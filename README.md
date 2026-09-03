@@ -15,32 +15,11 @@
 
 ---
 
-```text
-TOKEN MONITOR  [1] Limits [2] Ledger [3] Config     ● 9 ready · ▲ 2 attention · ◈ 7 wallets · ↻ 60s
-11/11 shown · updated now · native collector · live read-only
+<div align="center">
 
-── AI SUBSCRIPTIONS ── 🔥 Burn First: Command Code · Go (88% left, resets in 1d 18h) ───────────────
-SUBSCRIPTION / POOL       SESSION (5H)     CYCLE (7D)       RESETS (5H │ 7D)    STATUS / BURN
-────────────────────────────────────────────────────────────────────────────────────────────────────
-▶ ● Command Code · Go     [██████] 100%    [█████░] 88%     ↻ 0m   │ ↻ 1d 18h   🔥 BURN FIRST
-  ● Claude · Pro          [█████░] 80%     [██████] 95%     ↻ 2h   │ ↻ 6d 9h    ready
-  ● Antigravity · Google  2 pools active   CLI (port 5738)  ↻ 4h   │ ↻ 6d 23h   ready
-  ├─ Gemini Pool          [██████] 96%     [██████] 98%     ↻ 4h   │ ↻ 6d 23h   smooth
-  └─ Claude/GPT Pool      [█████░] 91%     [██████] 97%     ↻ 2h   │ ↻ 6d 5h    ready
-  ● Cursor · Free         [██████] 100%    [██████] 100%    —      │ ↻ 27d 22h  ready
-  ✕ Codex · Plus          [██████] 100%    [░░░░░░] 0%      ↻ 4h   │ ↻ 3d 7h    exhausted
-  ✕ Grok · SuperGrok      —                [░░░░░░] 0%      —      │ ↻ 1d 13h   exhausted
+![Token Monitor Live Demo](./assets/demo.gif)
 
-── CREDIT GRANTS & PREPAID WALLETS ─────────────────────────────────────────────────────────────────
-PROVIDER / ACCOUNT        BALANCE          GRANT TYPE              NEXT RESET    STATUS
-────────────────────────────────────────────────────────────────────────────────────────────────────
-  ● Modal · workspace     $30.00 (100%)    $30.00 Monthly Allowa…  ↻ 27d 4h      active
-  ● OpenRouter · Pay-as-… $9.98 (100%)     Prepaid API Balance     —             PAYG
-  ● DeepSeek · Pay-as-you ¥8.61            Prepaid API Balance     —             PAYG
-  ● Vast.ai · Cloud GPU   $9.11            Prepaid Instance Cred…  —             PAYG
-
-[1] Limits*  [2] Ledger  [3] Config │ [/] Filter  [j/k] Select  [Enter] Detail  [a] Attn  [q] Quit
-```
+</div>
 
 ---
 
