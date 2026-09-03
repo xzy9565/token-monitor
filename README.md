@@ -88,9 +88,23 @@ Built in pure **Rust** on top of **Ratatui**:
 
 ## 🚀 Quick Start
 
-### Build from Source (Cargo)
+### 🍺 Homebrew (macOS, Recommended)
 
-Ensure you have Rust 1.80+ installed:
+Install precompiled native binaries in seconds via Homebrew:
+
+```bash
+brew install xzy9565/tap/token-monitor
+```
+
+### ⚡ One-Line Install (Cargo)
+
+If you already have Rust installed, install directly into `~/.cargo/bin/token-monitor`:
+
+```bash
+cargo install --git https://github.com/xzy9565/token-monitor
+```
+
+### 🛠️ Build from Source
 
 ```bash
 git clone https://github.com/xzy9565/token-monitor.git
