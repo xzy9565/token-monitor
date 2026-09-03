@@ -1,0 +1,24 @@
+[package]
+name = "token-monitor-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Pinned for reproducible local usage parsing. This is intentionally a library
+# dependency: the final binary must not spawn a Tokscale Node/CLI sidecar.
+tokscale-core = { git = "https://github.com/junhoyeo/tokscale.git", rev = "029a1baf7b7e55dbca176f65b47e1537543f2857", package = "tokscale-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time", "process"] }
+chrono = "0.4"
+futures = "0.3"

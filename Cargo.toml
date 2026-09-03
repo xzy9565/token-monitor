@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/token-monitor-core",
+    "crates/token-monitor",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/xzy9565/token-monitor"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
+panic = "unwind"

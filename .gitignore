@@ -1,0 +1,5 @@
+target/
+.releases/
+*.sqlite3
+**/*.jsonl
+.DS_Store
