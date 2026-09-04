@@ -4044,16 +4044,15 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 if is_sel {
                     title_style = title_style.bg(Color::Rgb(28, 42, 60));
                 }
+                let is_free_tier = provider.plan.to_ascii_lowercase().contains("free");
+                let marker_style = if provider.availability == Availability::Available {
+                    Style::default().fg(if is_dimmed { DIM_GREY } else { GREEN })
+                } else {
+                    status_style_for(provider)
+                };
                 let mut row = vec![
                     Span::styled(cursor_mark, Style::default().fg(if is_sel { Color::Yellow } else { Color::Reset }).add_modifier(Modifier::BOLD)),
-                    Span::styled(
-                        format!("{} ", provider.availability.marker()),
-                        if provider.availability == Availability::Available {
-                            Style::default().fg(if is_dimmed { DIM_GREY } else { brand })
-                        } else {
-                            status_style_for(provider)
-                        },
-                    ),
+                    Span::styled(format!("{} ", provider.availability.marker()), marker_style),
                     Span::styled(
                         fit(&provider_title_base(provider), cols.provider.saturating_sub(4)),
                         title_style,
@@ -4066,7 +4065,12 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 row.push(Span::raw("  "));
                 row.extend(format_dual_reset(None, cursor_models.or(other_models), cols.reset, now_ms, is_dimmed));
                 row.push(Span::raw("  "));
-                row.push(format_matrix_status(provider, None, cols.status, false, is_dimmed));
+                let status_override = if is_free_tier && provider.availability == Availability::Available {
+                    Some(("slow pool", GREEN))
+                } else {
+                    None
+                };
+                row.push(format_matrix_status(provider, status_override, cols.status, false, is_dimmed));
                 lines.push(Line::from(row));
                 continue;
             }

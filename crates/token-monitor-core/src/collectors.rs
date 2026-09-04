@@ -561,7 +561,8 @@ pub async fn collect_cursor(options: &CollectorOptions) -> Vec<ProviderSnapshot>
             75,
         );
         if is_free && plan_limit == 0.0 {
-            provider.diagnostics.push("Cursor Free plan includes 0 fast requests (slow requests with queue)".into());
+            provider.availability = Availability::Available;
+            provider.diagnostics.push("Cursor Free plan: 0 fast Pro requests included, unlimited slow/auto requests available".into());
         }
         if cursor_agent_blocked(reset_ms) {
             provider.availability = Availability::AgentBlocked;
