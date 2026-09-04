@@ -2917,7 +2917,11 @@ pub async fn collect_commandcode(options: &CollectorOptions) -> Vec<ProviderSnap
 }
 
 fn minimax_token() -> Option<String> {
-    env_secret(&["TOKEN_MONITOR_MINIMAX_API_KEY", "MINIMAX_CODING_API_KEY"])
+    env_secret(&[
+        "TOKEN_MONITOR_MINIMAX_API_KEY",
+        "MINIMAX_API_KEY",
+        "MINIMAX_CODING_API_KEY",
+    ])
 }
 
 fn minimax_windows(payload: &Value) -> Vec<LimitWindow> {
@@ -3011,10 +3015,14 @@ pub async fn collect_minimax(options: &CollectorOptions) -> Vec<ProviderSnapshot
         }
     };
     let urls = [
-        "https://api.minimax.io/v1/token_plan/remains",
-        "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
         "https://api.minimaxi.com/v1/token_plan/remains",
         "https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains",
+        "https://api.minimax.io/v1/token_plan/remains",
+        "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
+        "https://api.minimaxi.chat/v1/token_plan/remains",
+        "https://api.minimaxi.chat/v1/api/openplatform/coding_plan/remains",
+        "https://api.minimax.chat/v1/token_plan/remains",
+        "https://api.minimax.chat/v1/api/openplatform/coding_plan/remains",
     ];
     let mut last_health = SourceHealth::Unavailable;
     for url in urls {
@@ -3063,13 +3071,18 @@ pub async fn collect_minimax(options: &CollectorOptions) -> Vec<ProviderSnapshot
             )];
         }
     }
+    let message = if matches!(last_health, SourceHealth::Unauthorized) {
+        "MiniMax unauthorized or missing Coding Plan subscription"
+    } else {
+        "MiniMax quota response unavailable"
+    };
     vec![unavailable_snapshot(
         "minimax",
         account_key("minimax", &token),
         "Token Plan".into(),
         "api",
         last_health,
-        "MiniMax quota response unavailable",
+        message,
         214,
     )]
 }

@@ -389,6 +389,7 @@ struct App {
     consumption: Option<usage::ConsumptionReport>,
     cached_ledger: Option<CachedLedger>,
     usage_busy: bool,
+    limits_busy: bool,
     view: View,
     filter: Filter,
     scroll: u16,
@@ -567,6 +568,7 @@ impl App {
             consumption: None,
             cached_ledger: None,
             usage_busy: false,
+            limits_busy: false,
             view: View::Limits,
             filter: Filter::All,
             scroll: 0,
@@ -602,6 +604,7 @@ impl App {
             consumption: None,
             cached_ledger: None,
             usage_busy: false,
+            limits_busy: false,
             view: View::Limits,
             filter: Filter::All,
             scroll: 0,
@@ -737,6 +740,8 @@ impl App {
             KeyCode::Char('r') => {
                 self.refreshes = self.refreshes.saturating_add(1);
                 self.last_refresh = Instant::now();
+                self.limits_busy = true;
+                self.usage_busy = true;
             }
             KeyCode::Char('a') => {
                 self.filter = if self.filter == Filter::Attention {
@@ -1887,6 +1892,22 @@ fn header_lines(app: &App, width: u16, refresh_seconds: u64) -> Vec<Line<'static
     first_row.push(Span::raw(" "));
     first_row.push(Span::styled("[3] Config", t3_style));
 
+    let is_refreshing = app.limits_busy
+        || app.usage_busy
+        || app.last_refresh.elapsed() < Duration::from_millis(1500);
+
+    let refresh_indicator = if is_refreshing {
+        Span::styled(
+            "↻ refreshing...",
+            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            format!("↻ {}s", refresh_seconds.clamp(10, 1800)),
+            Style::default().fg(GREY),
+        )
+    };
+
     let summary_spans = vec![
         Span::styled(format!("● {connected} ready"), Style::default().fg(GREEN)),
         Span::raw(" · "),
@@ -1897,10 +1918,7 @@ fn header_lines(app: &App, width: u16, refresh_seconds: u64) -> Vec<Line<'static
         Span::raw(" · "),
         Span::styled(format!("◈ {wallets} wallets"), Style::default().fg(BLUE)),
         Span::raw(" · "),
-        Span::styled(
-            format!("↻ {}s", refresh_seconds.clamp(10, 1800)),
-            Style::default().fg(GREY),
-        ),
+        refresh_indicator,
     ];
 
     let brand_len: usize = first_row.iter().map(|s| str_width(&s.content)).sum();
@@ -1911,7 +1929,9 @@ fn header_lines(app: &App, width: u16, refresh_seconds: u64) -> Vec<Line<'static
         first_row.extend(summary_spans);
     }
 
-    let mode = if app.live {
+    let mode = if is_refreshing {
+        "native collector · ↻ refreshing..."
+    } else if app.live {
         "native collector · live read-only"
     } else if app.refreshes == 0 {
         "native collector · fixture"
@@ -4516,7 +4536,7 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
             lines.push(Line::from(Span::styled("[Esc / Enter / Space to close]", Style::default().fg(GREY).add_modifier(Modifier::DIM))));
             lines
         }
-        DetailModal::ConsumptionWindow { window, records, tokens, api_usd, clients, models: _ } => {
+        DetailModal::ConsumptionWindow { window, records, tokens, api_usd, clients, models } => {
             let mut lines = Vec::new();
             let grand = tokens.reported_total_without_reasoning();
             let eff = if *api_usd > 0.0 {
@@ -4576,6 +4596,38 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
                     Span::raw("  "),
                     Span::styled(fit(&calls.to_string(), 8), Style::default().fg(DIM_GREY)),
                 ]));
+            }
+            if !models.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("TOP MODELS IN THIS WINDOW:", Style::default().fg(GREY).add_modifier(Modifier::BOLD))));
+                lines.push(Line::from(vec![
+                    Span::styled(fit("MODEL", 28), Style::default().fg(GREY)),
+                    Span::raw("  "),
+                    Span::styled(fit("TOKENS", 12), Style::default().fg(GREY)),
+                    Span::raw("  "),
+                    Span::styled(fit("API-EQ", 10), Style::default().fg(GREY)),
+                    Span::raw("  "),
+                    Span::styled(fit("TOK/$", 10), Style::default().fg(GREY)),
+                    Span::raw("  "),
+                    Span::styled(fit("CALLS", 8), Style::default().fg(GREY)),
+                ]));
+                lines.push(Line::from(Span::styled("─".repeat(max_w.min(74)), Style::default().fg(DIM_GREY))));
+                for (m, tok, val, calls) in models.iter().take(8) {
+                    let m_eff = if *val > 0.0 { format!("{:.2}M/$", *tok as f64 / 1_000_000.0 / val) } else { "—".to_owned() };
+                    let val_str = if *val > 0.0 { format!("${:.2}", val) } else { "—".to_owned() };
+                    let hue = m.bytes().fold(0u8, |s, b| s.wrapping_add(b));
+                    lines.push(Line::from(vec![
+                        Span::styled(fit(m, 28), Style::default().fg(palette(hue))),
+                        Span::raw("  "),
+                        Span::styled(fit(&format_tokens(*tok), 12), Style::default().fg(CYAN)),
+                        Span::raw("  "),
+                        Span::styled(fit(&val_str, 10), Style::default().fg(YELLOW)),
+                        Span::raw("  "),
+                        Span::styled(fit(&m_eff, 10), Style::default().fg(Color::Rgb(66, 165, 245))),
+                        Span::raw("  "),
+                        Span::styled(fit(&calls.to_string(), 8), Style::default().fg(DIM_GREY)),
+                    ]));
+                }
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("[Esc / Enter / Space to close · press 'w' in ledger to switch active window]", Style::default().fg(GREY).add_modifier(Modifier::DIM))));
@@ -4885,6 +4937,7 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                 sort_burn_first(&mut app.providers, chrono::Utc::now().timestamp_millis());
                 app.live = true;
                 refresh_in_flight = false;
+                app.limits_busy = false;
                 if let Ok(storage) = token_monitor_core::storage::Storage::open_default() {
                     let _ = storage.save_provider_snapshots(&app.providers);
                 }
@@ -4906,6 +4959,7 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
             }
             if args.live && !refresh_in_flight && Instant::now() >= next_refresh {
                 refresh_in_flight = true;
+                app.limits_busy = true;
                 let tx = refresh_tx.clone();
                 let options = collector_options.clone().unwrap_or_default();
                 tokio::spawn(async move {
@@ -4943,7 +4997,7 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                                     (chrono::Utc::now() - chrono::Duration::days(days as i64))
                                         .date_naive()
                                         .to_string()
-                                })
+                                 })
                                 .as_deref(),
                             None,
                         );
@@ -4958,6 +5012,9 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                 });
                 next_usage_refresh = Instant::now() + Duration::from_secs(300);
                 changed = true;
+            }
+            if app.limits_busy || app.usage_busy || app.last_refresh.elapsed() < Duration::from_millis(1600) {
+                dirty = true;
             }
             if changed {
                 dirty = true;
@@ -4975,11 +5032,10 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                         let immediate_refresh = key.code == KeyCode::Char('r');
                         app.handle_key(key);
                         if immediate_refresh {
-                            if app.view == View::Consumption {
-                                next_usage_refresh = Instant::now();
-                            } else {
-                                next_refresh = Instant::now();
-                            }
+                            next_refresh = Instant::now();
+                            next_usage_refresh = Instant::now();
+                            app.limits_busy = true;
+                            app.usage_busy = true;
                         }
                         if key.code == KeyCode::Char('t') && app.view == View::Consumption {
                             next_usage_refresh = Instant::now();
@@ -5227,6 +5283,34 @@ mod tests {
             }
             _ => panic!("expected ConsumptionWindow modal"),
         }
+    }
+
+    #[test]
+    fn consumption_window_modal_shows_top_models_and_refresh_indicator() {
+        let mut app = App::new(true, false);
+        app.view = View::Consumption;
+        let report = mock_consumption_report();
+        app.set_consumption(report);
+
+        app.ledger_window = LedgerWindow::Today;
+        app.consumption_selected = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let m_lines = modal_lines(&app.modal, 100);
+        let m_text = m_lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(m_text.contains("CLIENT / HARNESS BREAKDOWN IN THIS WINDOW:"));
+        assert!(m_text.contains("TOP MODELS IN THIS WINDOW:"));
+
+        // Close modal
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.modal, DetailModal::None);
+
+        // Refresh indicator test
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(app.limits_busy);
+        assert!(app.usage_busy);
+        let h_lines = header_lines(&app, 100, 60);
+        let h_text = h_lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(h_text.contains("refreshing..."));
     }
 
     #[test]
