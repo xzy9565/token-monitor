@@ -737,7 +737,7 @@ impl App {
                 self.scroll = 0;
             }
             KeyCode::Char('p') | KeyCode::Char('s') => self.open_settings(),
-            KeyCode::Char('r') => {
+            KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.refreshes = self.refreshes.saturating_add(1);
                 self.last_refresh = Instant::now();
                 self.limits_busy = true;
@@ -5029,7 +5029,7 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
             if event::poll(Duration::from_millis(100))? {
                 match event::read()? {
                     Event::Key(key) => {
-                        let immediate_refresh = key.code == KeyCode::Char('r');
+                        let immediate_refresh = matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'));
                         app.handle_key(key);
                         if immediate_refresh {
                             next_refresh = Instant::now();
