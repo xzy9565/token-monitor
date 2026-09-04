@@ -1887,12 +1887,19 @@ fn age_text(collected_at_ms: i64) -> String {
 fn header_lines(app: &App, width: u16, refresh_seconds: u64) -> Vec<Line<'static>> {
     let visible = app.visible_providers().len();
     let total = app.providers.len();
+    let is_session_capped_fn = |p: &ProviderSnapshot| {
+        p.windows.iter().any(|w| {
+            (w.kind == WindowKind::Session || w.label.to_ascii_lowercase().contains("5h"))
+                && w.remaining_percent == Some(0.0)
+        })
+    };
     let connected = app
         .providers
         .iter()
         .filter(|row| {
             row.availability == Availability::Available
                 && row.source_health == SourceHealth::Connected
+                && !is_session_capped_fn(row)
         })
         .count();
     let attention = app
@@ -1901,6 +1908,7 @@ fn header_lines(app: &App, width: u16, refresh_seconds: u64) -> Vec<Line<'static
         .filter(|row| {
             row.availability != Availability::Available
                 || row.source_health != SourceHealth::Connected
+                || is_session_capped_fn(row)
         })
         .count();
     let wallets = app
@@ -3600,6 +3608,10 @@ fn find_burn_first_recommendation(providers: &[&ProviderSnapshot], now_ms: i64) 
         if is_wallet_provider(p) {
             continue;
         }
+        // If currently on cooldown (0% session remaining), cannot burn right now!
+        if p.windows.iter().any(|w| (w.kind == WindowKind::Session || w.label.to_ascii_lowercase().contains("5h")) && w.remaining_percent == Some(0.0)) {
+            continue;
+        }
         for w in &p.windows {
             if (w.kind == WindowKind::Weekly || w.kind == WindowKind::Monthly || w.label.to_ascii_lowercase().contains("7d"))
                 && !w.metric.is_credit()
@@ -4030,7 +4042,9 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
             let is_sel = app.limits_selected == s_idx;
             let display_name = provider_title_base(provider);
             let brand = provider_brand_color(&provider.provider_id);
-            let is_dimmed = provider.availability.dimmed() || provider.source_health != SourceHealth::Connected;
+            let is_session_capped = session_w.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent == Some(0.0));
+            let is_cycle_capped = cycle_w.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent == Some(0.0));
+            let is_dimmed = provider.availability.dimmed() || is_session_capped || is_cycle_capped || provider.source_health != SourceHealth::Connected;
             let cursor_mark = if is_sel { "▶ " } else { "  " };
             let mut title_style = if is_dimmed {
                 Style::default().fg(brand).add_modifier(Modifier::DIM)
@@ -4040,16 +4054,16 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
             if is_sel {
                 title_style = title_style.bg(Color::Rgb(28, 42, 60));
             }
+            let (marker_char, marker_style) = if is_session_capped && provider.availability == Availability::Available {
+                ('▲', Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
+            } else if provider.availability == Availability::Available {
+                ('●', Style::default().fg(brand))
+            } else {
+                (provider.availability.marker(), status_style_for(provider))
+            };
             let mut row = vec![
                 Span::styled(cursor_mark, Style::default().fg(if is_sel { Color::Yellow } else { Color::Reset }).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    format!("{} ", provider.availability.marker()),
-                    if provider.availability == Availability::Available {
-                        Style::default().fg(brand)
-                    } else {
-                        status_style_for(provider)
-                    },
-                ),
+                Span::styled(format!("{marker_char} "), marker_style),
                 Span::styled(
                     fit(&display_name, cols.provider.saturating_sub(4)),
                     title_style,
