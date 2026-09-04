@@ -207,9 +207,16 @@ impl ProviderSnapshot {
         }
         self.windows
             .iter()
-            .filter(|window| window.spendable())
+            .filter(|window| window.spendable() && (window.kind.durable() || window.metric.is_credit()))
             .filter_map(|window| window.deadline_ms(now_ms))
             .min()
+            .or_else(|| {
+                self.windows
+                    .iter()
+                    .filter(|window| window.spendable())
+                    .filter_map(|window| window.deadline_ms(now_ms))
+                    .min()
+            })
     }
 
     pub fn payg(&self) -> bool {
@@ -399,6 +406,36 @@ mod tests {
                 .map(|row| row.provider_id.as_str())
                 .collect::<Vec<_>>(),
             ["cursor", "codex", "openrouter"]
+        );
+    }
+
+    #[test]
+    fn durable_cycle_reset_beats_sooner_session_reset() {
+        let now = 1_000;
+        let mut rows = vec![
+            provider(
+                "claude",
+                "Pro",
+                vec![
+                    window("5h", WindowKind::Session, 72.0, now + 3_600_000),
+                    window("7d", WindowKind::Weekly, 77.0, now + 500_000_000),
+                ],
+            ),
+            provider(
+                "commandcode",
+                "Go",
+                vec![
+                    window("5h", WindowKind::Session, 47.0, now + 7_200_000),
+                    window("Cycle", WindowKind::Monthly, 11.0, now + 80_000_000),
+                ],
+            ),
+        ];
+        sort_burn_first(&mut rows, now);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.provider_id.as_str())
+                .collect::<Vec<_>>(),
+            ["commandcode", "claude"]
         );
     }
 
