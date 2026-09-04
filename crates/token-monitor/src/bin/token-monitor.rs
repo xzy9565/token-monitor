@@ -740,8 +740,12 @@ impl App {
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.refreshes = self.refreshes.saturating_add(1);
                 self.last_refresh = Instant::now();
-                self.limits_busy = true;
-                self.usage_busy = true;
+                if self.view == View::Consumption {
+                    self.usage_busy = true;
+                } else {
+                    self.limits_busy = true;
+                    self.refresh_requested = true;
+                }
             }
             KeyCode::Char('a') => {
                 self.filter = if self.filter == Filter::Attention {
@@ -991,7 +995,6 @@ impl App {
                 self.refreshes = self.refreshes.saturating_add(1);
                 self.last_refresh = Instant::now();
                 self.limits_busy = true;
-                self.usage_busy = true;
                 self.refresh_requested = true;
             }
             _ => {}
@@ -1899,9 +1902,10 @@ fn header_lines(app: &App, width: u16, refresh_seconds: u64) -> Vec<Line<'static
     first_row.push(Span::raw(" "));
     first_row.push(Span::styled("[3] Config", t3_style));
 
-    let is_refreshing = app.limits_busy
-        || app.usage_busy
-        || app.last_refresh.elapsed() < Duration::from_millis(1500);
+    let is_refreshing = match app.view {
+        View::Consumption => app.usage_busy,
+        View::Limits | View::Settings => app.limits_busy,
+    } || app.last_refresh.elapsed() < Duration::from_millis(1500);
 
     let refresh_indicator = if is_refreshing {
         Span::styled(
@@ -4985,8 +4989,16 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                 let tx = refresh_tx.clone();
                 let options = collector_options.clone().unwrap_or_default();
                 tokio::spawn(async move {
-                    let providers =
-                        token_monitor_core::collectors::collect_live_limits(&options).await;
+                    let timeout = options.timeout();
+                    let providers = match tokio::time::timeout(
+                        timeout + Duration::from_secs(2),
+                        token_monitor_core::collectors::collect_live_limits(&options),
+                    )
+                    .await
+                    {
+                        Ok(p) => p,
+                        Err(_) => Vec::new(),
+                    };
                     let _ = tx.send(providers);
                 });
                 next_refresh = Instant::now() + app.refresh_seconds(args);
@@ -5035,7 +5047,11 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                 next_usage_refresh = Instant::now() + Duration::from_secs(300);
                 changed = true;
             }
-            if app.limits_busy || app.usage_busy || app.last_refresh.elapsed() < Duration::from_millis(1600) {
+            let active_busy = match app.view {
+                View::Consumption => app.usage_busy,
+                _ => app.limits_busy,
+            };
+            if active_busy || app.last_refresh.elapsed() < Duration::from_millis(1600) {
                 dirty = true;
             }
             if changed {
@@ -5054,12 +5070,15 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                         let immediate_refresh = matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'));
                         app.handle_key(key);
                         if immediate_refresh {
-                            next_refresh = Instant::now();
-                            next_usage_refresh = Instant::now();
-                            app.limits_busy = true;
-                            app.usage_busy = true;
                             app.last_refresh = Instant::now();
                             app.refreshes = app.refreshes.saturating_add(1);
+                            if app.view == View::Consumption {
+                                next_usage_refresh = Instant::now();
+                                app.usage_busy = true;
+                            } else {
+                                next_refresh = Instant::now();
+                                app.limits_busy = true;
+                            }
                         }
                         if key.code == KeyCode::Char('t') && app.view == View::Consumption {
                             next_usage_refresh = Instant::now();
@@ -5330,12 +5349,24 @@ mod tests {
 
         // Refresh indicator test
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        assert!(app.limits_busy);
         assert!(app.usage_busy);
+        assert!(!app.limits_busy);
         for w in [80u16, 100, 120] {
             let h_lines = header_lines(&app, w, 60);
             assert!(h_lines[0].to_string().contains("refreshing..."), "width {w} first row must contain refreshing...");
             assert!(h_lines[1].to_string().contains("refreshing..."), "width {w} subtitle must contain refreshing...");
+        }
+
+        // Refresh indicator test for limits view
+        let mut limits_app = App::new(true, false);
+        limits_app.view = View::Limits;
+        limits_app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(limits_app.limits_busy);
+        assert!(!limits_app.usage_busy);
+        for w in [80u16, 100, 120] {
+            let h_lines = header_lines(&limits_app, w, 60);
+            assert!(h_lines[0].to_string().contains("refreshing..."), "width {w} limits first row must contain refreshing...");
+            assert!(h_lines[1].to_string().contains("refreshing..."), "width {w} limits subtitle must contain refreshing...");
         }
     }
 

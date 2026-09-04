@@ -37,7 +37,7 @@ impl CollectorOptions {
             .is_none_or(|selected| selected.contains("all") || selected.contains(provider))
     }
 
-    fn timeout(&self) -> Duration {
+    pub fn timeout(&self) -> Duration {
         self.timeout.unwrap_or(DEFAULT_TIMEOUT)
     }
 }
