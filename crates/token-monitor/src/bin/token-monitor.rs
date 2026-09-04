@@ -4671,19 +4671,64 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
             lines.push(Line::from(Span::styled(format!("Account: {}", p.account_label), Style::default().fg(GREY))));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("RATE LIMIT WINDOWS:", Style::default().fg(GREY).add_modifier(Modifier::BOLD))));
-            for w in &p.windows {
+            let has_amounts = p.windows.iter().any(|w| w.remaining_amount.is_some());
+            let label_strs: Vec<String> = p
+                .windows
+                .iter()
+                .map(|w| format!("  • [{:?}] {}", w.kind, w.label))
+                .collect();
+            let max_label_len = label_strs.iter().map(|s| str_width(s)).max().unwrap_or(24);
+            let label_col_width = max_label_len
+                .max(24)
+                .min(max_w.saturating_sub(if has_amounts { 42 } else { 30 }));
+
+            for (idx, w) in p.windows.iter().enumerate() {
                 let r_text = reset_text(w);
-                let pct_text = w.remaining_percent.map(|pct| format!("{:>5.1}%", pct)).unwrap_or_else(|| "   — ".into());
-                let amt_text = w.remaining_amount.map(|amt| format!("{}{:.2}", w.currency.as_deref().unwrap_or("$"), amt)).unwrap_or_default();
-                lines.push(Line::from(vec![
-                    Span::styled(fit(&format!("  • [{:?}] {}", w.kind, w.label), 24), Style::default().fg(Color::White)),
-                    Span::raw(" "),
-                    Span::styled(pct_text, Style::default().fg(brand).add_modifier(Modifier::BOLD)),
+                let pct_text = w
+                    .remaining_percent
+                    .map(|pct| format!("{:>5.1}%", pct))
+                    .unwrap_or_else(|| "   — ".into());
+                let amt_text = w
+                    .remaining_amount
+                    .map(|amt| format!("{}{:.2}", w.currency.as_deref().unwrap_or("$"), amt))
+                    .unwrap_or_default();
+                let label_text = label_strs.get(idx).map(|s| s.as_str()).unwrap_or("");
+
+                let mut row = vec![
+                    Span::styled(
+                        fit(label_text, label_col_width),
+                        Style::default().fg(Color::White),
+                    ),
                     Span::raw("  "),
-                    Span::styled(fit(&amt_text, 10), Style::default().fg(YELLOW)),
-                    Span::raw("  resets in "),
-                    Span::styled(r_text, Style::default().fg(CYAN)),
-                ]));
+                ];
+
+                if let Some(pct) = w.remaining_percent {
+                    let m = meter(pct, 6);
+                    let m_color = if pct <= 0.0 {
+                        RED
+                    } else if pct < 20.0 {
+                        YELLOW
+                    } else {
+                        brand
+                    };
+                    row.push(Span::styled(format!("[{m}] "), Style::default().fg(m_color)));
+                } else {
+                    row.push(Span::raw("         "));
+                }
+
+                row.push(Span::styled(
+                    pct_text,
+                    Style::default().fg(brand).add_modifier(Modifier::BOLD),
+                ));
+
+                if has_amounts {
+                    row.push(Span::raw("  "));
+                    row.push(Span::styled(fit(&amt_text, 10), Style::default().fg(YELLOW)));
+                }
+
+                row.push(Span::raw("  resets in "));
+                row.push(Span::styled(r_text, Style::default().fg(CYAN)));
+                lines.push(Line::from(row));
             }
             if !p.diagnostics.is_empty() {
                 lines.push(Line::from(""));
@@ -5655,5 +5700,55 @@ mod tests {
         }
         assert!(rendered.contains("▶"));
         assert!(rendered.contains(sel_label));
+    }
+
+    #[test]
+    fn limits_provider_modal_shows_full_labels_and_meters() {
+        let provider = ProviderSnapshot {
+            account_key: "ag-test".into(),
+            account_label: "test@example.com".into(),
+            availability: Availability::Available,
+            collected_at_ms: 1000,
+            diagnostics: vec![],
+            hue: 141,
+            plan: "Pro".into(),
+            provider_id: "antigravity".into(),
+            source: "web".into(),
+            source_health: SourceHealth::Connected,
+            windows: vec![
+                LimitWindow {
+                    currency: None,
+                    estimated: false,
+                    kind: WindowKind::Session,
+                    label: "Claude/GPT 5h".into(),
+                    metric: WindowMetric::Quota,
+                    remaining_amount: None,
+                    remaining_percent: Some(100.0),
+                    reset_text: None,
+                    resets_at_ms: Some(18_000_000),
+                },
+                LimitWindow {
+                    currency: None,
+                    estimated: false,
+                    kind: WindowKind::Weekly,
+                    label: "Claude/GPT 7d".into(),
+                    metric: WindowMetric::Quota,
+                    remaining_amount: None,
+                    remaining_percent: Some(62.9),
+                    reset_text: None,
+                    resets_at_ms: Some(500_000_000),
+                },
+            ],
+        };
+        let modal = DetailModal::LimitsProvider(Box::new(provider));
+        let lines = modal_lines(&modal, 100);
+        let text = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("RATE LIMIT WINDOWS:"));
+        assert!(text.contains("Claude/GPT 5h"));
+        assert!(text.contains("Claude/GPT 7d"));
+        assert!(text.contains("[██████]"));
+        // Ensure no truncated ellipsis in window labels
+        assert!(!text.contains("Claude/GP…"));
+        assert!(!text.contains("Claude/GPT…"));
     }
 }
