@@ -987,6 +987,13 @@ impl App {
             }
             KeyCode::Enter => self.begin_settings_edit(),
             KeyCode::Char('d') => self.delete_settings_credential(),
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.refreshes = self.refreshes.saturating_add(1);
+                self.last_refresh = Instant::now();
+                self.limits_busy = true;
+                self.usage_busy = true;
+                self.refresh_requested = true;
+            }
             _ => {}
         }
     }
@@ -1918,15 +1925,20 @@ fn header_lines(app: &App, width: u16, refresh_seconds: u64) -> Vec<Line<'static
         Span::raw(" · "),
         Span::styled(format!("◈ {wallets} wallets"), Style::default().fg(BLUE)),
         Span::raw(" · "),
-        refresh_indicator,
+        refresh_indicator.clone(),
     ];
 
     let brand_len: usize = first_row.iter().map(|s| str_width(&s.content)).sum();
     let summary_len: usize = summary_spans.iter().map(|s| str_width(&s.content)).sum();
-    let pad = (width as usize).saturating_sub(brand_len + summary_len);
-    if width >= 85 && pad > 1 {
-        first_row.push(Span::raw(" ".repeat(pad)));
+    let refresh_len: usize = str_width(&refresh_indicator.content);
+    let pad_full = (width as usize).saturating_sub(brand_len + summary_len);
+    let pad_compact = (width as usize).saturating_sub(brand_len + refresh_len);
+    if width >= 105 && pad_full > 1 {
+        first_row.push(Span::raw(" ".repeat(pad_full)));
         first_row.extend(summary_spans);
+    } else if width >= 55 && pad_compact > 1 {
+        first_row.push(Span::raw(" ".repeat(pad_compact)));
+        first_row.push(refresh_indicator);
     }
 
     let mode = if is_refreshing {
@@ -1939,14 +1951,24 @@ fn header_lines(app: &App, width: u16, refresh_seconds: u64) -> Vec<Line<'static
         "native collector · refreshed"
     };
 
-    let subtitle = format!(
-        "{visible}/{total} shown · updated {} · {mode}",
-        age_text(updated_at)
-    );
+    let mut subtitle_spans = vec![
+        Span::styled(
+            format!("{visible}/{total} shown · updated {} · ", age_text(updated_at)),
+            Style::default().fg(DIM_GREY),
+        ),
+    ];
+    if is_refreshing {
+        subtitle_spans.push(Span::styled(
+            "↻ refreshing...",
+            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        subtitle_spans.push(Span::styled(mode, Style::default().fg(DIM_GREY)));
+    }
 
     vec![
         Line::from(first_row),
-        Line::from(Span::styled(subtitle, Style::default().fg(DIM_GREY))),
+        Line::from(subtitle_spans),
     ]
 }
 
@@ -4826,17 +4848,17 @@ fn draw(frame: &mut Frame, app: &App, forced_width: Option<u16>, refresh_seconds
         }
     } else if width < 110 {
         if app.view == View::Consumption {
-            format!("[1] Limits  [2] Ledger*  [3] Config │ [h/l] Win:{}  [/] Filter  [j/k] Sel  [Enter] Detail  [q] Quit", app.ledger_window.label())
+            format!("[1] Limits  [2] Ledger*  [3] Config │ [h/l] Win:{}  [r] Ref  [Enter] Detail  [q] Quit", app.ledger_window.label())
         } else if app.view == View::Settings {
-            "[1] Limits  [2] Ledger  [3] Config* │ [Enter] Edit  [Esc] Back  [q] Quit".to_owned()
+            "[1] Limits  [2] Ledger  [3] Config* │ [Enter] Edit  [r] Ref  [Esc] Back  [q] Quit".to_owned()
         } else {
-            "[1] Limits*  [2] Ledger  [3] Config │ [/] Filter  [j/k] Sel  [Enter] Detail  [a] Attn  [c] Cred  [q] Quit".to_owned()
+            "[1] Limits*  [2] Ledger  [3] Config │ [/] Filter  [Enter] Detail  [r] Ref  [q] Quit".to_owned()
         }
     } else {
         if app.view == View::Consumption {
-            format!("[1] Limits  [2] Ledger*  [3] Config │ [h/l / ←/→] Window: {}  [/] Filter  [m] Metric  [j/k] Select  [Enter] Detail  [q] Quit", app.ledger_window.label())
+            format!("[1] Limits  [2] Ledger*  [3] Config │ [h/l / ←/→] Window: {}  [/] Filter  [m] Metric  [Enter] Detail  [r] Refresh  [q] Quit", app.ledger_window.label())
         } else if app.view == View::Settings {
-            "[1] Limits  [2] Ledger  [3] Config* │ [Enter] Edit  [d] Delete  [Esc] Back  [q] Quit".to_owned()
+            "[1] Limits  [2] Ledger  [3] Config* │ [Enter] Edit  [d] Delete  [r] Refresh  [Esc] Back  [q] Quit".to_owned()
         } else {
             "[1] Limits*  [2] Ledger  [3] Config │ [/] Filter  [j/k] Select  [Enter] Detail  [a] Attn  [c] Credits  [r] Refresh  [q] Quit".to_owned()
         }
@@ -5036,6 +5058,8 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                             next_usage_refresh = Instant::now();
                             app.limits_busy = true;
                             app.usage_busy = true;
+                            app.last_refresh = Instant::now();
+                            app.refreshes = app.refreshes.saturating_add(1);
                         }
                         if key.code == KeyCode::Char('t') && app.view == View::Consumption {
                             next_usage_refresh = Instant::now();
@@ -5308,9 +5332,11 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         assert!(app.limits_busy);
         assert!(app.usage_busy);
-        let h_lines = header_lines(&app, 100, 60);
-        let h_text = h_lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
-        assert!(h_text.contains("refreshing..."));
+        for w in [80u16, 100, 120] {
+            let h_lines = header_lines(&app, w, 60);
+            assert!(h_lines[0].to_string().contains("refreshing..."), "width {w} first row must contain refreshing...");
+            assert!(h_lines[1].to_string().contains("refreshing..."), "width {w} subtitle must contain refreshing...");
+        }
     }
 
     #[test]
