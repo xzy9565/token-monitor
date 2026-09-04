@@ -300,6 +300,15 @@ impl LedgerWindow {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct WindowClientItem {
+    pub client: String,
+    pub tokens: i64,
+    pub api_usd: f64,
+    pub calls: usize,
+    pub models: Vec<(String, i64, f64, usize)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum DetailModal {
     None,
     LimitsProvider(Box<ProviderSnapshot>),
@@ -308,8 +317,8 @@ pub enum DetailModal {
         records: usize,
         tokens: usage::UsageTokens,
         api_usd: f64,
-        clients: Vec<(String, i64, f64, usize)>,
-        models: Vec<(String, i64, f64, usize)>,
+        clients: Vec<WindowClientItem>,
+        models: Vec<(String, String, i64, f64, usize)>,
     },
     ConsumptionClient {
         client: String,
@@ -399,6 +408,7 @@ struct App {
     no_color: bool,
     limits_selected: usize,
     consumption_selected: usize,
+    modal_scroll: u16,
     modal: DetailModal,
     ledger_window: LedgerWindow,
     search_query: String,
@@ -432,8 +442,10 @@ impl App {
         }
         let ordered: Vec<&ProviderSnapshot> = subscriptions.into_iter().chain(wallets).collect();
         let sel = self.limits_selected.min(ordered.len().saturating_sub(1));
-        if let Some(p) = ordered.get(sel) {
-            self.modal = DetailModal::LimitsProvider(Box::new((*p).clone()));
+        let selected_provider = ordered.get(sel).cloned().cloned();
+        if let Some(p) = selected_provider {
+            self.modal_scroll = 0;
+            self.modal = DetailModal::LimitsProvider(Box::new(p));
         }
     }
 
@@ -455,8 +467,8 @@ impl App {
             let mut win_tokens = usage::UsageTokens::default();
             let mut win_records = 0;
             let mut win_usd = 0.0;
-            let mut client_map: HashMap<String, (i64, f64, usize)> = HashMap::new();
-            let mut model_map: HashMap<String, (i64, f64, usize)> = HashMap::new();
+            let mut client_map: HashMap<String, (i64, f64, usize, HashMap<String, (i64, f64, usize)>)> = HashMap::new();
+            let mut model_map: HashMap<String, (i64, f64, usize, HashMap<String, usize>)> = HashMap::new();
             let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
 
             for (idx, rec) in report.snapshot.records.iter().enumerate() {
@@ -468,22 +480,44 @@ impl App {
                 let val = report.quotes.as_ref().and_then(|q| q.get(idx)).and_then(|q| q.value_usd).unwrap_or_else(|| pricing.quote(rec).value_usd.unwrap_or(0.0));
                 win_usd += val;
                 let c_norm = normalize_client_id(&rec.client);
-                let c_entry = client_map.entry(c_norm).or_insert((0, 0.0, 0));
+                let c_entry = client_map.entry(c_norm.clone()).or_insert_with(|| (0, 0.0, 0, HashMap::new()));
                 c_entry.0 += rec.tokens.reported_total_without_reasoning();
                 c_entry.1 += val;
                 c_entry.2 += 1;
+                let sub_m = c_entry.3.entry(rec.model_id.clone()).or_insert((0, 0.0, 0));
+                sub_m.0 += rec.tokens.reported_total_without_reasoning();
+                sub_m.1 += val;
+                sub_m.2 += 1;
 
-                let m_entry = model_map.entry(rec.model_id.clone()).or_insert((0, 0.0, 0));
+                let m_entry = model_map.entry(rec.model_id.clone()).or_insert_with(|| (0, 0.0, 0, HashMap::new()));
                 m_entry.0 += rec.tokens.reported_total_without_reasoning();
                 m_entry.1 += val;
                 m_entry.2 += 1;
+                *m_entry.3.entry(c_norm).or_insert(0) += 1;
             }
 
-            let mut c_vec: Vec<(String, i64, f64, usize)> = client_map.into_iter().map(|(c, (t, u, n))| (c, t, u, n)).collect();
-            c_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
-            let mut m_vec: Vec<(String, i64, f64, usize)> = model_map.into_iter().map(|(m, (t, u, n))| (m, t, u, n)).collect();
-            m_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
+            let mut c_vec: Vec<WindowClientItem> = client_map.into_iter().map(|(c, (t, u, n, sub_map))| {
+                let mut sub_vec: Vec<(String, i64, f64, usize)> = sub_map.into_iter().map(|(m, (st, su, sn))| (m, st, su, sn)).collect();
+                sub_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
+                WindowClientItem {
+                    client: c,
+                    tokens: t,
+                    api_usd: u,
+                    calls: n,
+                    models: sub_vec,
+                }
+            }).collect();
+            c_vec.sort_by_key(|a| std::cmp::Reverse(a.tokens));
 
+            let mut m_vec: Vec<(String, String, i64, f64, usize)> = model_map.into_iter().map(|(m, (t, u, n, c_map))| {
+                let mut c_list: Vec<(String, usize)> = c_map.into_iter().collect();
+                c_list.sort_by_key(|a| std::cmp::Reverse(a.1));
+                let c_str = c_list.into_iter().map(|(c, _)| c).collect::<Vec<_>>().join(", ");
+                (m, c_str, t, u, n)
+            }).collect();
+            m_vec.sort_by_key(|a| std::cmp::Reverse(a.2));
+
+            self.modal_scroll = 0;
             self.modal = DetailModal::ConsumptionWindow {
                 window: target_win,
                 records: win_records,
@@ -516,6 +550,7 @@ impl App {
             let mut models_vec: Vec<(String, i64, f64, usize)> = client_models.into_iter().map(|(m, (t, u, c))| (m, t, u, c)).collect();
             models_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
 
+            self.modal_scroll = 0;
             self.modal = DetailModal::ConsumptionClient {
                 client: target_client,
                 window: cur_window,
@@ -549,6 +584,7 @@ impl App {
             let mut clients_vec: Vec<(String, i64, f64, usize)> = model_clients.into_iter().map(|(c, (t, u, k))| (c, t, u, k)).collect();
             clients_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
 
+            self.modal_scroll = 0;
             self.modal = DetailModal::ConsumptionModel {
                 model: target_model,
                 window: cur_window,
@@ -583,6 +619,7 @@ impl App {
             refresh_requested: false,
             limits_selected: 0,
             consumption_selected: 0,
+            modal_scroll: 0,
             modal: DetailModal::None,
             ledger_window: LedgerWindow::Today,
             search_query: String::new(),
@@ -619,6 +656,7 @@ impl App {
             refresh_requested: false,
             limits_selected: 0,
             consumption_selected: 0,
+            modal_scroll: 0,
             modal: DetailModal::None,
             ledger_window: LedgerWindow::Today,
             search_query: String::new(),
@@ -635,6 +673,13 @@ impl App {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ') => {
                     self.modal = DetailModal::None;
+                    self.modal_scroll = 0;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.modal_scroll = self.modal_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.modal_scroll = self.modal_scroll.saturating_add(1);
                 }
                 _ => {}
             }
@@ -2736,17 +2781,24 @@ fn compute_temporal_usage(report: &usage::ConsumptionReport) -> Vec<TemporalUsag
 }
 
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct ModelConsumptionRow {
     model: String,
     records: usize,
     tokens: usage::UsageTokens,
     api_value_usd: f64,
+    clients: std::collections::HashMap<String, usize>,
 }
 
 impl ModelConsumptionRow {
     fn token_total(&self) -> i64 {
         self.tokens.reported_total_without_reasoning()
+    }
+
+    fn primary_client(&self) -> String {
+        let mut sorted: Vec<(&String, &usize)> = self.clients.iter().collect();
+        sorted.sort_by_key(|a| std::cmp::Reverse(*a.1));
+        sorted.into_iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>().join(", ")
     }
 }
 
@@ -2779,9 +2831,11 @@ fn model_consumption_rows(
             records: 0,
             tokens: usage::UsageTokens::default(),
             api_value_usd: 0.0,
+            clients: std::collections::HashMap::new(),
         });
         entry.records += 1;
         entry.tokens.add_assign(&record.tokens);
+        *entry.clients.entry(client_norm).or_insert(0) += 1;
         let val = if let Some(quotes) = report.quotes.as_ref() {
             quotes.get(index).and_then(|q| q.value_usd).unwrap_or_else(|| pricing.quote(record).value_usd.unwrap_or(0.0))
         } else {
@@ -3096,16 +3150,19 @@ fn consumption_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     ]));
 
     let max_m_tokens = m_rows.iter().map(|m| m.token_total()).max().unwrap_or(0);
-    let m_label_w = if width >= 120 { 32 } else { 24 };
+    let m_label_w = if width >= 120 { 28 } else { 22 };
+    let harness_w = if width >= 120 { 18 } else { 14 };
     let token_width = 12;
-    let api_width = 12;
-    let coverage_width = 12;
+    let api_width = 10;
+    let coverage_width = 11;
     let m_bar_width = (width as usize)
-        .saturating_sub(m_label_w + token_width + api_width + coverage_width + 8)
-        .clamp(6, 18);
+        .saturating_sub(m_label_w + harness_w + token_width + api_width + coverage_width + 10)
+        .clamp(4, 18);
 
     lines.push(Line::from(vec![
         Span::styled(fit("MODEL", m_label_w), Style::default().fg(GREY)),
+        Span::raw("  "),
+        Span::styled(fit("HARNESS", harness_w), Style::default().fg(GREY)),
         Span::raw("  "),
         Span::styled(fit("TOKENS", token_width), Style::default().fg(GREY)),
         Span::raw("  "),
@@ -3143,6 +3200,8 @@ fn consumption_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             m_style = m_style.bg(Color::Rgb(28, 42, 60)).add_modifier(Modifier::BOLD);
         }
         let cursor_mark = if is_sel { "▶ " } else { "  " };
+        let parent_harness = m_row.primary_client();
+        let h_brand = client_brand_color(&parent_harness);
 
         let m_meter = colored_meter(
             if max_m_tokens > 0 {
@@ -3157,6 +3216,8 @@ fn consumption_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         let mut row_spans = vec![
             Span::styled(cursor_mark, Style::default().fg(if is_sel { Color::Yellow } else { Color::Reset }).add_modifier(Modifier::BOLD)),
             Span::styled(fit(&m_row.model, m_label_w.saturating_sub(2)), m_style),
+            Span::raw("  "),
+            Span::styled(fit(&parent_harness, harness_w), Style::default().fg(h_brand)),
             Span::raw("  "),
             Span::styled(fit(&token_text, token_width), Style::default().fg(CYAN)),
             Span::raw("  "),
@@ -4609,9 +4670,10 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
                 Span::styled(format_tokens(tokens.reasoning), Style::default().fg(Color::White)),
             ]));
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("CLIENT / HARNESS BREAKDOWN IN THIS WINDOW:", Style::default().fg(GREY).add_modifier(Modifier::BOLD))));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("CLIENT / HARNESS & SUB-MODEL HIERARCHY (PARENT ➔ CHILDREN):", Style::default().fg(GREY).add_modifier(Modifier::BOLD))));
             lines.push(Line::from(vec![
-                Span::styled(fit("CLIENT", 24), Style::default().fg(GREY)),
+                Span::styled(fit("CLIENT / SUB-MODEL", 32), Style::default().fg(GREY)),
                 Span::raw("  "),
                 Span::styled(fit("TOKENS", 12), Style::default().fg(GREY)),
                 Span::raw("  "),
@@ -4621,28 +4683,46 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
                 Span::raw("  "),
                 Span::styled(fit("CALLS", 8), Style::default().fg(GREY)),
             ]));
-            lines.push(Line::from(Span::styled("─".repeat(max_w.min(74)), Style::default().fg(DIM_GREY))));
-            for (c, tok, val, calls) in clients.iter().take(6) {
-                let brand = client_brand_color(c);
-                let c_eff = if *val > 0.0 { format!("{:.2}M/$", *tok as f64 / 1_000_000.0 / val) } else { "—".to_owned() };
-                let val_str = if *val > 0.0 { format!("${:.2}", val) } else { "—".to_owned() };
+            lines.push(Line::from(Span::styled("─".repeat(max_w.min(78)), Style::default().fg(DIM_GREY))));
+            for c_item in clients.iter().take(6) {
+                let brand = client_brand_color(&c_item.client);
+                let c_eff = if c_item.api_usd > 0.0 { format!("{:.2}M/$", c_item.tokens as f64 / 1_000_000.0 / c_item.api_usd) } else { "—".to_owned() };
+                let val_str = if c_item.api_usd > 0.0 { format!("${:.2}", c_item.api_usd) } else { "—".to_owned() };
                 lines.push(Line::from(vec![
-                    Span::styled(fit(c, 24), Style::default().fg(brand).add_modifier(Modifier::BOLD)),
+                    Span::styled(fit(&format!("▼ {}", c_item.client), 32), Style::default().fg(brand).add_modifier(Modifier::BOLD)),
                     Span::raw("  "),
-                    Span::styled(fit(&format_tokens(*tok), 12), Style::default().fg(CYAN)),
+                    Span::styled(fit(&format_tokens(c_item.tokens), 12), Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
                     Span::raw("  "),
-                    Span::styled(fit(&val_str, 10), Style::default().fg(YELLOW)),
+                    Span::styled(fit(&val_str, 10), Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)),
                     Span::raw("  "),
                     Span::styled(fit(&c_eff, 10), Style::default().fg(Color::Rgb(66, 165, 245))),
                     Span::raw("  "),
-                    Span::styled(fit(&calls.to_string(), 8), Style::default().fg(DIM_GREY)),
+                    Span::styled(fit(&c_item.calls.to_string(), 8), Style::default().fg(DIM_GREY)),
                 ]));
+                for (sub_m, s_tok, s_usd, s_calls) in c_item.models.iter().take(5) {
+                    let s_eff = if *s_usd > 0.0 { format!("{:.2}M/$", *s_tok as f64 / 1_000_000.0 / s_usd) } else { "—".to_owned() };
+                    let s_val_str = if *s_usd > 0.0 { format!("${:.2}", s_usd) } else { "—".to_owned() };
+                    let m_hue = sub_m.bytes().fold(0u8, |s, b| s.wrapping_add(b));
+                    lines.push(Line::from(vec![
+                        Span::styled(fit(&format!("  └─ {}", sub_m), 32), Style::default().fg(palette(m_hue))),
+                        Span::raw("  "),
+                        Span::styled(fit(&format_tokens(*s_tok), 12), Style::default().fg(CYAN)),
+                        Span::raw("  "),
+                        Span::styled(fit(&s_val_str, 10), Style::default().fg(YELLOW)),
+                        Span::raw("  "),
+                        Span::styled(fit(&s_eff, 10), Style::default().fg(Color::Rgb(66, 165, 245))),
+                        Span::raw("  "),
+                        Span::styled(fit(&s_calls.to_string(), 8), Style::default().fg(DIM_GREY)),
+                    ]));
+                }
             }
             if !models.is_empty() {
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("TOP MODELS IN THIS WINDOW:", Style::default().fg(GREY).add_modifier(Modifier::BOLD))));
+                lines.push(Line::from(Span::styled("TOP MODELS IN THIS WINDOW (WITH PARENT HARNESS):", Style::default().fg(GREY).add_modifier(Modifier::BOLD))));
                 lines.push(Line::from(vec![
-                    Span::styled(fit("MODEL", 28), Style::default().fg(GREY)),
+                    Span::styled(fit("MODEL", 26), Style::default().fg(GREY)),
+                    Span::raw("  "),
+                    Span::styled(fit("PARENT HARNESS", 18), Style::default().fg(GREY)),
                     Span::raw("  "),
                     Span::styled(fit("TOKENS", 12), Style::default().fg(GREY)),
                     Span::raw("  "),
@@ -4650,15 +4730,18 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
                     Span::raw("  "),
                     Span::styled(fit("TOK/$", 10), Style::default().fg(GREY)),
                     Span::raw("  "),
-                    Span::styled(fit("CALLS", 8), Style::default().fg(GREY)),
+                    Span::styled(fit("CALLS", 6), Style::default().fg(GREY)),
                 ]));
-                lines.push(Line::from(Span::styled("─".repeat(max_w.min(74)), Style::default().fg(DIM_GREY))));
-                for (m, tok, val, calls) in models.iter().take(8) {
+                lines.push(Line::from(Span::styled("─".repeat(max_w.min(90)), Style::default().fg(DIM_GREY))));
+                for (m, parent_harness, tok, val, calls) in models.iter().take(8) {
                     let m_eff = if *val > 0.0 { format!("{:.2}M/$", *tok as f64 / 1_000_000.0 / val) } else { "—".to_owned() };
                     let val_str = if *val > 0.0 { format!("${:.2}", val) } else { "—".to_owned() };
                     let hue = m.bytes().fold(0u8, |s, b| s.wrapping_add(b));
+                    let h_brand = client_brand_color(parent_harness);
                     lines.push(Line::from(vec![
-                        Span::styled(fit(m, 28), Style::default().fg(palette(hue))),
+                        Span::styled(fit(m, 26), Style::default().fg(palette(hue))),
+                        Span::raw("  "),
+                        Span::styled(fit(parent_harness, 18), Style::default().fg(h_brand)),
                         Span::raw("  "),
                         Span::styled(fit(&format_tokens(*tok), 12), Style::default().fg(CYAN)),
                         Span::raw("  "),
@@ -4666,12 +4749,12 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
                         Span::raw("  "),
                         Span::styled(fit(&m_eff, 10), Style::default().fg(Color::Rgb(66, 165, 245))),
                         Span::raw("  "),
-                        Span::styled(fit(&calls.to_string(), 8), Style::default().fg(DIM_GREY)),
+                        Span::styled(fit(&calls.to_string(), 6), Style::default().fg(DIM_GREY)),
                     ]));
                 }
             }
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("[Esc / Enter / Space to close · press 'w' in ledger to switch active window]", Style::default().fg(GREY).add_modifier(Modifier::DIM))));
+            lines.push(Line::from(Span::styled("[Esc / Enter / Space to close · ↑/↓/j/k to scroll · press 'w' in ledger to switch active window]", Style::default().fg(GREY).add_modifier(Modifier::DIM))));
             lines
         }
         DetailModal::ConsumptionClient { client, window, records, tokens, api_usd, models } => {
@@ -4888,14 +4971,14 @@ fn draw(frame: &mut Frame, app: &App, forced_width: Option<u16>, refresh_seconds
         chunks[2],
     );
     if app.modal != DetailModal::None {
-        let popup_area = centered_rect(84, 82, area);
+        let popup_area = centered_rect(88, 86, area);
         frame.render_widget(Clear, popup_area);
         let m_lines = modal_lines(&app.modal, popup_area.width);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD))
             .title(" DETAIL DRILL-DOWN ");
-        let paragraph = Paragraph::new(m_lines).block(block);
+        let paragraph = Paragraph::new(m_lines).scroll((app.modal_scroll, 0)).block(block);
         frame.render_widget(paragraph, popup_area);
     }
     if app.no_color {
@@ -5355,12 +5438,32 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let m_lines = modal_lines(&app.modal, 100);
         let m_text = m_lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
-        assert!(m_text.contains("CLIENT / HARNESS BREAKDOWN IN THIS WINDOW:"));
-        assert!(m_text.contains("TOP MODELS IN THIS WINDOW:"));
+        assert!(m_text.contains("CLIENT / HARNESS & SUB-MODEL HIERARCHY"));
+        assert!(m_text.contains("▼ "));
+        assert!(m_text.contains("└─ "));
+        assert!(m_text.contains("TOP MODELS IN THIS WINDOW"));
+        assert!(m_text.contains("PARENT HARNESS"));
+
+        // Test modal scrolling with j / k
+        assert_eq!(app.modal_scroll, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.modal_scroll, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.modal_scroll, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.modal_scroll, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.modal_scroll, 0);
 
         // Close modal
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.modal, DetailModal::None);
+        assert_eq!(app.modal_scroll, 0);
+
+        // Verify main ledger view has HARNESS column in TOP MODEL MIX
+        let c_lines = consumption_lines(&app, 120);
+        let c_text = c_lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(c_text.contains("HARNESS"), "Main screen must have HARNESS column");
 
         // Refresh indicator test
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
