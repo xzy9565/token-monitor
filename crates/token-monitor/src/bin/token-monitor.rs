@@ -451,7 +451,7 @@ impl App {
             let target_win = cur_window;
 
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let today_str = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let today_str = local_today_str();
             let mut win_tokens = usage::UsageTokens::default();
             let mut win_records = 0;
             let mut win_usd = 0.0;
@@ -499,7 +499,7 @@ impl App {
             let mut client_models: std::collections::HashMap<String, (i64, f64, usize)> = std::collections::HashMap::new();
             let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let today_str = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let today_str = local_today_str();
 
             for (idx, rec) in report.snapshot.records.iter().enumerate() {
                 if !record_in_window(rec, cur_window, now_ms, &today_str) {
@@ -531,7 +531,7 @@ impl App {
             let mut model_clients: std::collections::HashMap<String, (i64, f64, usize)> = std::collections::HashMap::new();
             let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let today_str = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let today_str = local_today_str();
 
             for (idx, rec) in report.snapshot.records.iter().enumerate() {
                 if !record_in_window(rec, cur_window, now_ms, &today_str) {
@@ -584,7 +584,7 @@ impl App {
             limits_selected: 0,
             consumption_selected: 0,
             modal: DetailModal::None,
-            ledger_window: LedgerWindow::AllTime,
+            ledger_window: LedgerWindow::Today,
             search_query: String::new(),
             searching: false,
         };
@@ -620,7 +620,7 @@ impl App {
             limits_selected: 0,
             consumption_selected: 0,
             modal: DetailModal::None,
-            ledger_window: LedgerWindow::AllTime,
+            ledger_window: LedgerWindow::Today,
             search_query: String::new(),
             searching: false,
         }
@@ -1059,7 +1059,7 @@ fn fixture_window(
 }
 
 fn mock_consumption_report() -> usage::ConsumptionReport {
-    let now = chrono::Utc::now();
+    let now = chrono::Local::now();
     let today_date = now.format("%Y-%m-%d").to_string();
     let yest_date = (now - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
     let d3_date = (now - chrono::Duration::days(3)).format("%Y-%m-%d").to_string();
@@ -2498,12 +2498,26 @@ fn colored_meter(percent: f64, width: usize, color: Color) -> Vec<Span<'static>>
     ]
 }
 
+fn local_today_str() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+fn local_today_start_ms() -> i64 {
+    chrono::Local::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|naive| naive.and_local_timezone(chrono::Local).earliest())
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or_default()
+}
+
 fn record_in_window(rec: &usage::UsageRecord, window: LedgerWindow, now_ms: i64, today_str: &str) -> bool {
     let day_ms = 86_400_000i64;
     match window {
         LedgerWindow::AllTime => true,
         LedgerWindow::Today => {
-            rec.date == today_str || (rec.timestamp >= now_ms.saturating_sub(day_ms) && rec.date.as_str() >= today_str)
+            let today_start_ms = local_today_start_ms();
+            rec.date == today_str || (today_start_ms > 0 && rec.timestamp >= today_start_ms)
         }
         LedgerWindow::Last24h => rec.timestamp >= now_ms.saturating_sub(day_ms),
         LedgerWindow::Last7d => rec.timestamp >= now_ms.saturating_sub(7 * day_ms),
@@ -2605,7 +2619,7 @@ fn consumption_rows(
     query: &str,
 ) -> Vec<ConsumptionRow> {
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let today_str = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let today_str = local_today_str();
     let mut grouped: HashMap<String, ConsumptionRow> = HashMap::new();
     let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
 
@@ -2670,7 +2684,8 @@ fn consumption_rows(
 
 fn compute_temporal_usage(report: &usage::ConsumptionReport) -> Vec<TemporalUsageBucket> {
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let today_date = chrono::Utc::now().date_naive().to_string();
+    let today_date = local_today_str();
+    let today_start_ms = local_today_start_ms();
     let h24_ms = now_ms - 24 * 3600 * 1000;
     let d7_ms = now_ms - 7 * 86400 * 1000;
     let d30_ms = now_ms - 30 * 86400 * 1000;
@@ -2703,7 +2718,7 @@ fn compute_temporal_usage(report: &usage::ConsumptionReport) -> Vec<TemporalUsag
         };
 
         add(&mut all);
-        if record.date == today_date {
+        if record.date == today_date || (today_start_ms > 0 && record.timestamp >= today_start_ms) {
             add(&mut today);
         }
         if record.timestamp >= h24_ms {
@@ -2742,7 +2757,7 @@ fn model_consumption_rows(
     query: &str,
 ) -> Vec<ModelConsumptionRow> {
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let today_str = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let today_str = local_today_str();
     let mut rows: std::collections::HashMap<String, ModelConsumptionRow> = std::collections::HashMap::new();
     let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
 
