@@ -3000,7 +3000,10 @@ pub async fn collect_minimax(options: &CollectorOptions) -> Vec<ProviderSnapshot
             )]
         }
     };
-    let client = match Client::builder().timeout(options.timeout()).build() {
+    let client = match Client::builder()
+        .timeout(options.timeout().min(Duration::from_secs(4)))
+        .build()
+    {
         Ok(client) => client,
         Err(_) => {
             return vec![unavailable_snapshot(
@@ -3015,14 +3018,10 @@ pub async fn collect_minimax(options: &CollectorOptions) -> Vec<ProviderSnapshot
         }
     };
     let urls = [
-        "https://api.minimaxi.com/v1/token_plan/remains",
-        "https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains",
-        "https://api.minimax.io/v1/token_plan/remains",
-        "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
         "https://api.minimaxi.chat/v1/token_plan/remains",
-        "https://api.minimaxi.chat/v1/api/openplatform/coding_plan/remains",
+        "https://api.minimax.io/v1/token_plan/remains",
+        "https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains",
         "https://api.minimax.chat/v1/token_plan/remains",
-        "https://api.minimax.chat/v1/api/openplatform/coding_plan/remains",
     ];
     let mut last_health = SourceHealth::Unavailable;
     for url in urls {
