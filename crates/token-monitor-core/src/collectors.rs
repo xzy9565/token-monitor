@@ -512,11 +512,10 @@ pub async fn collect_cursor(options: &CollectorOptions) -> Vec<ProviderSnapshot>
         let mut windows = vec![];
         let auto_used = cursor_number(summary.get("autoPercentUsed"));
         let api_used = cursor_number(summary.get("apiPercentUsed"));
-        let (auto_remaining, api_remaining) = if is_free && plan_limit == 0.0 {
-            (Some(0.0), Some(0.0))
-        } else {
-            (cursor_remaining_percent(auto_used), cursor_remaining_percent(api_used))
-        };
+        let (auto_remaining, api_remaining) = (
+            cursor_remaining_percent(auto_used),
+            cursor_remaining_percent(api_used),
+        );
 
         if let Some(window) = cursor_window(
             "Cursor Models",
@@ -536,11 +535,7 @@ pub async fn collect_cursor(options: &CollectorOptions) -> Vec<ProviderSnapshot>
         }
         if windows.is_empty() {
             let used = cursor_number(summary.get("totalPercentUsed"));
-            let total_rem = if is_free && plan_limit == 0.0 {
-                Some(0.0)
-            } else {
-                cursor_remaining_percent(used)
-            };
+            let total_rem = cursor_remaining_percent(used);
             if let Some(window) = cursor_window(
                 "Overall",
                 total_rem,
