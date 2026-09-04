@@ -198,20 +198,29 @@ pub struct UsageOptions {
 /// This function is synchronous by design: the caller must run it in a
 /// blocking worker when the interactive TUI is active.
 pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, String> {
+    let clients = options.clients.or_else(|| {
+        let mut list: Vec<String> = tokscale_core::ClientId::iter()
+            .map(|c| c.as_str().to_string())
+            .collect();
+        list.push("cursor".to_string());
+        list.push("synthetic".to_string());
+        Some(list)
+    });
+
     let parsed = tokscale_core::parse_local_clients(tokscale_core::LocalParseOptions {
         home_dir: options
             .home_dir
             .map(|path| path.to_string_lossy().into_owned()),
         use_env_roots: true,
-        clients: options.clients,
-        since: options.since,
+        clients,
+        since: options.since.clone(),
         until: options.until,
         year: options.year,
         scanner_settings: tokscale_core::scanner::ScannerSettings::default(),
     })
     .map_err(|error| format!("tokscale local parse failed: {error}"))?;
 
-    let records = parsed
+    let mut records: Vec<UsageRecord> = parsed
         .messages
         .into_iter()
         .map(|message| UsageRecord {
@@ -232,11 +241,181 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
         })
         .collect();
 
+    collect_commandcode_v3_records(&mut records, options.since.as_deref());
+    collect_cursor_cache_records(&mut records, options.since.as_deref());
+
     Ok(UsageSnapshot {
         records,
         processing_time_ms: parsed.processing_time_ms,
         tokscale_revision: TOKSCALE_REVISION.to_owned(),
     })
+}
+
+fn collect_cursor_cache_records(records: &mut Vec<UsageRecord>, since: Option<&str>) {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return,
+    };
+    let cursor_cache = home.join(".config/tokscale/cursor-cache");
+    if !cursor_cache.exists() {
+        return;
+    }
+    let has_cursor = records.iter().any(|r| r.client == "cursor");
+    if has_cursor {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(cursor_cache) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.ends_with(".csv") {
+            continue;
+        }
+        let msgs = tokscale_core::sessions::cursor::parse_cursor_file(&path);
+        for m in msgs {
+            if let Some(s) = since {
+                if !m.date.is_empty() && m.date.as_str() < s {
+                    continue;
+                }
+            }
+            records.push(UsageRecord {
+                client: "cursor".into(),
+                model_id: m.model_id,
+                provider_id: m.provider_id,
+                session_id: m.session_id,
+                date: m.date,
+                timestamp: m.timestamp,
+                tokens: UsageTokens {
+                    input: m.tokens.input.max(0),
+                    output: m.tokens.output.max(0),
+                    cache_read: m.tokens.cache_read.max(0),
+                    cache_write: m.tokens.cache_write.max(0),
+                    reasoning: m.tokens.reasoning.max(0),
+                },
+                message_count: m.message_count.max(0),
+            });
+        }
+    }
+}
+
+fn collect_commandcode_v3_records(records: &mut Vec<UsageRecord>, since: Option<&str>) {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return,
+    };
+    let projects_dir = home.join(".commandcode/projects");
+    if !projects_dir.exists() {
+        return;
+    }
+    let existing_ids: std::collections::HashSet<String> = records
+        .iter()
+        .filter(|r| r.client == "commandcode")
+        .map(|r| r.session_id.clone())
+        .collect();
+
+    let Ok(project_entries) = std::fs::read_dir(projects_dir) else {
+        return;
+    };
+    for p_entry in project_entries.flatten() {
+        let p_path = p_entry.path();
+        if !p_path.is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&p_path) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let f_path = f.path();
+            let f_name = f_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !f_name.ends_with(".jsonl") || f_name.ends_with(".checkpoints.jsonl") {
+                continue;
+            }
+            let session_id = f_name.trim_end_matches(".jsonl").to_string();
+            if existing_ids.contains(&session_id) {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&f_path) else {
+                continue;
+            };
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                    continue;
+                };
+                if val.get("type").and_then(|t| t.as_str()) != Some("message") {
+                    continue;
+                }
+                let msg = val.get("message").unwrap_or(&serde_json::Value::Null);
+                if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+                    continue;
+                }
+                let usage = val.get("usage").or_else(|| msg.get("usage"));
+                let raw_model = val
+                    .get("model")
+                    .or_else(|| msg.get("model"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown");
+
+                let (provider_id, model_id) = if let Some((p, m)) = raw_model.split_once('/') {
+                    (p.to_ascii_lowercase(), m.to_string())
+                } else {
+                    ("commandcode".to_string(), raw_model.to_string())
+                };
+
+                let ts_str = val.get("timestamp").and_then(|t| t.as_str());
+                let (timestamp, date) = if let Some(ts) = ts_str {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+                        (dt.timestamp_millis(), dt.format("%Y-%m-%d").to_string())
+                    } else {
+                        (0, String::new())
+                    }
+                } else {
+                    (0, String::new())
+                };
+
+                if let Some(s) = since {
+                    if !date.is_empty() && date.as_str() < s {
+                        continue;
+                    }
+                }
+
+                let tokens = if let Some(u) = usage {
+                    UsageTokens {
+                        input: u.get("inputTokens").and_then(|v| v.as_i64()).unwrap_or(0),
+                        output: u.get("outputTokens").and_then(|v| v.as_i64()).unwrap_or(0),
+                        cache_read: u
+                            .get("cacheReadTokens")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0),
+                        cache_write: u
+                            .get("cacheWriteTokens")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0),
+                        reasoning: 0,
+                    }
+                } else {
+                    UsageTokens::default()
+                };
+
+                records.push(UsageRecord {
+                    client: "commandcode".into(),
+                    model_id,
+                    provider_id,
+                    session_id: session_id.clone(),
+                    date,
+                    timestamp,
+                    tokens,
+                    message_count: 1,
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]

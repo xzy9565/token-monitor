@@ -502,12 +502,25 @@ pub async fn collect_cursor(options: &CollectorOptions) -> Vec<ProviderSnapshot>
             .and_then(|value| value.get("plan"))
             .unwrap_or(&Value::Null);
         let (reset_ms, reset_text) = cursor_reset(&usage);
+        let membership = usage
+            .get("membershipType")
+            .and_then(Value::as_str)
+            .unwrap_or("Free");
+        let is_free = membership.eq_ignore_ascii_case("free");
+        let plan_limit = cursor_number(summary.get("limit")).unwrap_or(0.0);
+
         let mut windows = vec![];
         let auto_used = cursor_number(summary.get("autoPercentUsed"));
         let api_used = cursor_number(summary.get("apiPercentUsed"));
+        let (auto_remaining, api_remaining) = if is_free && plan_limit == 0.0 {
+            (Some(0.0), Some(0.0))
+        } else {
+            (cursor_remaining_percent(auto_used), cursor_remaining_percent(api_used))
+        };
+
         if let Some(window) = cursor_window(
             "Cursor Models",
-            cursor_remaining_percent(auto_used),
+            auto_remaining,
             reset_text.clone(),
             reset_ms,
         ) {
@@ -515,7 +528,7 @@ pub async fn collect_cursor(options: &CollectorOptions) -> Vec<ProviderSnapshot>
         }
         if let Some(window) = cursor_window(
             "Other Models",
-            cursor_remaining_percent(api_used),
+            api_remaining,
             reset_text.clone(),
             reset_ms,
         ) {
@@ -523,19 +536,20 @@ pub async fn collect_cursor(options: &CollectorOptions) -> Vec<ProviderSnapshot>
         }
         if windows.is_empty() {
             let used = cursor_number(summary.get("totalPercentUsed"));
+            let total_rem = if is_free && plan_limit == 0.0 {
+                Some(0.0)
+            } else {
+                cursor_remaining_percent(used)
+            };
             if let Some(window) = cursor_window(
                 "Overall",
-                cursor_remaining_percent(used),
+                total_rem,
                 reset_text.clone(),
                 reset_ms,
             ) {
                 windows.push(window);
             }
         }
-        let membership = usage
-            .get("membershipType")
-            .and_then(Value::as_str)
-            .unwrap_or("Free");
         let account_label = user_email.unwrap_or(label);
         let mut provider = connected_snapshot(
             "cursor",
@@ -546,6 +560,9 @@ pub async fn collect_cursor(options: &CollectorOptions) -> Vec<ProviderSnapshot>
             windows,
             75,
         );
+        if is_free && plan_limit == 0.0 {
+            provider.diagnostics.push("Cursor Free plan includes 0 fast requests (slow requests with queue)".into());
+        }
         if cursor_agent_blocked(reset_ms) {
             provider.availability = Availability::AgentBlocked;
             provider
@@ -1853,9 +1870,11 @@ pub async fn collect_codex(options: &CollectorOptions) -> Vec<ProviderSnapshot> 
         .and_then(Value::as_str)
         .unwrap_or("Codex");
     let reset_credits = payload
-        .get("resetCredits")
+        .get("rate_limit_reset_credits")
+        .or_else(|| payload.get("rateLimitResetCredits"))
+        .or_else(|| payload.get("resetCredits"))
         .or_else(|| payload.get("reset_credits"))
-        .and_then(|rc| rc.get("availableCount").or_else(|| rc.get("available_count")))
+        .and_then(|rc| rc.get("available_count").or_else(|| rc.get("availableCount")))
         .and_then(Value::as_i64);
     let mut snapshot = connected_snapshot(
         "codex",
@@ -1867,7 +1886,8 @@ pub async fn collect_codex(options: &CollectorOptions) -> Vec<ProviderSnapshot> 
         43,
     );
     if let Some(credits) = reset_credits.filter(|c| *c > 0) {
-        snapshot.diagnostics.push(format!("{credits} reset credit available"));
+        let s = if credits > 1 { "s" } else { "" };
+        snapshot.diagnostics.push(format!("★ {credits} rate limit reset credit{s} available"));
     }
     vec![snapshot]
 }

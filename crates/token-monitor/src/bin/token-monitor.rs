@@ -3548,7 +3548,9 @@ fn format_quota_cell(
 ) -> Vec<Span<'static>> {
     if let Some(w) = window {
         if let Some(pct) = w.remaining_percent {
-            let color = if pct <= 0.0 {
+            let color = if dimmed {
+                DIM_GREY
+            } else if pct <= 0.0 {
                 RED
             } else if pct < 20.0 {
                 YELLOW
@@ -3565,7 +3567,7 @@ fn format_quota_cell(
             if dimmed || pct <= 0.0 {
                 style = style.add_modifier(Modifier::DIM);
             }
-            if pct <= 0.0 {
+            if pct <= 0.0 && !dimmed {
                 style = style.add_modifier(Modifier::BOLD);
             }
             let mut spans = vec![
@@ -3581,7 +3583,7 @@ fn format_quota_cell(
         } else if let Some(amt) = w.remaining_amount {
             let curr = w.currency.as_deref().unwrap_or("$");
             let text = format!("{}{:.2}", curr, amt);
-            let mut style = Style::default().fg(brand_color);
+            let mut style = Style::default().fg(if dimmed { DIM_GREY } else { brand_color });
             if dimmed {
                 style = style.add_modifier(Modifier::DIM);
             }
@@ -3667,18 +3669,22 @@ fn format_dual_reset(
         }
     });
 
-    let s5_color = if s5.contains('m') || s5.contains("0m") {
-        YELLOW
+    let (s5_color, s7_color) = if dimmed {
+        (DIM_GREY, DIM_GREY)
     } else {
-        GREY
-    };
-
-    let s7_color = if is_urgent {
-        Color::Rgb(245, 175, 45) // Amber gold: expiring soonest!
-    } else if s7.contains('d') {
-        GREY
-    } else {
-        YELLOW
+        let s5_c = if s5.contains('m') || s5.contains("0m") {
+            YELLOW
+        } else {
+            GREY
+        };
+        let s7_c = if is_urgent {
+            Color::Rgb(245, 175, 45) // Amber gold: expiring soonest!
+        } else if s7.contains('d') {
+            GREY
+        } else {
+            YELLOW
+        };
+        (s5_c, s7_c)
     };
 
     let s5_compact = if col_width <= 18 && s5.len() > 6 && s5.contains('h') && s5.contains('m') {
@@ -3704,7 +3710,7 @@ fn format_dual_reset(
 
     let mut s5_style = Style::default().fg(s5_color);
     let mut s7_style = Style::default().fg(s7_color);
-    if is_urgent {
+    if is_urgent && !dimmed {
         s7_style = s7_style.add_modifier(Modifier::BOLD);
     }
     if dimmed {
@@ -3779,42 +3785,47 @@ fn format_matrix_status(
     override_text: Option<(&str, Color)>,
     col_width: usize,
     is_burn_first: bool,
+    dimmed: bool,
 ) -> Span<'static> {
-    if is_burn_first && provider.availability == Availability::Available {
+    if is_burn_first && provider.availability == Availability::Available && !dimmed {
         return Span::styled(
             fit("🔥 BURN FIRST", col_width),
             Style::default().fg(Color::Rgb(245, 175, 45)).add_modifier(Modifier::BOLD),
         );
     }
     if let Some((text, color)) = override_text {
-        return Span::styled(
-            fit(text, col_width),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        );
+        let mut style = Style::default().fg(if dimmed { DIM_GREY } else { color });
+        if dimmed || color == DIM_GREY {
+            style = style.add_modifier(Modifier::DIM);
+        } else {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        return Span::styled(fit(text, col_width), style);
     }
     let (text, color) = match provider.availability {
         Availability::Exhausted => {
-            let has_reset_credit = provider
+            let reset_diag = provider
                 .diagnostics
                 .iter()
-                .any(|d| d.to_ascii_lowercase().contains("reset credit") || d.contains("★"));
-            if has_reset_credit {
-                ("exhausted (★1 credit)", RED)
+                .find(|d| d.to_ascii_lowercase().contains("reset credit") || d.contains("★"));
+            if let Some(diag) = reset_diag {
+                let num = diag.chars().find(|c| c.is_ascii_digit()).unwrap_or('1');
+                (format!("exhausted (★{} resets)", num), Color::Rgb(245, 175, 45))
             } else {
-                ("exhausted", RED)
+                ("exhausted".to_string(), RED)
             }
         }
-        Availability::AgentBlocked => ("blocked", RED),
-        Availability::Available => ("ready", GREEN),
-        Availability::Unknown => ("unknown", GREY),
+        Availability::AgentBlocked => ("blocked".to_string(), RED),
+        Availability::Available => ("ready".to_string(), GREEN),
+        Availability::Unknown => ("unknown".to_string(), GREY),
     };
-    let mut style = Style::default().fg(color);
-    if provider.availability.dimmed() {
+    let mut style = Style::default().fg(if dimmed { DIM_GREY } else { color });
+    if dimmed || provider.availability.dimmed() {
         style = style.add_modifier(Modifier::DIM);
     } else {
         style = style.add_modifier(Modifier::BOLD);
     }
-    Span::styled(fit(text, col_width), style)
+    Span::styled(fit(&text, col_width), style)
 }
 
 fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
@@ -3911,69 +3922,94 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                     (l.contains("claude") || l.contains("gpt")) && (l.contains("7d") || w.kind == WindowKind::Weekly)
                 });
 
+                let g_dim = gemini_5h.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent == Some(0.0));
+                let c_dim = claude_5h.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent == Some(0.0));
+                let all_dim = g_dim && c_dim;
+
                 // Parent row
                 let is_sel = app.limits_selected == s_idx;
                 let ag_brand = provider_brand_color("antigravity");
                 let cursor_mark = if is_sel { "▶ " } else { "  " };
-                let mut title_style = Style::default().fg(ag_brand).add_modifier(Modifier::BOLD);
+                let mut title_style = if all_dim {
+                    Style::default().fg(DIM_GREY)
+                } else {
+                    Style::default().fg(ag_brand).add_modifier(Modifier::BOLD)
+                };
                 if is_sel {
                     title_style = title_style.bg(Color::Rgb(28, 42, 60));
                 }
+                let (marker_char, marker_style) = if all_dim {
+                    ('▲', Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
+                } else if c_dim || g_dim {
+                    ('▲', Style::default().fg(YELLOW))
+                } else {
+                    ('●', Style::default().fg(ag_brand))
+                };
                 let mut parent_spans = vec![
                     Span::styled(cursor_mark, Style::default().fg(if is_sel { Color::Yellow } else { Color::Reset }).add_modifier(Modifier::BOLD)),
-                    Span::styled(
-                        format!("{} ", provider.availability.marker()),
-                        if provider.availability == Availability::Available {
-                            Style::default().fg(ag_brand)
-                        } else {
-                            status_style_for(provider)
-                        },
-                    ),
+                    Span::styled(format!("{marker_char} "), marker_style),
                     Span::styled(
                         fit(&provider_title_base(provider), cols.provider.saturating_sub(4)),
                         title_style,
                     ),
                     Span::raw("  "),
-                    Span::styled(fit("2 pools active", cols.session), Style::default().fg(CYAN)),
+                    Span::styled(fit("2 pools active", cols.session), Style::default().fg(if all_dim { DIM_GREY } else { CYAN })),
                     Span::raw("  "),
                     Span::styled(fit("CLI (port 57388)", cols.cycle), Style::default().fg(DIM_GREY)),
                     Span::raw("  "),
                 ];
-                parent_spans.extend(format_dual_reset(gemini_5h, gemini_7d, cols.reset, now_ms, false));
+                parent_spans.extend(format_dual_reset(gemini_5h, gemini_7d, cols.reset, now_ms, all_dim));
                 parent_spans.push(Span::raw("  "));
-                parent_spans.push(format_matrix_status(provider, Some(("ready", GREEN)), cols.status, false));
+                let parent_status = if all_dim {
+                    ("all capped", DIM_GREY)
+                } else if c_dim {
+                    ("Claude capped", YELLOW)
+                } else if g_dim {
+                    ("Gemini capped", YELLOW)
+                } else {
+                    ("ready", GREEN)
+                };
+                parent_spans.push(format_matrix_status(provider, Some(parent_status), cols.status, false, all_dim));
                 lines.push(Line::from(parent_spans));
 
                 // Sub-row 1: Gemini Pool
                 let gemini_color = Color::Rgb(66, 165, 245);
+                let g_title_style = if g_dim {
+                    Style::default().fg(DIM_GREY)
+                } else {
+                    Style::default().fg(gemini_color).add_modifier(Modifier::BOLD)
+                };
                 let mut g_spans = vec![
                     Span::raw("  "),
-                    Span::styled(fit("├─ Gemini Pool (Flash/Pro)", cols.provider.saturating_sub(2)), Style::default().fg(gemini_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(fit("├─ Gemini Pool (Flash/Pro)", cols.provider.saturating_sub(2)), g_title_style),
                     Span::raw("  "),
                 ];
-                let g_dim = gemini_5h.is_some_and(|w| w.remaining_percent == Some(0.0));
                 g_spans.extend(format_quota_cell(gemini_5h, cols.bar_width, cols.session, gemini_color, g_dim));
                 g_spans.push(Span::raw("  "));
                 g_spans.extend(format_quota_cell(gemini_7d, cols.bar_width, cols.cycle, gemini_color, g_dim));
                 g_spans.push(Span::raw("  "));
                 g_spans.extend(format_dual_reset(gemini_5h, gemini_7d, cols.reset, now_ms, g_dim));
                 g_spans.push(Span::raw("  "));
-                let g_stat = if gemini_5h.is_some_and(|w| w.remaining_percent == Some(0.0)) {
-                    ("5h capped", YELLOW)
+                let g_stat = if g_dim {
+                    ("5h capped", DIM_GREY)
                 } else {
                     ("smooth", GREY)
                 };
-                g_spans.push(format_matrix_status(provider, Some(g_stat), cols.status, false));
+                g_spans.push(format_matrix_status(provider, Some(g_stat), cols.status, false, g_dim));
                 lines.push(Line::from(g_spans));
 
                 // Sub-row 2: Claude / GPT Pool
                 let claude_color = Color::Rgb(217, 119, 87);
+                let c_title_style = if c_dim {
+                    Style::default().fg(DIM_GREY)
+                } else {
+                    Style::default().fg(claude_color).add_modifier(Modifier::BOLD)
+                };
                 let mut c_spans = vec![
                     Span::raw("  "),
-                    Span::styled(fit("└─ Claude/GPT Pool (Sonnet)", cols.provider.saturating_sub(2)), Style::default().fg(claude_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(fit("└─ Claude/GPT Pool (Sonnet)", cols.provider.saturating_sub(2)), c_title_style),
                     Span::raw("  "),
                 ];
-                let c_dim = claude_5h.is_some_and(|w| w.remaining_percent == Some(0.0));
                 c_spans.extend(format_quota_cell(claude_5h, cols.bar_width, cols.session, claude_color, c_dim));
                 c_spans.push(Span::raw("  "));
                 c_spans.extend(format_quota_cell(claude_7d, cols.bar_width, cols.cycle, claude_color, c_dim));
@@ -3982,12 +4018,12 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 c_spans.push(Span::raw("  "));
                 let c_stat = if claude_5h.is_some_and(|w| w.remaining_percent == Some(100.0)) {
                     ("READY (FULL)", GREEN)
-                } else if claude_5h.is_some_and(|w| w.remaining_percent == Some(0.0)) {
-                    ("5h capped", YELLOW)
+                } else if c_dim {
+                    ("5h capped", DIM_GREY)
                 } else {
                     ("ready", GREEN)
                 };
-                c_spans.push(format_matrix_status(provider, Some(c_stat), cols.status, false));
+                c_spans.push(format_matrix_status(provider, Some(c_stat), cols.status, false, c_dim));
                 lines.push(Line::from(c_spans));
                 continue;
             }
@@ -3999,7 +4035,12 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 let other_models = provider.windows.iter().find(|w| w.label.to_ascii_lowercase().contains("other"));
                 let brand = provider_brand_color("cursor");
                 let cursor_mark = if is_sel { "▶ " } else { "  " };
-                let mut title_style = Style::default().fg(brand).add_modifier(Modifier::BOLD);
+                let is_dimmed = provider.availability.dimmed() || provider.source_health != SourceHealth::Connected;
+                let mut title_style = if is_dimmed {
+                    Style::default().fg(DIM_GREY)
+                } else {
+                    Style::default().fg(brand).add_modifier(Modifier::BOLD)
+                };
                 if is_sel {
                     title_style = title_style.bg(Color::Rgb(28, 42, 60));
                 }
@@ -4008,7 +4049,7 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                     Span::styled(
                         format!("{} ", provider.availability.marker()),
                         if provider.availability == Availability::Available {
-                            Style::default().fg(brand)
+                            Style::default().fg(if is_dimmed { DIM_GREY } else { brand })
                         } else {
                             status_style_for(provider)
                         },
@@ -4019,14 +4060,13 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                     ),
                     Span::raw("  "),
                 ];
-                let is_dimmed = provider.availability.dimmed() || provider.source_health != SourceHealth::Connected;
                 row.extend(format_quota_cell(cursor_models, cols.bar_width, cols.session, brand, is_dimmed));
                 row.push(Span::raw("  "));
                 row.extend(format_quota_cell(other_models, cols.bar_width, cols.cycle, brand, is_dimmed));
                 row.push(Span::raw("  "));
                 row.extend(format_dual_reset(None, cursor_models.or(other_models), cols.reset, now_ms, is_dimmed));
                 row.push(Span::raw("  "));
-                row.push(format_matrix_status(provider, None, cols.status, false));
+                row.push(format_matrix_status(provider, None, cols.status, false, is_dimmed));
                 lines.push(Line::from(row));
                 continue;
             }
@@ -4047,7 +4087,7 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
             let is_dimmed = provider.availability.dimmed() || is_session_capped || is_cycle_capped || provider.source_health != SourceHealth::Connected;
             let cursor_mark = if is_sel { "▶ " } else { "  " };
             let mut title_style = if is_dimmed {
-                Style::default().fg(brand).add_modifier(Modifier::DIM)
+                Style::default().fg(DIM_GREY)
             } else {
                 Style::default().fg(brand).add_modifier(Modifier::BOLD)
             };
@@ -4079,14 +4119,14 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
             row.push(Span::raw("  "));
 
             let is_burn_first = burn_rec.as_ref().is_some_and(|b| b.provider_title == display_name);
-            let status_override = if session_w.is_some_and(|w| w.remaining_percent == Some(0.0)) && provider.availability == Availability::Available {
-                Some(("5h capped", YELLOW))
-            } else if cycle_w.is_some_and(|w| w.remaining_percent == Some(0.0)) && provider.availability == Availability::Available {
-                Some(("weekly cap", RED))
+            let status_override = if is_session_capped && provider.availability == Availability::Available {
+                Some(("5h capped", DIM_GREY))
+            } else if is_cycle_capped && provider.availability == Availability::Available {
+                Some(("weekly cap", DIM_GREY))
             } else {
                 None
             };
-            row.push(format_matrix_status(provider, status_override, cols.status, is_burn_first));
+            row.push(format_matrix_status(provider, status_override, cols.status, is_burn_first, is_dimmed));
             lines.push(Line::from(row));
         }
     }
@@ -4645,7 +4685,15 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled("DIAGNOSTICS & DETAILS:", Style::default().fg(GREY).add_modifier(Modifier::BOLD))));
                 for d in &p.diagnostics {
-                    lines.push(Line::from(Span::styled(format!("  • {}", fit(d, max_w)), Style::default().fg(GREY))));
+                    if d.contains("reset credit") || d.contains("★") {
+                        lines.push(Line::from(vec![
+                            Span::styled("  ★ ", Style::default().fg(Color::Rgb(245, 175, 45)).add_modifier(Modifier::BOLD)),
+                            Span::styled(d.clone(), Style::default().fg(Color::Rgb(245, 175, 45)).add_modifier(Modifier::BOLD)),
+                            Span::styled("  (Available in ChatGPT Web / Codex to reset quota immediately)", Style::default().fg(GREY)),
+                        ]));
+                    } else {
+                        lines.push(Line::from(Span::styled(format!("  • {}", fit(d, max_w)), Style::default().fg(GREY))));
+                    }
                 }
             }
             lines.push(Line::from(""));
