@@ -850,7 +850,7 @@ impl App {
                 })
             })
             .unwrap_or(0);
-        self.scroll = self.settings.selected as u16;
+        self.scroll = 0;
     }
 
     fn selected_credential_spec(&self) -> Option<&'static CredentialSpec> {
@@ -975,12 +975,10 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.settings.selected = self.settings.selected.saturating_sub(1);
-                self.scroll = self.settings.selected as u16;
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.settings.selected = (self.settings.selected + 1)
                     .min(self.settings.provider_ids.len().saturating_sub(1));
-                self.scroll = self.settings.selected as u16;
             }
             KeyCode::Enter => self.begin_settings_edit(),
             KeyCode::Char('d') => self.delete_settings_credential(),
@@ -3296,7 +3294,7 @@ fn settings_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         }
         lines.push(Line::from(vec![
             Span::styled(
-                if selected { "› " } else { "  " },
+                if selected { "▶ " } else { "  " },
                 Style::default().fg(Color::White),
             ),
             Span::styled(fit(label, provider_width.saturating_sub(2)), provider_style),
@@ -4731,19 +4729,21 @@ fn draw(frame: &mut Frame, app: &App, forced_width: Option<u16>, refresh_seconds
     let total_lines = body_rendered.len() as u16;
     let viewport_height = chunks[1].height;
 
-    let cursor_line = body_rendered
+    let cursor_pos = body_rendered
         .iter()
-        .position(|line| line.spans.iter().any(|s| s.content.contains('▶')))
-        .unwrap_or(0) as u16;
+        .position(|line| line.spans.iter().any(|s| s.content.contains('▶') || s.content.contains('›')));
 
     let effective_scroll = if total_lines <= viewport_height {
         0
     } else {
         let mut s = app.scroll;
-        if cursor_line < s {
-            s = cursor_line;
-        } else if cursor_line >= s.saturating_add(viewport_height) {
-            s = cursor_line.saturating_add(1).saturating_sub(viewport_height);
+        if let Some(c_line) = cursor_pos {
+            let cursor_line = c_line as u16;
+            if cursor_line < s {
+                s = cursor_line;
+            } else if cursor_line >= s.saturating_add(viewport_height) {
+                s = cursor_line.saturating_add(1).saturating_sub(viewport_height);
+            }
         }
         let max_scroll = total_lines.saturating_sub(viewport_height);
         s.min(max_scroll)
@@ -5303,5 +5303,32 @@ mod tests {
         assert!(text.contains("Modal · workspace-a"));
         assert!(text.contains("TOKEN CONSUMPTION & VELOCITY"));
         assert!(!text.contains("Modal · Modal"));
+    }
+
+    #[test]
+    fn settings_screen_scrolls_viewport_when_scrolling_down() {
+        let mut app = App::new(true, false);
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!(app.view, View::Settings);
+        // Scroll down 15 times to select an item past the initial viewport
+        for _ in 0..15 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let sel_id = &app.settings.provider_ids[app.settings.selected];
+        let sel_label = token_monitor_core::provider_registry::display_name(sel_id);
+
+        let backend = ratatui::backend::TestBackend::new(100, 14);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal.draw(|frame| draw(frame, &app, None, 60)).expect("draw");
+
+        let mut rendered = String::new();
+        for y in 0..14 {
+            for x in 0..100 {
+                rendered.push_str(terminal.backend().buffer().get(x, y).symbol());
+            }
+            rendered.push('\n');
+        }
+        assert!(rendered.contains("▶"));
+        assert!(rendered.contains(sel_label));
     }
 }
