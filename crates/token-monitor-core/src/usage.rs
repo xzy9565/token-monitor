@@ -243,6 +243,8 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
 
     collect_commandcode_v3_records(&mut records, options.since.as_deref());
     collect_cursor_cache_records(&mut records, options.since.as_deref());
+    enrich_antigravity_timestamps(&mut records);
+    tag_antigravity_account_records(&mut records);
 
     Ok(UsageSnapshot {
         records,
@@ -418,6 +420,371 @@ fn collect_commandcode_v3_records(records: &mut Vec<UsageRecord>, since: Option<
     }
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Deserialize)]
+struct SessionSpanRecord {
+    session_id: String,
+    #[serde(default)]
+    target: Option<u32>,
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    start_ms: Option<i64>,
+    #[serde(default)]
+    end_ms: Option<i64>,
+    #[serde(default)]
+    start_idx: Option<i64>,
+    #[serde(default)]
+    end_idx: Option<i64>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+fn tag_antigravity_account_records(records: &mut [UsageRecord]) {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return,
+    };
+    let spans_file = home.join(".gemini/accounts/session_spans.jsonl");
+    if !spans_file.exists() {
+        return;
+    }
+    let content = match std::fs::read_to_string(&spans_file) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let mut spans_by_session: std::collections::HashMap<String, Vec<SessionSpanRecord>> =
+        std::collections::HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(span) = serde_json::from_str::<SessionSpanRecord>(line) {
+            spans_by_session
+                .entry(span.session_id.clone())
+                .or_default()
+                .push(span);
+        }
+    }
+    if spans_by_session.is_empty() {
+        return;
+    }
+    for spans in spans_by_session.values_mut() {
+        spans.sort_by(|a, b| {
+            a.start_idx
+                .unwrap_or(0)
+                .cmp(&b.start_idx.unwrap_or(0))
+                .then_with(|| a.start_ms.unwrap_or(0).cmp(&b.start_ms.unwrap_or(0)))
+        });
+    }
+
+    let mut session_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for record in records.iter_mut() {
+        if record.client != "antigravity-cli" {
+            continue;
+        }
+        let turn_entry = session_counts.entry(record.session_id.clone()).or_insert(0);
+        let current_turn = *turn_entry;
+        *turn_entry += 1;
+
+        if let Some(spans) = spans_by_session.get(&record.session_id) {
+            let first_acct = spans.first().and_then(|s| s.account.as_deref());
+            let all_same = spans.iter().all(|s| s.account.as_deref() == first_acct);
+            if all_same && first_acct.is_some() {
+                if let Some(acct) = first_acct {
+                    record.client = format!("antigravity-cli ({acct})");
+                    continue;
+                }
+            }
+
+            for span in spans.iter().rev() {
+                let start_idx = span.start_idx.unwrap_or(0);
+                if current_turn >= start_idx {
+                    if let Some(end_idx) = span.end_idx {
+                        if current_turn > end_idx {
+                            continue;
+                        }
+                    }
+                    let acct_name = span
+                        .account
+                        .clone()
+                        .unwrap_or_else(|| format!("Account {}", span.target.unwrap_or(1)));
+                    record.client = format!("antigravity-cli ({acct_name})");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum ProtoWire<'a> {
+    Varint(u64),
+    Fixed64(u64),
+    Len(&'a [u8]),
+    Fixed32,
+}
+
+struct ProtoWireReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ProtoWireReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn read_varint(&mut self) -> Option<u64> {
+        let mut result = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let byte = *self.buf.get(self.pos)?;
+            self.pos += 1;
+            result |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(result);
+            }
+            shift += 7;
+            if shift >= 64 {
+                return None;
+            }
+        }
+    }
+
+    fn next_field(&mut self) -> Option<(u64, ProtoWire<'a>)> {
+        if self.pos >= self.buf.len() {
+            return None;
+        }
+        let tag = self.read_varint()?;
+        let field = tag >> 3;
+        let wire = match tag & 0x7 {
+            0 => ProtoWire::Varint(self.read_varint()?),
+            1 => {
+                let end = self.pos.checked_add(8).filter(|&p| p <= self.buf.len())?;
+                let bytes: [u8; 8] = self.buf[self.pos..end].try_into().ok()?;
+                self.pos = end;
+                ProtoWire::Fixed64(u64::from_le_bytes(bytes))
+            }
+            2 => {
+                let len = self.read_varint()? as usize;
+                let end = self.pos.checked_add(len).filter(|&p| p <= self.buf.len())?;
+                let bytes = &self.buf[self.pos..end];
+                self.pos = end;
+                ProtoWire::Len(bytes)
+            }
+            5 => {
+                self.pos = self.pos.checked_add(4).filter(|&p| p <= self.buf.len())?;
+                ProtoWire::Fixed32
+            }
+            _ => return None,
+        };
+        Some((field, wire))
+    }
+}
+
+fn extract_proto_timestamp_ms(buf: &[u8]) -> Option<i64> {
+    let mut reader = ProtoWireReader::new(buf);
+    let mut seconds = None;
+    let mut nanos = 0i64;
+    while let Some((field, wire)) = reader.next_field() {
+        match (field, wire) {
+            (1, ProtoWire::Varint(s)) => seconds = Some(s as i64),
+            (2, ProtoWire::Varint(n)) => nanos = n as i64,
+            _ => {}
+        }
+    }
+    let sec = seconds?;
+    if !(1_000_000_000..=3_000_000_000).contains(&sec) {
+        return None;
+    }
+    Some(sec.saturating_mul(1000).saturating_add(nanos / 1_000_000))
+}
+
+fn extract_step_timestamp_ms(metadata: &[u8]) -> Option<i64> {
+    let mut reader = ProtoWireReader::new(metadata);
+    while let Some((field, wire)) = reader.next_field() {
+        if field == 1 || field == 6 || field == 7 {
+            if let ProtoWire::Len(bytes) = wire {
+                if let Some(ts) = extract_proto_timestamp_ms(bytes) {
+                    return Some(ts);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_gen_metadata_turn(blob: &[u8]) -> Option<(Option<String>, Vec<i64>)> {
+    let mut reader = ProtoWireReader::new(blob);
+    let mut chat_model_bytes = None;
+    let mut step_bytes = None;
+    while let Some((field, wire)) = reader.next_field() {
+        match (field, wire) {
+            (1, ProtoWire::Len(b)) => chat_model_bytes = Some(b),
+            (2, ProtoWire::Len(b)) => step_bytes = Some(b),
+            _ => {}
+        }
+    }
+    let cm = chat_model_bytes?;
+    let mut cm_reader = ProtoWireReader::new(cm);
+    let mut usage_bytes = None;
+    while let Some((field, wire)) = cm_reader.next_field() {
+        if field == 4 {
+            if let ProtoWire::Len(b) = wire {
+                usage_bytes = Some(b);
+                break;
+            }
+        }
+    }
+    let u = usage_bytes?;
+    let mut u_reader = ProtoWireReader::new(u);
+    let mut inp1 = 0u64;
+    let mut inp2 = 0u64;
+    let mut out = 0u64;
+    let mut cch = 0u64;
+    let mut rea = 0u64;
+    let mut dedup_id = None;
+    while let Some((field, wire)) = u_reader.next_field() {
+        match (field, wire) {
+            (1, ProtoWire::Varint(v)) => inp1 = v,
+            (2, ProtoWire::Varint(v)) => inp2 = v,
+            (5, ProtoWire::Varint(v)) => cch = v,
+            (9, ProtoWire::Varint(v)) => out = v,
+            (10, ProtoWire::Varint(v)) => rea = v,
+            (11, ProtoWire::Len(b)) => {
+                if let Ok(s) = std::str::from_utf8(b) {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        dedup_id = Some(trimmed.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if inp1 == 0 && inp2 == 0 && out == 0 && cch == 0 && rea == 0 {
+        return None;
+    }
+    let mut step_indices = Vec::new();
+    if let Some(sb) = step_bytes {
+        let mut s_reader = ProtoWireReader::new(sb);
+        while let Some(idx) = s_reader.read_varint() {
+            step_indices.push(idx as i64);
+        }
+    }
+    Some((dedup_id, step_indices))
+}
+
+fn enrich_antigravity_timestamps(records: &mut [UsageRecord]) {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return,
+    };
+    let conv_dir = home.join(".gemini/antigravity-cli/conversations");
+    if !conv_dir.exists() {
+        return;
+    }
+
+    let mut session_map: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (idx, record) in records.iter().enumerate() {
+        if record.client.starts_with("antigravity-cli") {
+            session_map.entry(record.session_id.clone()).or_default().push(idx);
+        }
+    }
+
+    for (session_id, record_indices) in session_map {
+        if record_indices.len() <= 1 {
+            continue;
+        }
+        // Defensive bypass: only enrich if all records share the exact same fallback timestamp
+        let first_ts = records[record_indices[0]].timestamp;
+        let all_identical = record_indices.iter().all(|&i| records[i].timestamp == first_ts);
+        if !all_identical {
+            continue;
+        }
+
+        let db_path = conv_dir.join(format!("{session_id}.db"));
+        if !db_path.exists() {
+            continue;
+        }
+
+        let conn = match rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        ) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Extract step timestamps
+        let mut step_timestamps: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL") {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    let idx: i64 = match row.get(0) {
+                        Ok(i) => i,
+                        Err(_) => continue,
+                    };
+                    let meta: Vec<u8> = match row.get(1) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if let Some(ts) = extract_step_timestamp_ms(&meta) {
+                        step_timestamps.insert(idx, ts);
+                    }
+                }
+            }
+        }
+
+        if step_timestamps.is_empty() {
+            continue;
+        }
+
+        // Extract turn timestamps from gen_metadata in order
+        let mut turn_timestamps = Vec::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT data FROM gen_metadata ORDER BY idx") {
+            if let Ok(mut rows) = stmt.query([]) {
+                let mut seen_ids = std::collections::HashSet::new();
+                while let Ok(Some(row)) = rows.next() {
+                    let blob: Vec<u8> = match row.get(0) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                    let Some((dedup_id, step_indices)) = parse_gen_metadata_turn(&blob) else {
+                        continue;
+                    };
+                    if let Some(id) = dedup_id {
+                        if !seen_ids.insert(id) {
+                            continue;
+                        }
+                    }
+                    let mut turn_ts = None;
+                    for s_idx in step_indices {
+                        if let Some(&ts) = step_timestamps.get(&s_idx) {
+                            turn_ts = Some(ts);
+                            break;
+                        }
+                    }
+                    turn_timestamps.push(turn_ts);
+                }
+            }
+        }
+
+        for (&r_idx, maybe_ts) in record_indices.iter().zip(turn_timestamps) {
+            if let Some(ts) = maybe_ts {
+                records[r_idx].timestamp = ts;
+                if let Some(dt) = chrono::DateTime::from_timestamp_millis(ts) {
+                    records[r_idx].date = dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string();
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +860,31 @@ mod tests {
         assert_eq!(report.summary.unpriced_tokens, 30);
         assert_eq!(report.summary.unknown_rows, 1);
         assert!(report.summary.api_equivalent_usd.is_none());
+    }
+
+    #[test]
+    fn extract_proto_timestamp_decodes_seconds_and_nanos() {
+        // Wire encoded {1: 1788640000, 2: 500000000}
+        // tag 1 (field 1, varint): (1 << 3) | 0 = 0x08
+        // 1788640000 in varint
+        // tag 2 (field 2, varint): (2 << 3) | 0 = 0x10
+        let mut buf = Vec::new();
+        buf.push(0x08);
+        let mut s = 1788640000u64;
+        while s >= 0x80 {
+            buf.push((s as u8 & 0x7f) | 0x80);
+            s >>= 7;
+        }
+        buf.push(s as u8);
+        buf.push(0x10);
+        let mut n = 500_000_000u64;
+        while n >= 0x80 {
+            buf.push((n as u8 & 0x7f) | 0x80);
+            n >>= 7;
+        }
+        buf.push(n as u8);
+
+        let ms = extract_proto_timestamp_ms(&buf);
+        assert_eq!(ms, Some(1788640000500));
     }
 }

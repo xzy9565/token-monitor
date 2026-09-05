@@ -2160,13 +2160,50 @@ async fn antigravity_call(
         .map_err(|_| "Invalid Antigravity RPC JSON".to_owned())
 }
 
+fn cached_antigravity_snapshots(live_emails: &std::collections::HashSet<String>) -> Vec<ProviderSnapshot> {
+    let mut cached_list = Vec::new();
+    let mut seen_emails = live_emails.clone();
+    if let Ok(storage) = crate::storage::Storage::open_default() {
+        if let Ok(saved) = storage.latest_provider_snapshots() {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            for item in saved {
+                if item.provider_id == "antigravity"
+                    && item.account_label.contains('@')
+                    && !seen_emails.contains(&item.account_label)
+                    && !item.windows.is_empty()
+                {
+                    let has_active_countdown = item
+                        .windows
+                        .iter()
+                        .any(|w| w.resets_at_ms.map_or(false, |r| r > now_ms));
+                    if has_active_countdown {
+                        seen_emails.insert(item.account_label.clone());
+                        let mut cached = item;
+                        cached.source_health = SourceHealth::Stale;
+                        cached_list.push(cached);
+                    }
+                }
+            }
+        }
+    }
+    cached_list
+}
+
 pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnapshot> {
     if !options.includes("antigravity") {
         return vec![];
     }
-    let ps = match run_text_command("ps", &["-axo", "pid=,command="], options.timeout()).await {
-        Ok(output) => output,
-        Err(_) => {
+    let ps = match tokio::process::Command::new("ps")
+        .args(["-eo", "pid,command"])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).into_owned(),
+        _ => {
+            let cached = cached_antigravity_snapshots(&std::collections::HashSet::new());
+            if !cached.is_empty() {
+                return cached;
+            }
             return vec![unavailable_snapshot(
                 "antigravity",
                 "".into(),
@@ -2175,11 +2212,15 @@ pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnap
                 SourceHealth::Unavailable,
                 "Process list unavailable",
                 141,
-            )]
+            )];
         }
     };
     let servers = antigravity_servers(&ps);
     if servers.is_empty() {
+        let cached = cached_antigravity_snapshots(&std::collections::HashSet::new());
+        if !cached.is_empty() {
+            return cached;
+        }
         return vec![unavailable_snapshot(
             "antigravity",
             "".into(),
@@ -2197,6 +2238,10 @@ pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnap
     {
         Ok(client) => client,
         Err(_) => {
+            let cached = cached_antigravity_snapshots(&std::collections::HashSet::new());
+            if !cached.is_empty() {
+                return cached;
+            }
             return vec![unavailable_snapshot(
                 "antigravity",
                 "".into(),
@@ -2205,12 +2250,20 @@ pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnap
                 SourceHealth::Unavailable,
                 "HTTP client unavailable",
                 141,
-            )]
+            )];
         }
     };
+
+    let mut snapshots = Vec::new();
+    let mut live_emails = std::collections::HashSet::new();
+
     for server in servers {
         let ports = antigravity_ports(server.pid, options.timeout()).await;
+        let mut server_connected = false;
         for port in ports {
+            if server_connected {
+                break;
+            }
             for scheme in ["http", "https"] {
                 let result = antigravity_call(
                     &client,
@@ -2251,27 +2304,41 @@ pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnap
                     .and_then(|value| value.get("name"))
                     .and_then(Value::as_str)
                     .unwrap_or("Pro");
-                return vec![connected_snapshot(
-                    "antigravity",
-                    account_key("antigravity", email),
-                    email.into(),
-                    plan.into(),
-                    "rpc",
-                    windows,
-                    141,
-                )];
+
+                if live_emails.insert(email.to_string()) {
+                    snapshots.push(connected_snapshot(
+                        "antigravity",
+                        account_key("antigravity", email),
+                        email.into(),
+                        plan.into(),
+                        "rpc",
+                        windows,
+                        141,
+                    ));
+                }
+                server_connected = true;
+                break;
             }
         }
     }
-    vec![unavailable_snapshot(
-        "antigravity",
-        "".into(),
-        "Pro".into(),
-        "rpc",
-        SourceHealth::Unavailable,
-        "Antigravity quota RPC unavailable",
-        141,
-    )]
+
+    // Append cached offline snapshots for accounts with active countdown timers
+    let mut cached_offline = cached_antigravity_snapshots(&live_emails);
+    snapshots.append(&mut cached_offline);
+
+    if snapshots.is_empty() {
+        vec![unavailable_snapshot(
+            "antigravity",
+            "".into(),
+            "Pro".into(),
+            "rpc",
+            SourceHealth::Unavailable,
+            "Antigravity quota RPC unavailable",
+            141,
+        )]
+    } else {
+        snapshots
+    }
 }
 
 async fn grok_rpc_billing(options: &CollectorOptions) -> Result<Value, String> {

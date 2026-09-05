@@ -1732,10 +1732,27 @@ fn display_plan(plan: &str) -> String {
     match plan.to_ascii_lowercase().as_str() {
         "free" => "Free".into(),
         "plus" => "Plus".into(),
-        "pro" => "Pro".into(),
+        "pro" | "google ai pro" => "Pro".into(),
         "team" | "teams" => "Team".into(),
         "pay-as-you-go" | "pay as you go" | "payg" => "Pay-as-you-go".into(),
         _ => plan.to_owned(),
+    }
+}
+
+fn provider_compact_identity(provider: &ProviderSnapshot, show_account: bool) -> Option<String> {
+    let raw = provider.account_label.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let candidate = raw.split('@').next().unwrap_or(raw).trim();
+    if candidate.is_empty() {
+        return None;
+    }
+    if show_account {
+        Some(candidate.to_owned())
+    } else {
+        let first = candidate.chars().next().unwrap_or('*');
+        Some(format!("{first}***"))
     }
 }
 
@@ -1772,8 +1789,7 @@ fn provider_identity(provider: &ProviderSnapshot, show_account: bool) -> Option<
     Some(value)
 }
 
-#[allow(dead_code)]
-fn provider_titles(providers: &[&ProviderSnapshot], show_account: bool) -> Vec<String> {
+fn provider_titles_fitted(providers: &[&ProviderSnapshot], show_account: bool, max_w: usize) -> Vec<String> {
     let bases = providers
         .iter()
         .map(|provider| provider_title_base(provider))
@@ -1787,6 +1803,12 @@ fn provider_titles(providers: &[&ProviderSnapshot], show_account: bool) -> Vec<S
         .zip(bases)
         .map(|(provider, base)| {
             if counts.get(&base).copied().unwrap_or(0) > 1 {
+                let name = provider_name(&provider.provider_id);
+                if max_w < 30 {
+                    if let Some(short_id) = provider_compact_identity(provider, show_account) {
+                        return format!("{name} ({short_id})");
+                    }
+                }
                 if let Some(identity) = provider_identity(provider, show_account) {
                     return format!("{base} · {identity}");
                 }
@@ -1794,6 +1816,11 @@ fn provider_titles(providers: &[&ProviderSnapshot], show_account: bool) -> Vec<S
             base
         })
         .collect()
+}
+
+#[allow(dead_code)]
+fn provider_titles(providers: &[&ProviderSnapshot], show_account: bool) -> Vec<String> {
+    provider_titles_fitted(providers, show_account, 100)
 }
 
 #[allow(dead_code)]
@@ -2497,30 +2524,76 @@ struct TemporalUsageBucket {
     records: usize,
 }
 fn normalize_client_id(client: &str) -> String {
-    let s = client.trim().to_ascii_lowercase();
-    if s.contains("codex") || s.contains("openai") {
+    let s = client.trim();
+    let lower = s.to_ascii_lowercase();
+    if lower.contains("codex") || lower.contains("openai") {
         "Codex".to_owned()
-    } else if s.contains("claude") || s.contains("anthropic") {
+    } else if lower.contains("claude") || lower.contains("anthropic") {
         "Claude".to_owned()
-    } else if s.contains("antigravity-cli") || s.contains("antigravity cli") || s == "antigravity_cli" {
+    } else if lower.starts_with("antigravity-cli (") && lower.ends_with(')') {
+        let inner = s[17..s.len() - 1].trim();
+        format!("Antigravity Cli ({inner})")
+    } else if lower.contains("antigravity-cli") || lower.contains("antigravity cli") || lower == "antigravity_cli" {
         "Antigravity Cli".to_owned()
-    } else if s.contains("antigravity") || s.contains("google") {
+    } else if lower.contains("antigravity") || lower.contains("google") {
         "Antigravity".to_owned()
-    } else if s.contains("opencode") {
+    } else if lower.contains("opencode") {
         "OpenCode".to_owned()
-    } else if s.contains("grok") || s.contains("xai") {
+    } else if lower.contains("grok") || lower.contains("xai") {
         "Grok".to_owned()
-    } else if s.contains("cursor") {
+    } else if lower.contains("cursor") {
         "Cursor".to_owned()
-    } else if s.is_empty() {
+    } else if lower.is_empty() {
         "Unknown".to_owned()
     } else {
-        let mut chars = s.chars();
+        let mut chars = lower.chars();
         match chars.next() {
             Some(f) => format!("{}{}", f.to_ascii_uppercase(), chars.as_str()),
             None => "Unknown".to_owned(),
         }
     }
+}
+
+fn format_client_display(client: &str, max_w: usize) -> String {
+    let s = client.trim();
+    let lower = s.to_ascii_lowercase();
+    if (lower.starts_with("antigravity-cli (") || lower.starts_with("antigravity cli ("))
+        && lower.ends_with(')')
+    {
+        if let (Some(open), Some(close)) = (s.find('('), s.rfind(')')) {
+            if open < close {
+                let inner = s[open + 1..close].trim();
+                let full = format!("Antigravity Cli ({inner})");
+                if full.len() <= max_w {
+                    return full;
+                }
+                let med = format!("Antigravity ({inner})");
+                if med.len() <= max_w {
+                    return med;
+                }
+                let short_acct = inner.replace("Account ", "Acct ");
+                let compact = format!("Antigravity ({short_acct})");
+                if compact.len() <= max_w {
+                    return compact;
+                }
+                let mini = format!("AGY ({short_acct})");
+                if mini.len() <= max_w {
+                    return mini;
+                }
+                return fit(&full, max_w);
+            }
+        }
+    }
+    if lower == "antigravity-cli" || lower == "antigravity cli" {
+        if max_w >= 15 {
+            return "Antigravity Cli".to_string();
+        }
+        if max_w >= 11 {
+            return "Antigravity".to_string();
+        }
+        return "AGY".to_string();
+    }
+    fit(s, max_w)
 }
 
 fn client_brand_color(client: &str) -> Color {
@@ -3080,13 +3153,21 @@ fn consumption_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             Style::default().fg(GREY),
         )));
     } else {
-        let label_width = if width >= 120 { 26 } else { 20 };
+        let label_width = if width >= 140 {
+            32
+        } else if width >= 115 {
+            28
+        } else if width >= 95 {
+            26
+        } else {
+            20
+        };
         let token_width = 12;
         let api_width = 12;
         let coverage_width = 12;
         let bar_width = (width as usize)
             .saturating_sub(label_width + token_width + api_width + coverage_width + 8)
-            .clamp(6, 18);
+            .clamp(6, 24);
         lines.push(Line::from(vec![
             Span::styled(fit("SOURCE", label_width), Style::default().fg(GREY)),
             Span::raw("  "),
@@ -3129,9 +3210,10 @@ fn consumption_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 label_style = label_style.bg(Color::Rgb(28, 42, 60)).add_modifier(Modifier::BOLD);
             }
             let cursor_mark = if is_sel { "▶ " } else { "  " };
+            let display_client = format_client_display(&row.client, label_width.saturating_sub(2));
             let mut row_spans = vec![
                 Span::styled(cursor_mark, Style::default().fg(if is_sel { Color::Yellow } else { Color::Reset }).add_modifier(Modifier::BOLD)),
-                Span::styled(fit(&row.client, label_width.saturating_sub(2)), label_style),
+                Span::styled(fit(&display_client, label_width.saturating_sub(2)), label_style),
                 Span::raw("  "),
                 Span::styled(
                     fit(&token_text, token_width),
@@ -3158,14 +3240,30 @@ fn consumption_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     ]));
 
     let max_m_tokens = m_rows.iter().map(|m| m.token_total()).max().unwrap_or(0);
-    let m_label_w = if width >= 120 { 28 } else { 22 };
-    let harness_w = if width >= 120 { 18 } else { 14 };
+    let m_label_w = if width >= 140 {
+        28
+    } else if width >= 115 {
+        24
+    } else if width >= 95 {
+        22
+    } else {
+        20
+    };
+    let harness_w = if width >= 140 {
+        30
+    } else if width >= 115 {
+        26
+    } else if width >= 95 {
+        24
+    } else {
+        18
+    };
     let token_width = 12;
     let api_width = 10;
     let coverage_width = 11;
     let m_bar_width = (width as usize)
         .saturating_sub(m_label_w + harness_w + token_width + api_width + coverage_width + 10)
-        .clamp(4, 18);
+        .clamp(4, 24);
 
     lines.push(Line::from(vec![
         Span::styled(fit("MODEL", m_label_w), Style::default().fg(GREY)),
@@ -3210,6 +3308,7 @@ fn consumption_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         let cursor_mark = if is_sel { "▶ " } else { "  " };
         let parent_harness = m_row.primary_client();
         let h_brand = client_brand_color(&parent_harness);
+        let display_harness = format_client_display(&parent_harness, harness_w);
 
         let m_meter = colored_meter(
             if max_m_tokens > 0 {
@@ -3225,7 +3324,7 @@ fn consumption_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             Span::styled(cursor_mark, Style::default().fg(if is_sel { Color::Yellow } else { Color::Reset }).add_modifier(Modifier::BOLD)),
             Span::styled(fit(&m_row.model, m_label_w.saturating_sub(2)), m_style),
             Span::raw("  "),
-            Span::styled(fit(&parent_harness, harness_w), Style::default().fg(h_brand)),
+            Span::styled(fit(&display_harness, harness_w), Style::default().fg(h_brand)),
             Span::raw("  "),
             Span::styled(fit(&token_text, token_width), Style::default().fg(CYAN)),
             Span::raw("  "),
@@ -3900,6 +3999,8 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
             Style::default().fg(DIM_GREY),
         )));
 
+        let titles = provider_titles_fitted(&subscriptions, app.show_account, cols.provider.saturating_sub(4));
+
         for (s_idx, provider) in subscriptions.iter().enumerate() {
             let pid = provider.provider_id.to_ascii_lowercase();
 
@@ -3945,17 +4046,24 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 } else {
                     ('●', Style::default().fg(ag_brand))
                 };
+                let cli_tag = if cols.cycle >= 16 {
+                    "CLI (port 57388)"
+                } else if cols.cycle >= 9 {
+                    "CLI (RPC)"
+                } else {
+                    "CLI"
+                };
                 let mut parent_spans = vec![
                     Span::styled(cursor_mark, Style::default().fg(if is_sel { Color::Yellow } else { Color::Reset }).add_modifier(Modifier::BOLD)),
                     Span::styled(format!("{marker_char} "), marker_style),
                     Span::styled(
-                        fit(&provider_title_base(provider), cols.provider.saturating_sub(4)),
+                        fit(&titles[s_idx], cols.provider.saturating_sub(4)),
                         title_style,
                     ),
                     Span::raw("  "),
                     Span::styled(fit("2 pools active", cols.session), Style::default().fg(if all_dim { DIM_GREY } else { CYAN })),
                     Span::raw("  "),
-                    Span::styled(fit("CLI (port 57388)", cols.cycle), Style::default().fg(DIM_GREY)),
+                    Span::styled(fit(cli_tag, cols.cycle), Style::default().fg(DIM_GREY)),
                     Span::raw("  "),
                 ];
                 parent_spans.extend(format_dual_reset(gemini_5h, gemini_7d, cols.reset, now_ms, all_dim));
@@ -3979,9 +4087,14 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 } else {
                     Style::default().fg(gemini_color).add_modifier(Modifier::BOLD)
                 };
+                let g_pool_label = if cols.provider.saturating_sub(2) < 26 {
+                    "├─ Gemini (Flash/Pro)"
+                } else {
+                    "├─ Gemini Pool (Flash/Pro)"
+                };
                 let mut g_spans = vec![
                     Span::raw("  "),
-                    Span::styled(fit("├─ Gemini Pool (Flash/Pro)", cols.provider.saturating_sub(2)), g_title_style),
+                    Span::styled(fit(g_pool_label, cols.provider.saturating_sub(2)), g_title_style),
                     Span::raw("  "),
                 ];
                 g_spans.extend(format_quota_cell(gemini_5h, cols.bar_width, cols.session, gemini_color, g_dim));
@@ -4005,9 +4118,14 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 } else {
                     Style::default().fg(claude_color).add_modifier(Modifier::BOLD)
                 };
+                let c_pool_label = if cols.provider.saturating_sub(2) < 26 {
+                    "└─ Claude/GPT (Sonnet)"
+                } else {
+                    "└─ Claude/GPT Pool (Sonnet)"
+                };
                 let mut c_spans = vec![
                     Span::raw("  "),
-                    Span::styled(fit("└─ Claude/GPT Pool (Sonnet)", cols.provider.saturating_sub(2)), c_title_style),
+                    Span::styled(fit(c_pool_label, cols.provider.saturating_sub(2)), c_title_style),
                     Span::raw("  "),
                 ];
                 c_spans.extend(format_quota_cell(claude_5h, cols.bar_width, cols.session, claude_color, c_dim));
@@ -4084,7 +4202,7 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
             });
 
             let is_sel = app.limits_selected == s_idx;
-            let display_name = provider_title_base(provider);
+            let display_name = &titles[s_idx];
             let brand = provider_brand_color(&provider.provider_id);
             let is_session_capped = session_w.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent == Some(0.0));
             let is_cycle_capped = cycle_w.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent == Some(0.0));
@@ -4122,7 +4240,7 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
             row.extend(format_dual_reset(session_w, cycle_w, cols.reset, now_ms, is_dimmed));
             row.push(Span::raw("  "));
 
-            let is_burn_first = burn_rec.as_ref().is_some_and(|b| b.provider_title == display_name);
+            let is_burn_first = burn_rec.as_ref().is_some_and(|b| b.provider_title.as_str() == display_name.as_str());
             let status_override = if is_session_capped && provider.availability == Availability::Available {
                 Some(("5h capped", DIM_GREY))
             } else if is_cycle_capped && provider.availability == Availability::Available {
@@ -4783,8 +4901,9 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
             lines.push(Line::from(""));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("CLIENT / HARNESS & SUB-MODEL HIERARCHY (PARENT ➔ CHILDREN):", Style::default().fg(GREY).add_modifier(Modifier::BOLD))));
+            let client_hier_w = max_w.saturating_sub(44).clamp(32, 42);
             lines.push(Line::from(vec![
-                Span::styled(fit("CLIENT / SUB-MODEL", 32), Style::default().fg(GREY)),
+                Span::styled(fit("CLIENT / SUB-MODEL", client_hier_w), Style::default().fg(GREY)),
                 Span::raw("  "),
                 Span::styled(fit("TOKENS", 12), Style::default().fg(GREY)),
                 Span::raw("  "),
@@ -4794,13 +4913,14 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
                 Span::raw("  "),
                 Span::styled(fit("CALLS", 8), Style::default().fg(GREY)),
             ]));
-            lines.push(Line::from(Span::styled("─".repeat(max_w.min(78)), Style::default().fg(DIM_GREY))));
+            lines.push(Line::from(Span::styled("─".repeat(max_w.min(client_hier_w + 44)), Style::default().fg(DIM_GREY))));
             for c_item in clients.iter().take(6) {
                 let brand = client_brand_color(&c_item.client);
                 let c_eff = if c_item.api_usd > 0.0 { format!("{:.2}M/$", c_item.tokens as f64 / 1_000_000.0 / c_item.api_usd) } else { "—".to_owned() };
                 let val_str = if c_item.api_usd > 0.0 { format!("${:.2}", c_item.api_usd) } else { "—".to_owned() };
+                let display_client = format_client_display(&c_item.client, client_hier_w.saturating_sub(2));
                 lines.push(Line::from(vec![
-                    Span::styled(fit(&format!("▼ {}", c_item.client), 32), Style::default().fg(brand).add_modifier(Modifier::BOLD)),
+                    Span::styled(fit(&format!("▼ {}", display_client), client_hier_w), Style::default().fg(brand).add_modifier(Modifier::BOLD)),
                     Span::raw("  "),
                     Span::styled(fit(&format_tokens(c_item.tokens), 12), Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
                     Span::raw("  "),
@@ -4815,7 +4935,7 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
                     let s_val_str = if *s_usd > 0.0 { format!("${:.2}", s_usd) } else { "—".to_owned() };
                     let m_hue = sub_m.bytes().fold(0u8, |s, b| s.wrapping_add(b));
                     lines.push(Line::from(vec![
-                        Span::styled(fit(&format!("  └─ {}", sub_m), 32), Style::default().fg(palette(m_hue))),
+                        Span::styled(fit(&format!("  └─ {}", sub_m), client_hier_w), Style::default().fg(palette(m_hue))),
                         Span::raw("  "),
                         Span::styled(fit(&format_tokens(*s_tok), 12), Style::default().fg(CYAN)),
                         Span::raw("  "),
@@ -4830,10 +4950,12 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
             if !models.is_empty() {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled("TOP MODELS IN THIS WINDOW (WITH PARENT HARNESS):", Style::default().fg(GREY).add_modifier(Modifier::BOLD))));
+                let model_col_w = if max_w >= 105 { 28 } else { 24 };
+                let parent_col_w = max_w.saturating_sub(model_col_w + 38).clamp(18, 30);
                 lines.push(Line::from(vec![
-                    Span::styled(fit("MODEL", 26), Style::default().fg(GREY)),
+                    Span::styled(fit("MODEL", model_col_w), Style::default().fg(GREY)),
                     Span::raw("  "),
-                    Span::styled(fit("PARENT HARNESS", 18), Style::default().fg(GREY)),
+                    Span::styled(fit("PARENT HARNESS", parent_col_w), Style::default().fg(GREY)),
                     Span::raw("  "),
                     Span::styled(fit("TOKENS", 12), Style::default().fg(GREY)),
                     Span::raw("  "),
@@ -4843,16 +4965,17 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
                     Span::raw("  "),
                     Span::styled(fit("CALLS", 6), Style::default().fg(GREY)),
                 ]));
-                lines.push(Line::from(Span::styled("─".repeat(max_w.min(90)), Style::default().fg(DIM_GREY))));
+                lines.push(Line::from(Span::styled("─".repeat(max_w.min(model_col_w + parent_col_w + 36)), Style::default().fg(DIM_GREY))));
                 for (m, parent_harness, tok, val, calls) in models.iter().take(8) {
                     let m_eff = if *val > 0.0 { format!("{:.2}M/$", *tok as f64 / 1_000_000.0 / val) } else { "—".to_owned() };
                     let val_str = if *val > 0.0 { format!("${:.2}", val) } else { "—".to_owned() };
                     let hue = m.bytes().fold(0u8, |s, b| s.wrapping_add(b));
                     let h_brand = client_brand_color(parent_harness);
+                    let display_harness = format_client_display(parent_harness, parent_col_w);
                     lines.push(Line::from(vec![
-                        Span::styled(fit(m, 26), Style::default().fg(palette(hue))),
+                        Span::styled(fit(m, model_col_w), Style::default().fg(palette(hue))),
                         Span::raw("  "),
-                        Span::styled(fit(parent_harness, 18), Style::default().fg(h_brand)),
+                        Span::styled(fit(&display_harness, parent_col_w), Style::default().fg(h_brand)),
                         Span::raw("  "),
                         Span::styled(fit(&format_tokens(*tok), 12), Style::default().fg(CYAN)),
                         Span::raw("  "),
@@ -4902,8 +5025,9 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
             ]));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("MODELS CALLED BY THIS CLIENT:", Style::default().fg(GREY).add_modifier(Modifier::BOLD))));
+            let model_col_w = max_w.saturating_sub(44).clamp(28, 40);
             lines.push(Line::from(vec![
-                Span::styled(fit("MODEL", 28), Style::default().fg(GREY)),
+                Span::styled(fit("MODEL", model_col_w), Style::default().fg(GREY)),
                 Span::raw("  "),
                 Span::styled(fit("TOKENS", 12), Style::default().fg(GREY)),
                 Span::raw("  "),
@@ -4913,13 +5037,13 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
                 Span::raw("  "),
                 Span::styled(fit("CALLS", 8), Style::default().fg(GREY)),
             ]));
-            lines.push(Line::from(Span::styled("─".repeat(max_w.min(74)), Style::default().fg(DIM_GREY))));
+            lines.push(Line::from(Span::styled("─".repeat(max_w.min(model_col_w + 36)), Style::default().fg(DIM_GREY))));
             for (m, tok, val, calls) in models.iter().take(8) {
                 let m_eff = if *val > 0.0 { format!("{:.2}M/$", *tok as f64 / 1_000_000.0 / val) } else { "—".to_owned() };
                 let val_str = if *val > 0.0 { format!("${:.2}", val) } else { "—".to_owned() };
                 let hue = m.bytes().fold(0u8, |s, b| s.wrapping_add(b));
                 lines.push(Line::from(vec![
-                    Span::styled(fit(m, 28), Style::default().fg(palette(hue))),
+                    Span::styled(fit(m, model_col_w), Style::default().fg(palette(hue))),
                     Span::raw("  "),
                     Span::styled(fit(&format_tokens(*tok), 12), Style::default().fg(CYAN)),
                     Span::raw("  "),
@@ -4968,8 +5092,9 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
             ]));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("CLIENTS / HARNESSES INVOKING THIS MODEL:", Style::default().fg(GREY).add_modifier(Modifier::BOLD))));
+            let client_w = max_w.saturating_sub(38).clamp(24, 34);
             lines.push(Line::from(vec![
-                Span::styled(fit("CLIENT", 24), Style::default().fg(GREY)),
+                Span::styled(fit("CLIENT", client_w), Style::default().fg(GREY)),
                 Span::raw("  "),
                 Span::styled(fit("TOKENS", 12), Style::default().fg(GREY)),
                 Span::raw("  "),
@@ -4977,12 +5102,13 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
                 Span::raw("  "),
                 Span::styled(fit("CALLS", 8), Style::default().fg(GREY)),
             ]));
-            lines.push(Line::from(Span::styled("─".repeat(max_w.min(60)), Style::default().fg(DIM_GREY))));
+            lines.push(Line::from(Span::styled("─".repeat(max_w.min(client_w + 36)), Style::default().fg(DIM_GREY))));
             for (c, tok, val, calls) in clients.iter().take(8) {
                 let brand = client_brand_color(c);
                 let val_str = if *val > 0.0 { format!("${:.2}", val) } else { "—".to_owned() };
+                let display_c = format_client_display(c, client_w);
                 lines.push(Line::from(vec![
-                    Span::styled(fit(c, 24), Style::default().fg(brand).add_modifier(Modifier::BOLD)),
+                    Span::styled(fit(&display_c, client_w), Style::default().fg(brand).add_modifier(Modifier::BOLD)),
                     Span::raw("  "),
                     Span::styled(fit(&format_tokens(*tok), 12), Style::default().fg(CYAN)),
                     Span::raw("  "),
@@ -5474,7 +5600,7 @@ mod tests {
         let mut full_text = String::new();
         for y in 0..26 {
             for x in 0..99 {
-                full_text.push_str(terminal.backend().buffer().get(x, y).symbol());
+                full_text.push_str(terminal.backend().buffer()[(x, y)].symbol());
             }
             full_text.push('\n');
         }
@@ -5694,7 +5820,7 @@ mod tests {
         let mut rendered = String::new();
         for y in 0..14 {
             for x in 0..100 {
-                rendered.push_str(terminal.backend().buffer().get(x, y).symbol());
+                rendered.push_str(terminal.backend().buffer()[(x, y)].symbol());
             }
             rendered.push('\n');
         }
@@ -5750,5 +5876,56 @@ mod tests {
         // Ensure no truncated ellipsis in window labels
         assert!(!text.contains("Claude/GP…"));
         assert!(!text.contains("Claude/GPT…"));
+    }
+
+    #[test]
+    fn normalize_client_id_handles_multi_account_antigravity() {
+        assert_eq!(normalize_client_id("antigravity-cli"), "Antigravity Cli");
+        assert_eq!(
+            normalize_client_id("antigravity-cli (Account 1)"),
+            "Antigravity Cli (Account 1)"
+        );
+        assert_eq!(
+            normalize_client_id("antigravity-cli (Account 2)"),
+            "Antigravity Cli (Account 2)"
+        );
+    }
+
+    #[test]
+    fn format_client_display_adapts_gracefully_to_widths() {
+        let acct = "Antigravity Cli (Account 1)";
+        assert_eq!(format_client_display(acct, 30), "Antigravity Cli (Account 1)");
+        assert_eq!(format_client_display(acct, 27), "Antigravity Cli (Account 1)");
+        assert_eq!(format_client_display(acct, 24), "Antigravity (Account 1)");
+        assert_eq!(format_client_display(acct, 21), "Antigravity (Acct 1)");
+        assert_eq!(format_client_display(acct, 15), "AGY (Acct 1)");
+        assert_eq!(format_client_display("Antigravity Cli", 15), "Antigravity Cli");
+        assert_eq!(format_client_display("Antigravity Cli", 12), "Antigravity");
+        assert_eq!(format_client_display("Antigravity Cli", 8), "AGY");
+    }
+
+    #[test]
+    fn consumption_model_modal_displays_account_without_truncation() {
+        let modal = DetailModal::ConsumptionModel {
+            model: "gemini-3.8-flash".into(),
+            window: LedgerWindow::Today,
+            records: 1683,
+            tokens: usage::UsageTokens {
+                input: 12_500_000,
+                output: 478_000,
+                cache_read: 232_170_000,
+                cache_write: 0,
+                reasoning: 358_000,
+            },
+            api_usd: 14.29,
+            clients: vec![
+                ("Antigravity Cli (Account 1)".into(), 245_150_000, 14.29, 1683),
+            ],
+        };
+        // At width 100 (modal width 100 - max_w 96)
+        let lines = modal_lines(&modal, 100);
+        let text = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Antigravity Cli (Account 1)"));
+        assert!(!text.contains("Antigravity Cli (Accoun…"));
     }
 }
