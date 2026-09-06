@@ -18,7 +18,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use token_monitor_core::{
     credentials, sort_burn_first, usage, Availability, LimitWindow, ProviderSnapshot, SourceHealth,
-    WindowKind, WindowMetric,
+    WindowKind, WindowMetric, EFFECTIVE_EXHAUSTION_PERCENT,
 };
 
 const GREY: Color = Color::Rgb(145, 145, 155);
@@ -1539,7 +1539,7 @@ fn format_tokens(value: i64) -> String {
 fn meter(percent: f64, width: usize) -> String {
     let clamped = percent.clamp(0.0, 100.0);
     let mut filled = ((clamped / 100.0) * width as f64).round() as usize;
-    if clamped > 0.0 && filled == 0 {
+    if clamped > EFFECTIVE_EXHAUSTION_PERCENT && filled == 0 {
         filled = 1;
     }
     filled = filled.min(width);
@@ -3647,10 +3647,9 @@ fn format_quota_cell(
 ) -> Vec<Span<'static>> {
     if let Some(w) = window {
         if let Some(pct) = w.remaining_percent {
-            let color = if dimmed {
+            let is_exhausted = w.effectively_exhausted() || pct <= EFFECTIVE_EXHAUSTION_PERCENT || pct.round() <= 0.0;
+            let color = if dimmed || is_exhausted {
                 DIM_GREY
-            } else if pct <= 0.0 {
-                RED
             } else if pct < 20.0 {
                 YELLOW
             } else {
@@ -3663,11 +3662,8 @@ fn format_quota_cell(
                 format!("{:>5.1}%", pct)
             };
             let mut style = Style::default().fg(color);
-            if dimmed || pct <= 0.0 {
+            if dimmed || is_exhausted {
                 style = style.add_modifier(Modifier::DIM);
-            }
-            if pct <= 0.0 && !dimmed {
-                style = style.add_modifier(Modifier::BOLD);
             }
             let mut spans = vec![
                 Span::styled(format!("[{m}]"), style),
@@ -4023,9 +4019,22 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                     (l.contains("claude") || l.contains("gpt")) && (l.contains("7d") || w.kind == WindowKind::Weekly)
                 });
 
-                let g_dim = gemini_5h.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent == Some(0.0));
-                let c_dim = claude_5h.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent == Some(0.0));
-                let all_dim = g_dim && c_dim;
+                let is_window_capped = |opt_w: Option<&LimitWindow>| -> bool {
+                    opt_w.is_some_and(|w| {
+                        w.effectively_exhausted()
+                            || w.remaining_percent.is_some_and(|p| p <= EFFECTIVE_EXHAUSTION_PERCENT || p.round() <= 0.0)
+                    })
+                };
+
+                let g_5h_capped = is_window_capped(gemini_5h);
+                let g_7d_capped = is_window_capped(gemini_7d);
+                let g_dim = g_5h_capped || g_7d_capped;
+
+                let c_5h_capped = is_window_capped(claude_5h);
+                let c_7d_capped = is_window_capped(claude_7d);
+                let c_dim = c_5h_capped || c_7d_capped;
+
+                let all_dim = (g_dim && c_dim) || provider.availability.dimmed();
 
                 // Parent row
                 let is_sel = app.limits_selected == s_idx;
@@ -4053,6 +4062,12 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 } else {
                     "CLI"
                 };
+                let active_pools_count = (!g_dim as usize) + (!c_dim as usize);
+                let pools_tag = match active_pools_count {
+                    2 => "2 pools active",
+                    1 => "1 pool active",
+                    _ => if cols.session >= 16 { "all pools capped" } else { "0 pools active" },
+                };
                 let mut parent_spans = vec![
                     Span::styled(cursor_mark, Style::default().fg(if is_sel { Color::Yellow } else { Color::Reset }).add_modifier(Modifier::BOLD)),
                     Span::styled(format!("{marker_char} "), marker_style),
@@ -4061,12 +4076,14 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                         title_style,
                     ),
                     Span::raw("  "),
-                    Span::styled(fit("2 pools active", cols.session), Style::default().fg(if all_dim { DIM_GREY } else { CYAN })),
+                    Span::styled(fit(pools_tag, cols.session), Style::default().fg(if all_dim { DIM_GREY } else { CYAN })),
                     Span::raw("  "),
                     Span::styled(fit(cli_tag, cols.cycle), Style::default().fg(DIM_GREY)),
                     Span::raw("  "),
                 ];
-                parent_spans.extend(format_dual_reset(gemini_5h, gemini_7d, cols.reset, now_ms, all_dim));
+                let best_5h = gemini_5h.or(claude_5h);
+                let best_7d = gemini_7d.or(claude_7d);
+                parent_spans.extend(format_dual_reset(best_5h, best_7d, cols.reset, now_ms, all_dim));
                 parent_spans.push(Span::raw("  "));
                 let parent_status = if all_dim {
                     ("all capped", DIM_GREY)
@@ -4103,7 +4120,9 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 g_spans.push(Span::raw("  "));
                 g_spans.extend(format_dual_reset(gemini_5h, gemini_7d, cols.reset, now_ms, g_dim));
                 g_spans.push(Span::raw("  "));
-                let g_stat = if g_dim {
+                let g_stat = if g_7d_capped {
+                    ("weekly cap", DIM_GREY)
+                } else if g_5h_capped {
                     ("5h capped", DIM_GREY)
                 } else {
                     ("smooth", GREY)
@@ -4134,10 +4153,12 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 c_spans.push(Span::raw("  "));
                 c_spans.extend(format_dual_reset(claude_5h, claude_7d, cols.reset, now_ms, c_dim));
                 c_spans.push(Span::raw("  "));
-                let c_stat = if claude_5h.is_some_and(|w| w.remaining_percent == Some(100.0)) {
-                    ("READY (FULL)", GREEN)
-                } else if c_dim {
+                let c_stat = if c_7d_capped {
+                    ("weekly cap", DIM_GREY)
+                } else if c_5h_capped {
                     ("5h capped", DIM_GREY)
+                } else if claude_5h.is_some_and(|w| w.remaining_percent == Some(100.0)) {
+                    ("READY (FULL)", GREEN)
                 } else {
                     ("ready", GREEN)
                 };
@@ -4204,8 +4225,8 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
             let is_sel = app.limits_selected == s_idx;
             let display_name = &titles[s_idx];
             let brand = provider_brand_color(&provider.provider_id);
-            let is_session_capped = session_w.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent == Some(0.0));
-            let is_cycle_capped = cycle_w.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent == Some(0.0));
+            let is_session_capped = session_w.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent.is_some_and(|p| p <= EFFECTIVE_EXHAUSTION_PERCENT || p.round() <= 0.0));
+            let is_cycle_capped = cycle_w.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent.is_some_and(|p| p <= EFFECTIVE_EXHAUSTION_PERCENT || p.round() <= 0.0));
             let is_dimmed = provider.availability.dimmed() || is_session_capped || is_cycle_capped || provider.source_health != SourceHealth::Connected;
             let cursor_mark = if is_sel { "▶ " } else { "  " };
             let mut title_style = if is_dimmed {
@@ -4821,23 +4842,34 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
                 ];
 
                 if let Some(pct) = w.remaining_percent {
+                    let is_exhausted = w.effectively_exhausted() || pct <= EFFECTIVE_EXHAUSTION_PERCENT || pct.round() <= 0.0;
                     let m = meter(pct, 6);
-                    let m_color = if pct <= 0.0 {
-                        RED
+                    let m_color = if is_exhausted {
+                        DIM_GREY
                     } else if pct < 20.0 {
                         YELLOW
                     } else {
                         brand
                     };
-                    row.push(Span::styled(format!("[{m}] "), Style::default().fg(m_color)));
+                    let mut m_style = Style::default().fg(m_color);
+                    if is_exhausted {
+                        m_style = m_style.add_modifier(Modifier::DIM);
+                    }
+                    row.push(Span::styled(format!("[{m}] "), m_style));
+                    let mut pct_style = Style::default().fg(if is_exhausted { DIM_GREY } else { brand });
+                    if is_exhausted {
+                        pct_style = pct_style.add_modifier(Modifier::DIM);
+                    } else {
+                        pct_style = pct_style.add_modifier(Modifier::BOLD);
+                    }
+                    row.push(Span::styled(pct_text, pct_style));
                 } else {
                     row.push(Span::raw("         "));
+                    row.push(Span::styled(
+                        pct_text,
+                        Style::default().fg(DIM_GREY).add_modifier(Modifier::DIM),
+                    ));
                 }
-
-                row.push(Span::styled(
-                    pct_text,
-                    Style::default().fg(brand).add_modifier(Modifier::BOLD),
-                ));
 
                 if has_amounts {
                     row.push(Span::raw("  "));
@@ -5927,5 +5959,140 @@ mod tests {
         let text = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
         assert!(text.contains("Antigravity Cli (Account 1)"));
         assert!(!text.contains("Antigravity Cli (Accoun…"));
+    }
+
+    #[test]
+    fn meter_clamps_sub_percent_to_empty_blocks() {
+        assert_eq!(meter(0.0, 6), "░░░░░░");
+        assert_eq!(meter(0.2, 6), "░░░░░░");
+        assert_eq!(meter(0.4, 6), "░░░░░░");
+        assert_eq!(meter(0.56, 6), "░░░░░░");
+        assert_eq!(meter(1.5, 6), "█░░░░░");
+        assert_eq!(meter(100.0, 6), "██████");
+    }
+
+    #[test]
+    fn antigravity_multipool_dims_when_session_or_cycle_exhausted() {
+        // Case 1: Gemini 5h exhausted at 0.4%, 7d healthy at 81.7%
+        let mut app = App::new(false, false);
+        app.providers = vec![
+            ProviderSnapshot {
+                account_key: "antigravity:y".into(),
+                account_label: "youngxia22@gmail.com".into(),
+                availability: Availability::Available,
+                collected_at_ms: 1000,
+                diagnostics: vec![],
+                hue: 141,
+                plan: "Pro".into(),
+                provider_id: "antigravity".into(),
+                source: "rpc".into(),
+                source_health: SourceHealth::Connected,
+                windows: vec![
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Session,
+                        label: "Gemini 5h".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(0.4),
+                        reset_text: None,
+                        resets_at_ms: Some(18_000_000),
+                    },
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Weekly,
+                        label: "Gemini 7d".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(81.7),
+                        reset_text: None,
+                        resets_at_ms: Some(500_000_000),
+                    },
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Session,
+                        label: "Claude/GPT 5h".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(100.0),
+                        reset_text: None,
+                        resets_at_ms: Some(18_000_000),
+                    },
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Weekly,
+                        label: "Claude/GPT 7d".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(66.4),
+                        reset_text: None,
+                        resets_at_ms: Some(500_000_000),
+                    },
+                ],
+            },
+        ];
+
+        let lines = body_lines(&app, 100, 30);
+        let text = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Gemini capped"));
+        assert!(text.contains("5h capped"));
+        assert!(text.contains("1 pool active"));
+        assert!(text.contains("[░░░░░░] 0%"));
+        assert!(!text.contains("[█░░░░░] 0%"));
+
+        // Case 2: Both Gemini 7d (0.5%) and Claude 7d (0.2%) exhausted
+        app.providers = vec![
+            ProviderSnapshot {
+                account_key: "antigravity:x".into(),
+                account_label: "xzy9565@gmail.com".into(),
+                availability: Availability::Available,
+                collected_at_ms: 1000,
+                diagnostics: vec![],
+                hue: 141,
+                plan: "Pro".into(),
+                provider_id: "antigravity".into(),
+                source: "rpc".into(),
+                source_health: SourceHealth::Connected,
+                windows: vec![
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Weekly,
+                        label: "Gemini 7d".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(0.56),
+                        reset_text: None,
+                        resets_at_ms: Some(500_000_000),
+                    },
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Weekly,
+                        label: "Claude/GPT 7d".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(0.21),
+                        reset_text: None,
+                        resets_at_ms: Some(500_000_000),
+                    },
+                ],
+            },
+        ];
+
+        let lines2 = body_lines(&app, 100, 30);
+        let text2 = lines2.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text2.contains("all capped"));
+        assert!(text2.contains("weekly cap"));
+        assert!(text2.contains("0 pools active"));
+        assert!(!text2.contains("ready"));
+
+        let lines_wide = body_lines(&app, 120, 30);
+        let text_wide = lines_wide.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text_wide.contains("all pools capped"));
     }
 }

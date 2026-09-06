@@ -15,7 +15,7 @@ pub mod provider_registry;
 pub mod storage;
 pub mod usage;
 
-pub const EFFECTIVE_EXHAUSTION_PERCENT: f64 = 0.1;
+pub const EFFECTIVE_EXHAUSTION_PERCENT: f64 = 0.6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceHealth {
@@ -128,7 +128,7 @@ impl LimitWindow {
             // visible value for requestability, so a raw 0.10334% remainder
             // displayed as 0.1% is not advertised as usable.
             let displayed = (percent * 10.0).round() / 10.0;
-            displayed <= EFFECTIVE_EXHAUSTION_PERCENT
+            displayed <= EFFECTIVE_EXHAUSTION_PERCENT || percent.round() <= 0.0
         })
     }
 
@@ -369,6 +369,8 @@ mod tests {
     fn effective_floor_only_applies_to_quota_windows() {
         assert!(window("G7d", WindowKind::Weekly, 0.1, 100).effectively_exhausted());
         assert!(window("G7d", WindowKind::Weekly, 0.103, 100).effectively_exhausted());
+        assert!(window("G7d", WindowKind::Weekly, 0.4, 100).effectively_exhausted());
+        assert!(window("G7d", WindowKind::Weekly, 0.56, 100).effectively_exhausted());
         assert!(!window("G7d", WindowKind::Weekly, 1.0, 100).effectively_exhausted());
         let credit = LimitWindow {
             label: "credit".into(),
