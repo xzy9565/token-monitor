@@ -114,15 +114,14 @@ pub struct LimitWindow {
 
 impl LimitWindow {
     pub fn effectively_exhausted(&self) -> bool {
-        if self
-            .remaining_amount
-            .is_some_and(|amount| self.metric.is_credit() && amount <= 0.0)
-        {
+        if self.remaining_amount.is_some_and(|amount| {
+            self.metric.is_credit() && (amount <= 0.0 || (amount * 100.0).round() <= 0.0)
+        }) {
             return true;
         }
         self.remaining_percent.is_some_and(|percent| {
             if self.metric.is_credit() {
-                return false;
+                return percent <= 0.0;
             }
             // The UI shows sub-10% values to one decimal place. Use that same
             // visible value for requestability, so a raw 0.10334% remainder
@@ -183,11 +182,36 @@ impl ProviderSnapshot {
     }
 
     pub fn is_exhausted(&self) -> bool {
-        self.availability == Availability::Exhausted
-            || self
-                .windows
-                .iter()
-                .any(|w| (w.kind.durable() || w.metric.is_credit()) && w.effectively_exhausted())
+        if self.availability == Availability::Exhausted {
+            return true;
+        }
+        let pid = self.provider_id.to_ascii_lowercase();
+        if pid == "antigravity" {
+            let gemini_capped = self.windows.iter().any(|w| {
+                let l = w.label.to_ascii_lowercase();
+                l.contains("gemini") && w.effectively_exhausted()
+            });
+            let claude_capped = self.windows.iter().any(|w| {
+                let l = w.label.to_ascii_lowercase();
+                (l.contains("claude") || l.contains("gpt")) && w.effectively_exhausted()
+            });
+            return gemini_capped && claude_capped;
+        }
+        if pid == "cursor" {
+            let cursor_models = self.windows.iter().find(|w| w.label.to_ascii_lowercase().contains("cursor"));
+            let other_models = self.windows.iter().find(|w| w.label.to_ascii_lowercase().contains("other"));
+            let c_capped = cursor_models.is_some_and(|w| w.effectively_exhausted());
+            let o_capped = other_models.is_some_and(|w| w.effectively_exhausted());
+            return match (cursor_models.is_some(), other_models.is_some()) {
+                (true, true) => c_capped && o_capped,
+                (true, false) => c_capped,
+                (false, true) => o_capped,
+                _ => self.windows.iter().any(|w| (w.kind.durable() || w.metric.is_credit()) && w.effectively_exhausted()),
+            };
+        }
+        self.windows
+            .iter()
+            .any(|w| (w.kind.durable() || w.metric.is_credit()) && w.effectively_exhausted())
     }
 
     pub fn earliest_deadline_ms(&self, now_ms: i64) -> Option<i64> {

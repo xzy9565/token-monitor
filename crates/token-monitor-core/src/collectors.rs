@@ -164,12 +164,37 @@ fn connected_snapshot(
     windows: Vec<LimitWindow>,
     hue: u8,
 ) -> ProviderSnapshot {
-    let availability = if windows.iter().any(|window| {
-        (window.metric.is_credit() && window.effectively_exhausted())
-            || (!window.metric.is_credit()
-                && window.kind.durable()
-                && window.effectively_exhausted())
-    }) {
+    let pid = provider_id.to_ascii_lowercase();
+    let is_exhausted = if pid == "antigravity" {
+        let gemini_capped = windows.iter().any(|w| {
+            let l = w.label.to_ascii_lowercase();
+            l.contains("gemini") && w.effectively_exhausted()
+        });
+        let claude_capped = windows.iter().any(|w| {
+            let l = w.label.to_ascii_lowercase();
+            (l.contains("claude") || l.contains("gpt")) && w.effectively_exhausted()
+        });
+        gemini_capped && claude_capped
+    } else if pid == "cursor" {
+        let cursor_models = windows.iter().find(|w| w.label.to_ascii_lowercase().contains("cursor"));
+        let other_models = windows.iter().find(|w| w.label.to_ascii_lowercase().contains("other"));
+        let c_capped = cursor_models.is_some_and(|w| w.effectively_exhausted());
+        let o_capped = other_models.is_some_and(|w| w.effectively_exhausted());
+        match (cursor_models.is_some(), other_models.is_some()) {
+            (true, true) => c_capped && o_capped,
+            (true, false) => c_capped,
+            (false, true) => o_capped,
+            _ => windows.iter().any(|w| (w.kind.durable() || w.metric.is_credit()) && w.effectively_exhausted()),
+        }
+    } else {
+        windows.iter().any(|window| {
+            (window.metric.is_credit() && window.effectively_exhausted())
+                || (!window.metric.is_credit()
+                    && window.kind.durable()
+                    && window.effectively_exhausted())
+        })
+    };
+    let availability = if is_exhausted {
         Availability::Exhausted
     } else {
         Availability::Available

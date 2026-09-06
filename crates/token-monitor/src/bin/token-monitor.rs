@@ -1064,7 +1064,15 @@ impl App {
             .iter()
             .filter(|provider| match self.filter {
                 Filter::All => true,
-                Filter::Attention => provider.availability != Availability::Available,
+                Filter::Attention => {
+                    provider.availability.dimmed()
+                        || provider.source_health != SourceHealth::Connected
+                        || provider.windows.iter().any(|w| {
+                            w.effectively_exhausted()
+                                || w.remaining_percent.is_some_and(|p| p <= EFFECTIVE_EXHAUSTION_PERCENT || p.round() <= 0.0)
+                                || w.remaining_amount.is_some_and(|a| a <= 0.0 || (a * 100.0).round() <= 0.0)
+                        })
+                }
                 Filter::Credits => provider.has_credits(),
                 Filter::Quotas => !provider.has_credits(),
             })
@@ -3678,8 +3686,9 @@ fn format_quota_cell(
         } else if let Some(amt) = w.remaining_amount {
             let curr = w.currency.as_deref().unwrap_or("$");
             let text = format!("{}{:.2}", curr, amt);
-            let mut style = Style::default().fg(if dimmed { DIM_GREY } else { brand_color });
-            if dimmed {
+            let is_exhausted = w.effectively_exhausted() || amt <= 0.0 || (amt * 100.0).round() <= 0.0;
+            let mut style = Style::default().fg(if dimmed || is_exhausted { DIM_GREY } else { brand_color });
+            if dimmed || is_exhausted {
                 style = style.add_modifier(Modifier::DIM);
             }
             vec![Span::styled(fit(&text, col_width), style)]
@@ -3705,8 +3714,26 @@ fn find_burn_first_recommendation(providers: &[&ProviderSnapshot], now_ms: i64) 
         if is_wallet_provider(p) {
             continue;
         }
-        // If currently on cooldown (0% session remaining), cannot burn right now!
-        if p.windows.iter().any(|w| (w.kind == WindowKind::Session || w.label.to_ascii_lowercase().contains("5h")) && w.remaining_percent == Some(0.0)) {
+        // If currently on cooldown (effectively exhausted session remaining), cannot burn right now!
+        let pid = p.provider_id.to_ascii_lowercase();
+        if pid == "antigravity" {
+            let gemini_5h = p.windows.iter().find(|w| {
+                let l = w.label.to_ascii_lowercase();
+                l.contains("gemini") && (l.contains("5h") || w.kind == WindowKind::Session)
+            });
+            let claude_5h = p.windows.iter().find(|w| {
+                let l = w.label.to_ascii_lowercase();
+                (l.contains("claude") || l.contains("gpt")) && (l.contains("5h") || w.kind == WindowKind::Session)
+            });
+            let g_capped = gemini_5h.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent.is_some_and(|pct| pct <= EFFECTIVE_EXHAUSTION_PERCENT || pct.round() <= 0.0));
+            let c_capped = claude_5h.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent.is_some_and(|pct| pct <= EFFECTIVE_EXHAUSTION_PERCENT || pct.round() <= 0.0));
+            if g_capped && c_capped {
+                continue;
+            }
+        } else if p.windows.iter().any(|w| {
+            (w.kind == WindowKind::Session || w.label.to_ascii_lowercase().contains("5h"))
+                && (w.effectively_exhausted() || w.remaining_percent.is_some_and(|pct| pct <= EFFECTIVE_EXHAUSTION_PERCENT || pct.round() <= 0.0))
+        }) {
             continue;
         }
         for w in &p.windows {
@@ -4034,7 +4061,9 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 let c_7d_capped = is_window_capped(claude_7d);
                 let c_dim = c_5h_capped || c_7d_capped;
 
-                let all_dim = (g_dim && c_dim) || provider.availability.dimmed();
+                let all_dim = (g_dim && c_dim)
+                    || provider.availability == Availability::AgentBlocked
+                    || provider.source_health != SourceHealth::Connected;
 
                 // Parent row
                 let is_sel = app.limits_selected == s_idx;
@@ -4174,7 +4203,24 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 let other_models = provider.windows.iter().find(|w| w.label.to_ascii_lowercase().contains("other"));
                 let brand = provider_brand_color("cursor");
                 let cursor_mark = if is_sel { "▶ " } else { "  " };
-                let is_dimmed = provider.availability.dimmed() || provider.source_health != SourceHealth::Connected;
+                let is_window_capped = |opt_w: Option<&LimitWindow>| -> bool {
+                    opt_w.is_some_and(|w| {
+                        w.effectively_exhausted()
+                            || w.remaining_percent.is_some_and(|p| p <= EFFECTIVE_EXHAUSTION_PERCENT || p.round() <= 0.0)
+                    })
+                };
+                let c_capped = is_window_capped(cursor_models);
+                let o_capped = is_window_capped(other_models);
+                let cursor_all_exhausted = match (cursor_models.is_some(), other_models.is_some()) {
+                    (true, true) => c_capped && o_capped,
+                    (true, false) => c_capped,
+                    (false, true) => o_capped,
+                    _ => false,
+                };
+                let is_free_tier = provider.plan.to_ascii_lowercase().contains("free");
+                let is_dimmed = (!is_free_tier && cursor_all_exhausted)
+                    || provider.availability == Availability::AgentBlocked
+                    || provider.source_health != SourceHealth::Connected;
                 let mut title_style = if is_dimmed {
                     Style::default().fg(DIM_GREY)
                 } else {
@@ -4183,29 +4229,38 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 if is_sel {
                     title_style = title_style.bg(Color::Rgb(28, 42, 60));
                 }
-                let is_free_tier = provider.plan.to_ascii_lowercase().contains("free");
-                let marker_style = if provider.availability == Availability::Available {
-                    Style::default().fg(if is_dimmed { DIM_GREY } else { GREEN })
+                let (marker_char, marker_style) = if is_dimmed {
+                    ('▲', Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
+                } else if c_capped || o_capped {
+                    ('▲', Style::default().fg(YELLOW))
+                } else if provider.availability == Availability::Available {
+                    ('●', Style::default().fg(GREEN))
                 } else {
-                    status_style_for(provider)
+                    (provider.availability.marker(), status_style_for(provider))
                 };
                 let mut row = vec![
                     Span::styled(cursor_mark, Style::default().fg(if is_sel { Color::Yellow } else { Color::Reset }).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("{} ", provider.availability.marker()), marker_style),
+                    Span::styled(format!("{marker_char} "), marker_style),
                     Span::styled(
                         fit(&provider_title_base(provider), cols.provider.saturating_sub(4)),
                         title_style,
                     ),
                     Span::raw("  "),
                 ];
-                row.extend(format_quota_cell(cursor_models, cols.bar_width, cols.session, brand, is_dimmed));
+                row.extend(format_quota_cell(cursor_models, cols.bar_width, cols.session, brand, is_dimmed || c_capped));
                 row.push(Span::raw("  "));
-                row.extend(format_quota_cell(other_models, cols.bar_width, cols.cycle, brand, is_dimmed));
+                row.extend(format_quota_cell(other_models, cols.bar_width, cols.cycle, brand, is_dimmed || o_capped));
                 row.push(Span::raw("  "));
                 row.extend(format_dual_reset(None, cursor_models.or(other_models), cols.reset, now_ms, is_dimmed));
                 row.push(Span::raw("  "));
                 let status_override = if is_free_tier && provider.availability == Availability::Available {
                     Some(("slow pool", GREEN))
+                } else if is_dimmed && cursor_all_exhausted {
+                    Some(("slow pool", DIM_GREY))
+                } else if c_capped {
+                    Some(("cursor capped", YELLOW))
+                } else if o_capped {
+                    Some(("other capped", YELLOW))
                 } else {
                     None
                 };
@@ -4219,7 +4274,17 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 !w.metric.is_credit() && (w.kind == WindowKind::Session || w.label.to_ascii_lowercase().contains("5h") || w.label.to_ascii_lowercase().contains("session"))
             });
             let cycle_w = provider.windows.iter().find(|w| {
-                !w.metric.is_credit() && (w.kind == WindowKind::Weekly || w.kind == WindowKind::Monthly || w.kind == WindowKind::Daily || w.label.to_ascii_lowercase().contains("7d") || w.label.to_ascii_lowercase().contains("weekly") || w.label.to_ascii_lowercase().contains("daily"))
+                !w.metric.is_credit() && (
+                    w.kind == WindowKind::Weekly
+                        || w.kind == WindowKind::Monthly
+                        || w.kind == WindowKind::Daily
+                        || w.kind == WindowKind::Billing
+                        || w.label.to_ascii_lowercase().contains("7d")
+                        || w.label.to_ascii_lowercase().contains("weekly")
+                        || w.label.to_ascii_lowercase().contains("monthly")
+                        || w.label.to_ascii_lowercase().contains("daily")
+                        || w.label.to_ascii_lowercase().contains("billing")
+                )
             });
 
             let is_sel = app.limits_selected == s_idx;
@@ -4370,7 +4435,22 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 "—".to_owned()
             };
 
-            let (status_text, status_color) = if is_modal {
+            let is_depleted = provider.availability == Availability::Exhausted
+                || (!provider.windows.is_empty()
+                    && provider.windows.iter().all(|w| {
+                        w.effectively_exhausted()
+                            || w.remaining_amount.is_some_and(|a| a <= 0.0 || (a * 100.0).round() <= 0.0)
+                            || w.remaining_percent.is_some_and(|p| p <= 0.0)
+                    }));
+            let is_dimmed = is_depleted || provider.availability.dimmed() || provider.source_health != SourceHealth::Connected;
+
+            let (status_text, status_color) = if is_dimmed {
+                if is_depleted {
+                    ("depleted", DIM_GREY)
+                } else {
+                    ("offline", DIM_GREY)
+                }
+            } else if is_modal {
                 ("active", GREEN)
             } else {
                 ("PAYG", BLUE)
@@ -4378,13 +4458,34 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
 
             let brand = provider_brand_color(&provider.provider_id);
 
-            let mut title_style = Style::default().fg(brand).add_modifier(Modifier::BOLD);
+            let mut title_style = if is_dimmed {
+                Style::default().fg(DIM_GREY)
+            } else {
+                Style::default().fg(brand).add_modifier(Modifier::BOLD)
+            };
             if is_sel {
                 title_style = title_style.bg(Color::Rgb(28, 42, 60));
             }
+            let marker_char = if is_dimmed { '▲' } else { '●' };
+            let marker_style = if is_dimmed {
+                Style::default().fg(YELLOW)
+            } else {
+                Style::default().fg(brand)
+            };
+            let balance_style = if is_dimmed {
+                Style::default().fg(DIM_GREY).add_modifier(Modifier::DIM)
+            } else {
+                Style::default().fg(brand).add_modifier(Modifier::BOLD)
+            };
+            let mut stat_style = Style::default().fg(status_color);
+            if is_dimmed {
+                stat_style = stat_style.add_modifier(Modifier::DIM);
+            } else {
+                stat_style = stat_style.add_modifier(Modifier::BOLD);
+            }
             lines.push(Line::from(vec![
                 Span::styled(cursor_mark, Style::default().fg(if is_sel { Color::Yellow } else { Color::Reset }).add_modifier(Modifier::BOLD)),
-                Span::styled("● ", Style::default().fg(brand)),
+                Span::styled(format!("{marker_char} "), marker_style),
                 Span::styled(
                     fit(&display_name, w_prov.saturating_sub(4)),
                     title_style,
@@ -4392,14 +4493,14 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 Span::raw("  "),
                 Span::styled(
                     fit(&balance_str, w_bal),
-                    Style::default().fg(brand).add_modifier(Modifier::BOLD),
+                    balance_style,
                 ),
                 Span::raw("  "),
-                Span::styled(fit(&grant_type, w_type), Style::default().fg(GREY)),
+                Span::styled(fit(&grant_type, w_type), Style::default().fg(if is_dimmed { DIM_GREY } else { GREY })),
                 Span::raw("  "),
-                Span::styled(fit(&reset_str, w_res), Style::default().fg(GREY)),
+                Span::styled(fit(&reset_str, w_res), Style::default().fg(if is_dimmed { DIM_GREY } else { GREY })),
                 Span::raw("  "),
-                Span::styled(fit(status_text, w_stat), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                Span::styled(fit(status_text, w_stat), stat_style),
             ]));
         }
     }
@@ -4832,17 +4933,25 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
                     .map(|amt| format!("{}{:.2}", w.currency.as_deref().unwrap_or("$"), amt))
                     .unwrap_or_default();
                 let label_text = label_strs.get(idx).map(|s| s.as_str()).unwrap_or("");
+                let is_exhausted = w.effectively_exhausted()
+                    || w.remaining_percent.is_some_and(|pct| pct <= EFFECTIVE_EXHAUSTION_PERCENT || pct.round() <= 0.0)
+                    || w.remaining_amount.is_some_and(|amt| amt <= 0.0 || (amt * 100.0).round() <= 0.0);
+
+                let label_style = if is_exhausted {
+                    Style::default().fg(DIM_GREY).add_modifier(Modifier::DIM)
+                } else {
+                    Style::default().fg(Color::White)
+                };
 
                 let mut row = vec![
                     Span::styled(
                         fit(label_text, label_col_width),
-                        Style::default().fg(Color::White),
+                        label_style,
                     ),
                     Span::raw("  "),
                 ];
 
                 if let Some(pct) = w.remaining_percent {
-                    let is_exhausted = w.effectively_exhausted() || pct <= EFFECTIVE_EXHAUSTION_PERCENT || pct.round() <= 0.0;
                     let m = meter(pct, 6);
                     let m_color = if is_exhausted {
                         DIM_GREY
@@ -4873,11 +4982,24 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
 
                 if has_amounts {
                     row.push(Span::raw("  "));
-                    row.push(Span::styled(fit(&amt_text, 10), Style::default().fg(YELLOW)));
+                    let mut amt_style = Style::default().fg(if is_exhausted { DIM_GREY } else { YELLOW });
+                    if is_exhausted {
+                        amt_style = amt_style.add_modifier(Modifier::DIM);
+                    }
+                    row.push(Span::styled(fit(&amt_text, 10), amt_style));
                 }
 
-                row.push(Span::raw("  resets in "));
-                row.push(Span::styled(r_text, Style::default().fg(CYAN)));
+                let in_style = if is_exhausted {
+                    Style::default().fg(DIM_GREY).add_modifier(Modifier::DIM)
+                } else {
+                    Style::default().fg(GREY)
+                };
+                row.push(Span::styled("  resets in ", in_style));
+                let mut r_style = Style::default().fg(if is_exhausted { DIM_GREY } else { CYAN });
+                if is_exhausted {
+                    r_style = r_style.add_modifier(Modifier::DIM);
+                }
+                row.push(Span::styled(r_text, r_style));
                 lines.push(Line::from(row));
             }
             if !p.diagnostics.is_empty() {
@@ -6094,5 +6216,226 @@ mod tests {
         let lines_wide = body_lines(&app, 120, 30);
         let text_wide = lines_wide.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
         assert!(text_wide.contains("all pools capped"));
+
+        // Case 3: Gemini 7d exhausted (0%), Claude 7d healthy (85%)
+        app.providers = vec![
+            ProviderSnapshot {
+                account_key: "antigravity:g7d".into(),
+                account_label: "test@gmail.com".into(),
+                availability: Availability::Available,
+                collected_at_ms: 1000,
+                diagnostics: vec![],
+                hue: 141,
+                plan: "Pro".into(),
+                provider_id: "antigravity".into(),
+                source: "rpc".into(),
+                source_health: SourceHealth::Connected,
+                windows: vec![
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Weekly,
+                        label: "Gemini 7d".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(0.0),
+                        reset_text: None,
+                        resets_at_ms: Some(500_000_000),
+                    },
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Weekly,
+                        label: "Claude/GPT 7d".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(85.0),
+                        reset_text: None,
+                        resets_at_ms: Some(500_000_000),
+                    },
+                ],
+            },
+        ];
+
+        let lines3 = body_lines(&app, 100, 30);
+        let text3 = lines3.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text3.contains("1 pool active"));
+        assert!(text3.contains("Gemini capped"));
+        assert!(!text3.contains("all capped"));
+    }
+
+    #[test]
+    fn depleted_wallet_shows_depleted_and_dims() {
+        let mut app = App::new(false, false);
+        app.providers = vec![
+            ProviderSnapshot {
+                account_key: "openrouter:test".into(),
+                account_label: "key-1".into(),
+                availability: Availability::Exhausted,
+                collected_at_ms: 1000,
+                diagnostics: vec![],
+                hue: 10,
+                plan: "PAYG".into(),
+                provider_id: "openrouter".into(),
+                source: "api".into(),
+                source_health: SourceHealth::Connected,
+                windows: vec![
+                    LimitWindow {
+                        currency: Some("USD".into()),
+                        estimated: false,
+                        kind: WindowKind::Billing,
+                        label: "Balance".into(),
+                        metric: WindowMetric::Credits,
+                        remaining_amount: Some(0.0),
+                        remaining_percent: None,
+                        reset_text: None,
+                        resets_at_ms: None,
+                    },
+                ],
+            },
+        ];
+
+        let lines = body_lines(&app, 120, 30);
+        let text = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("depleted"));
+        assert!(text.contains("$0.00"));
+        assert!(text.contains("▲"));
+    }
+
+    #[test]
+    fn attention_filter_includes_session_capped_and_depleted_wallets() {
+        let mut app = App::new(false, false);
+        app.providers = vec![
+            ProviderSnapshot {
+                account_key: "healthy:1".into(),
+                account_label: "healthy".into(),
+                availability: Availability::Available,
+                collected_at_ms: 1000,
+                diagnostics: vec![],
+                hue: 10,
+                plan: "Pro".into(),
+                provider_id: "claude".into(),
+                source: "web".into(),
+                source_health: SourceHealth::Connected,
+                windows: vec![
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Session,
+                        label: "5h".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(90.0),
+                        reset_text: None,
+                        resets_at_ms: None,
+                    },
+                ],
+            },
+            ProviderSnapshot {
+                account_key: "session_capped:1".into(),
+                account_label: "capped".into(),
+                availability: Availability::Available,
+                collected_at_ms: 1000,
+                diagnostics: vec![],
+                hue: 10,
+                plan: "Pro".into(),
+                provider_id: "claude".into(),
+                source: "web".into(),
+                source_health: SourceHealth::Connected,
+                windows: vec![
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Session,
+                        label: "5h".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(0.0),
+                        reset_text: None,
+                        resets_at_ms: None,
+                    },
+                ],
+            },
+            ProviderSnapshot {
+                account_key: "wallet:1".into(),
+                account_label: "empty".into(),
+                availability: Availability::Available,
+                collected_at_ms: 1000,
+                diagnostics: vec![],
+                hue: 10,
+                plan: "PAYG".into(),
+                provider_id: "openrouter".into(),
+                source: "api".into(),
+                source_health: SourceHealth::Connected,
+                windows: vec![
+                    LimitWindow {
+                        currency: Some("USD".into()),
+                        estimated: false,
+                        kind: WindowKind::Billing,
+                        label: "Balance".into(),
+                        metric: WindowMetric::Credits,
+                        remaining_amount: Some(0.0),
+                        remaining_percent: None,
+                        reset_text: None,
+                        resets_at_ms: None,
+                    },
+                ],
+            },
+        ];
+
+        app.filter = Filter::Attention;
+        let visible = app.visible_providers();
+        let visible_labels: Vec<_> = visible.iter().map(|p| p.account_label.as_str()).collect();
+        assert!(!visible_labels.contains(&"healthy"));
+        assert!(visible_labels.contains(&"capped"));
+        assert!(visible_labels.contains(&"empty"));
+    }
+
+    #[test]
+    fn cursor_single_model_exhaustion_dims_only_capped_pool() {
+        let mut app = App::new(false, false);
+        app.providers = vec![
+            ProviderSnapshot {
+                account_key: "cursor:1".into(),
+                account_label: "test@cursor.sh".into(),
+                availability: Availability::Available,
+                collected_at_ms: 1000,
+                diagnostics: vec![],
+                hue: 75,
+                plan: "Pro".into(),
+                provider_id: "cursor".into(),
+                source: "web".into(),
+                source_health: SourceHealth::Connected,
+                windows: vec![
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Billing,
+                        label: "Cursor Models".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(0.0),
+                        reset_text: None,
+                        resets_at_ms: None,
+                    },
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Billing,
+                        label: "Other Models".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(90.0),
+                        reset_text: None,
+                        resets_at_ms: None,
+                    },
+                ],
+            },
+        ];
+
+        let lines = body_lines(&app, 100, 30);
+        let text = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("cursor capped"));
+        assert!(!text.contains("slow pool"));
     }
 }
