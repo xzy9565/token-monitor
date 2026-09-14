@@ -1788,6 +1788,133 @@ fn codex_plan(payload: &Value) -> String {
     }
 }
 
+fn format_countdown(diff_sec: i64) -> String {
+    if diff_sec <= 0 {
+        return "expired".to_string();
+    }
+    let days = diff_sec / 86_400;
+    let hours = (diff_sec % 86_400) / 3_600;
+    let minutes = (diff_sec % 3_600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        "<1m".to_string()
+    }
+}
+
+struct CodexResetCredit {
+    title: Option<String>,
+    expires_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+}
+
+fn parse_codex_reset_credits(
+    usage_payload: &Value,
+    credits_payload: Option<&Value>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let usage_count = usage_payload
+        .get("rate_limit_reset_credits")
+        .or_else(|| usage_payload.get("rateLimitResetCredits"))
+        .or_else(|| usage_payload.get("resetCredits"))
+        .or_else(|| usage_payload.get("reset_credits"))
+        .and_then(|rc| rc.get("available_count").or_else(|| rc.get("availableCount")))
+        .and_then(Value::as_i64);
+
+    let mut credits_list = Vec::new();
+    let mut payload_available_count = None;
+
+    if let Some(cp) = credits_payload {
+        payload_available_count = cp
+            .get("available_count")
+            .or_else(|| cp.get("availableCount"))
+            .and_then(Value::as_i64);
+
+        if let Some(arr) = cp.get("credits").and_then(Value::as_array) {
+            for item in arr {
+                let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+                if status != "available" {
+                    continue;
+                }
+                let title = item.get("title").and_then(Value::as_str).map(str::to_owned);
+                let expires_at = item
+                    .get("expires_at")
+                    .or_else(|| item.get("expiresAt"))
+                    .and_then(Value::as_str)
+                    .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok());
+
+                if let Some(exp) = expires_at {
+                    if exp.timestamp() <= now.timestamp() {
+                        continue;
+                    }
+                }
+
+                credits_list.push(CodexResetCredit {
+                    title,
+                    expires_at,
+                });
+            }
+        }
+    }
+
+    credits_list.sort_by_key(|c| c.expires_at);
+
+    let count = if !credits_list.is_empty() {
+        credits_list.len() as i64
+    } else {
+        payload_available_count.or(usage_count).unwrap_or(0)
+    };
+
+    if count <= 0 {
+        return vec![];
+    }
+
+    let mut diagnostics = Vec::new();
+    let s = if count > 1 { "s" } else { "" };
+
+    let earliest_exp = credits_list.iter().filter_map(|c| c.expires_at).next();
+    if let Some(exp) = earliest_exp {
+        let diff_sec = (exp.timestamp() - now.timestamp()).max(0);
+        let cd = format_countdown(diff_sec);
+        let date_str = exp.format("%b %-d").to_string();
+        let qualifier = if count > 1 { "earliest " } else { "" };
+        diagnostics.push(format!(
+            "★ {count} rate limit reset credit{s} available ({qualifier}expires in {cd} · {date_str})"
+        ));
+    } else {
+        diagnostics.push(format!("★ {count} rate limit reset credit{s} available"));
+    }
+
+    for (idx, credit) in credits_list.iter().enumerate() {
+        let num = idx + 1;
+        if let Some(exp) = credit.expires_at {
+            let diff_sec = (exp.timestamp() - now.timestamp()).max(0);
+            let cd = format_countdown(diff_sec);
+            let full_date = exp.format("%Y-%m-%d %H:%M UTC").to_string();
+            let title_part = credit
+                .title
+                .as_deref()
+                .map(|t| format!(" — {t}"))
+                .unwrap_or_default();
+            diagnostics.push(format!(
+                "Credit #{num}: expires in {cd} ({full_date}){title_part}"
+            ));
+        } else {
+            let title_part = credit
+                .title
+                .as_deref()
+                .map(|t| format!(" — {t}"))
+                .unwrap_or_default();
+            diagnostics.push(format!("Credit #{num}: available{title_part}"));
+        }
+    }
+
+    diagnostics
+}
+
 pub async fn collect_codex(options: &CollectorOptions) -> Vec<ProviderSnapshot> {
     if !options.includes("codex") {
         return vec![];
@@ -1825,10 +1952,17 @@ pub async fn collect_codex(options: &CollectorOptions) -> Vec<ProviderSnapshot> 
         .bearer_auth(&token)
         .header("Accept", "application/json")
         .header("User-Agent", "token-monitor-rust");
+    let mut credits_request = client
+        .get("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits")
+        .bearer_auth(&token)
+        .header("Accept", "application/json")
+        .header("User-Agent", "token-monitor-rust");
     if let Some(account_id) = &account_id {
         request = request.header("chatgpt-account-id", account_id);
+        credits_request = credits_request.header("chatgpt-account-id", account_id);
     }
-    let response = match request.send().await {
+    let (response, credits_response) = tokio::join!(request.send(), credits_request.send());
+    let response = match response {
         Ok(response) if response.status().is_success() => response,
         Ok(response) => {
             return vec![unavailable_snapshot(
@@ -1867,6 +2001,10 @@ pub async fn collect_codex(options: &CollectorOptions) -> Vec<ProviderSnapshot> 
             )]
         }
     };
+    let credits_payload: Option<Value> = match credits_response {
+        Ok(resp) if resp.status().is_success() => resp.json::<Value>().await.ok(),
+        _ => None,
+    };
     let rates = codex_rate_limits(&payload);
     let mut windows = vec![];
     if let Some(window) = rates
@@ -1890,13 +2028,6 @@ pub async fn collect_codex(options: &CollectorOptions) -> Vec<ProviderSnapshot> 
         .and_then(|account| account.get("email"))
         .and_then(Value::as_str)
         .unwrap_or("Codex");
-    let reset_credits = payload
-        .get("rate_limit_reset_credits")
-        .or_else(|| payload.get("rateLimitResetCredits"))
-        .or_else(|| payload.get("resetCredits"))
-        .or_else(|| payload.get("reset_credits"))
-        .and_then(|rc| rc.get("available_count").or_else(|| rc.get("availableCount")))
-        .and_then(Value::as_i64);
     let mut snapshot = connected_snapshot(
         "codex",
         account_key("codex", &token),
@@ -1906,10 +2037,7 @@ pub async fn collect_codex(options: &CollectorOptions) -> Vec<ProviderSnapshot> 
         windows,
         43,
     );
-    if let Some(credits) = reset_credits.filter(|c| *c > 0) {
-        let s = if credits > 1 { "s" } else { "" };
-        snapshot.diagnostics.push(format!("★ {credits} rate limit reset credit{s} available"));
-    }
+    snapshot.diagnostics = parse_codex_reset_credits(&payload, credits_payload.as_ref(), chrono::Utc::now());
     vec![snapshot]
 }
 
@@ -4891,5 +5019,57 @@ mod tests {
         .unwrap();
         assert!((window.remaining_percent.unwrap() - 66.66666666666667).abs() < 1e-9);
         assert_eq!(window.remaining_amount, Some(2.0));
+    }
+
+    #[test]
+    fn codex_reset_credits_surfaces_expiration_countdown_and_breakdown() {
+        let usage = serde_json::json!({
+            "rate_limit_reset_credits": {
+                "available_count": 3
+            }
+        });
+        let credits = serde_json::json!({
+            "credits": [
+                {
+                    "id": "c1",
+                    "status": "available",
+                    "expires_at": "2026-09-20T22:29:39Z",
+                    "title": "Full reset (Weekly + 5 hr)"
+                },
+                {
+                    "id": "c2",
+                    "status": "available",
+                    "expires_at": "2026-10-04T01:51:51Z",
+                    "title": "Full reset (Weekly + 5 hr)"
+                },
+                {
+                    "id": "c3",
+                    "status": "redeemed",
+                    "expires_at": "2026-09-18T00:00:00Z"
+                }
+            ],
+            "available_count": 2
+        });
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-14T14:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let diags = parse_codex_reset_credits(&usage, Some(&credits), now);
+        assert_eq!(diags.len(), 3);
+        assert!(diags[0].contains("★ 2 rate limit reset credits available (earliest expires in 6d 8h · Sep 20)"));
+        assert!(diags[1].contains("Credit #1: expires in 6d 8h (2026-09-20 22:29 UTC) — Full reset (Weekly + 5 hr)"));
+        assert!(diags[2].contains("Credit #2: expires in 19d 11h (2026-10-04 01:51 UTC) — Full reset (Weekly + 5 hr)"));
+    }
+
+    #[test]
+    fn codex_reset_credits_falls_back_gracefully_without_credits_endpoint() {
+        let usage = serde_json::json!({
+            "rate_limit_reset_credits": {
+                "available_count": 1
+            }
+        });
+        let now = chrono::Utc::now();
+        let diags = parse_codex_reset_credits(&usage, None, now);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0], "★ 1 rate limit reset credit available");
     }
 }

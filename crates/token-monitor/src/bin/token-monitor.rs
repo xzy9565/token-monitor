@@ -3931,7 +3931,16 @@ fn format_matrix_status(
                 .iter()
                 .find(|d| d.to_ascii_lowercase().contains("reset credit") || d.contains("★"));
             if let Some(diag) = reset_diag {
-                let num = diag.chars().find(|c| c.is_ascii_digit()).unwrap_or('1');
+                let num = diag
+                    .split_whitespace()
+                    .find_map(|w| w.parse::<u32>().ok())
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| {
+                        diag.chars()
+                            .find(|c| c.is_ascii_digit())
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "1".to_string())
+                    });
                 (format!("exhausted (★{} resets)", num), Color::Rgb(245, 175, 45))
             } else {
                 ("exhausted".to_string(), RED)
@@ -5006,11 +5015,17 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled("DIAGNOSTICS & DETAILS:", Style::default().fg(GREY).add_modifier(Modifier::BOLD))));
                 for d in &p.diagnostics {
-                    if d.contains("reset credit") || d.contains("★") {
+                    if d.contains("rate limit reset credit") || (d.contains("reset credit") && !d.starts_with("Credit #")) || (d.contains("★") && !d.starts_with("Credit #")) {
+                        let clean = d.trim_start_matches('★').trim();
                         lines.push(Line::from(vec![
                             Span::styled("  ★ ", Style::default().fg(Color::Rgb(245, 175, 45)).add_modifier(Modifier::BOLD)),
-                            Span::styled(d.clone(), Style::default().fg(Color::Rgb(245, 175, 45)).add_modifier(Modifier::BOLD)),
+                            Span::styled(clean.to_string(), Style::default().fg(Color::Rgb(245, 175, 45)).add_modifier(Modifier::BOLD)),
                             Span::styled("  (Available in ChatGPT Web / Codex to reset quota immediately)", Style::default().fg(GREY)),
+                        ]));
+                    } else if d.starts_with("Credit #") {
+                        lines.push(Line::from(vec![
+                            Span::styled("    • ", Style::default().fg(Color::Rgb(245, 175, 45))),
+                            Span::styled(fit(d, max_w.saturating_sub(6)), Style::default().fg(Color::Rgb(220, 200, 140))),
                         ]));
                     } else {
                         lines.push(Line::from(Span::styled(format!("  • {}", fit(d, max_w)), Style::default().fg(GREY))));
@@ -6030,6 +6045,36 @@ mod tests {
         // Ensure no truncated ellipsis in window labels
         assert!(!text.contains("Claude/GP…"));
         assert!(!text.contains("Claude/GPT…"));
+    }
+
+    #[test]
+    fn limits_provider_modal_renders_reset_credits_cleanly_without_double_star() {
+        let provider = ProviderSnapshot {
+            account_key: "codex-test".into(),
+            account_label: "user@example.com".into(),
+            availability: Availability::Available,
+            collected_at_ms: 1000,
+            diagnostics: vec![
+                "★ 3 rate limit reset credits available (earliest expires in 6d 8h · Sep 20)".into(),
+                "Credit #1: expires in 6d 8h (2026-09-20 22:29 UTC) — Full reset (Weekly + 5 hr)".into(),
+                "Credit #2: expires in 19d 11h (2026-10-04 01:51 UTC) — Full reset (Weekly + 5 hr)".into(),
+            ],
+            hue: 43,
+            plan: "Pro".into(),
+            provider_id: "codex".into(),
+            source: "oauth".into(),
+            source_health: SourceHealth::Connected,
+            windows: vec![],
+        };
+        let modal = DetailModal::LimitsProvider(Box::new(provider));
+        let lines = modal_lines(&modal, 120);
+        let text = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("DIAGNOSTICS & DETAILS:"));
+        // Ensure no double star "★ ★"
+        assert!(!text.contains("★ ★"));
+        assert!(text.contains("★ 3 rate limit reset credits available (earliest expires in 6d 8h · Sep 20)"));
+        assert!(text.contains("Credit #1: expires in 6d 8h (2026-09-20 22:29 UTC) — Full reset (Weekly + 5 hr)"));
+        assert!(text.contains("Credit #2: expires in 19d 11h (2026-10-04 01:51 UTC) — Full reset (Weekly + 5 hr)"));
     }
 
     #[test]
