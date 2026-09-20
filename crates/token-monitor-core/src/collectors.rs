@@ -2333,6 +2333,16 @@ fn cached_antigravity_snapshots(live_emails: &std::collections::HashSet<String>)
                         seen_emails.insert(item.account_label.clone());
                         let mut cached = item;
                         cached.source_health = SourceHealth::Stale;
+                        for w in &mut cached.windows {
+                            if w.kind == WindowKind::Session {
+                                if let Some(r) = w.resets_at_ms {
+                                    if r <= now_ms {
+                                        w.remaining_percent = Some(100.0);
+                                        w.resets_at_ms = None;
+                                    }
+                                }
+                            }
+                        }
                         cached_list.push(cached);
                     }
                 }

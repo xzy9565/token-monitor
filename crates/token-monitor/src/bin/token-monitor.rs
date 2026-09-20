@@ -1867,13 +1867,14 @@ fn status_style_for(provider: &ProviderSnapshot) -> Style {
 fn reset_text(window: &LimitWindow) -> String {
     if let Some(timestamp) = window.resets_at_ms {
         let now = chrono::Utc::now().timestamp_millis();
-        // Fixtures and a few legacy adapters carry a human countdown beside a
-        // non-absolute placeholder timestamp. Prefer that trusted text instead
-        // of rendering an accidental `0m` countdown.
+        // If the timestamp is in the past or right now, prefer trusted reset_text if present,
+        // or return "—" to avoid rendering a stale/accidental `0m` countdown.
         if timestamp <= now {
-            if let Some(text) = &window.reset_text {
-                return compact_reset_description(text);
-            }
+            return window
+                .reset_text
+                .as_deref()
+                .map(compact_reset_description)
+                .unwrap_or_else(|| "—".into());
         }
         let remaining = (timestamp - now).max(0) / 1000;
         let days = remaining / 86_400;
@@ -1883,8 +1884,10 @@ fn reset_text(window: &LimitWindow) -> String {
             format!("{days}d {hours}h")
         } else if hours > 0 {
             format!("{hours}h {minutes}m")
-        } else {
+        } else if minutes > 0 {
             format!("{minutes}m")
+        } else {
+            "<1m".into()
         };
     }
     window
@@ -2381,6 +2384,14 @@ fn next_reset(provider: &ProviderSnapshot) -> Option<String> {
             .iter()
             .filter_map(|window| window.resets_at_ms.map(|reset| (reset, window)))
             .collect();
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    if let Some((_, window)) = candidates
+        .iter()
+        .filter(|(reset, _)| *reset > now)
+        .min_by_key(|(reset, _)| *reset)
+    {
+        return Some(reset_text(window));
     }
     candidates
         .into_iter()
@@ -6566,5 +6577,35 @@ mod tests {
         let text = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
         assert!(text.contains("cursor capped"));
         assert!(!text.contains("slow pool"));
+    }
+
+    #[test]
+    fn reset_text_handles_expired_and_sub_minute_timestamps() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let expired_window = LimitWindow {
+            currency: None,
+            estimated: false,
+            kind: WindowKind::Session,
+            label: "5h".into(),
+            metric: WindowMetric::Quota,
+            remaining_amount: None,
+            remaining_percent: Some(73.0),
+            reset_text: None,
+            resets_at_ms: Some(now - 10_000),
+        };
+        assert_eq!(reset_text(&expired_window), "—");
+
+        let soon_window = LimitWindow {
+            currency: None,
+            estimated: false,
+            kind: WindowKind::Session,
+            label: "5h".into(),
+            metric: WindowMetric::Quota,
+            remaining_amount: None,
+            remaining_percent: Some(10.0),
+            reset_text: None,
+            resets_at_ms: Some(now + 30_000),
+        };
+        assert_eq!(reset_text(&soon_window), "<1m");
     }
 }
