@@ -4086,15 +4086,24 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 if is_sel {
                     title_style = title_style.bg(Color::Rgb(28, 42, 60));
                 }
-                let (marker_char, marker_style) = if all_dim {
+                let is_all_capped = g_dim && c_dim;
+                let (marker_char, marker_style) = if is_all_capped {
                     ('▲', Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
                 } else if c_dim || g_dim {
                     ('▲', Style::default().fg(YELLOW))
+                } else if provider.availability == Availability::AgentBlocked {
+                    ('▲', Style::default().fg(RED).add_modifier(Modifier::BOLD))
+                } else if all_dim {
+                    ('●', Style::default().fg(DIM_GREY))
                 } else {
                     ('●', Style::default().fg(ag_brand))
                 };
-                let cli_tag = if cols.cycle >= 16 {
-                    "CLI (port 57388)"
+                let cli_tag = if provider.source_health == SourceHealth::Stale {
+                    if cols.cycle >= 14 {
+                        "CLI (cached)"
+                    } else {
+                        "cached"
+                    }
                 } else if cols.cycle >= 9 {
                     "CLI (RPC)"
                 } else {
@@ -4123,12 +4132,14 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 let best_7d = gemini_7d.or(claude_7d);
                 parent_spans.extend(format_dual_reset(best_5h, best_7d, cols.reset, now_ms, all_dim));
                 parent_spans.push(Span::raw("  "));
-                let parent_status = if all_dim {
+                let parent_status = if is_all_capped {
                     ("all capped", DIM_GREY)
                 } else if c_dim {
                     ("Claude capped", YELLOW)
                 } else if g_dim {
                     ("Gemini capped", YELLOW)
+                } else if provider.availability == Availability::AgentBlocked {
+                    ("blocked", RED)
                 } else {
                     ("ready", GREEN)
                 };
@@ -4238,10 +4249,14 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 if is_sel {
                     title_style = title_style.bg(Color::Rgb(28, 42, 60));
                 }
-                let (marker_char, marker_style) = if is_dimmed {
+                let (marker_char, marker_style) = if cursor_all_exhausted {
                     ('▲', Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
                 } else if c_capped || o_capped {
                     ('▲', Style::default().fg(YELLOW))
+                } else if provider.availability == Availability::AgentBlocked {
+                    ('▲', Style::default().fg(RED).add_modifier(Modifier::BOLD))
+                } else if is_dimmed {
+                    ('●', Style::default().fg(DIM_GREY))
                 } else if provider.availability == Availability::Available {
                     ('●', Style::default().fg(GREEN))
                 } else {
@@ -6307,6 +6322,75 @@ mod tests {
         assert!(text3.contains("1 pool active"));
         assert!(text3.contains("Gemini capped"));
         assert!(!text3.contains("all capped"));
+
+        // Case 4: Stale/cached snapshot with healthy quotas (neither pool capped)
+        app.providers = vec![
+            ProviderSnapshot {
+                account_key: "antigravity:stale".into(),
+                account_label: "xzy9565@gmail.com".into(),
+                availability: Availability::Available,
+                collected_at_ms: 1000,
+                diagnostics: vec![],
+                hue: 141,
+                plan: "Pro".into(),
+                provider_id: "antigravity".into(),
+                source: "rpc".into(),
+                source_health: SourceHealth::Stale,
+                windows: vec![
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Session,
+                        label: "Gemini 5h".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(73.1),
+                        reset_text: None,
+                        resets_at_ms: Some(18_000_000),
+                    },
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Weekly,
+                        label: "Gemini 7d".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(95.2),
+                        reset_text: None,
+                        resets_at_ms: Some(500_000_000),
+                    },
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Session,
+                        label: "Claude/GPT 5h".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(100.0),
+                        reset_text: None,
+                        resets_at_ms: Some(18_000_000),
+                    },
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Weekly,
+                        label: "Claude/GPT 7d".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(100.0),
+                        reset_text: None,
+                        resets_at_ms: Some(500_000_000),
+                    },
+                ],
+            },
+        ];
+
+        let lines4 = body_lines(&app, 120, 30);
+        let text4 = lines4.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text4.contains("2 pools active"));
+        assert!(text4.contains("CLI (cached)"));
+        assert!(text4.contains("ready"));
+        assert!(!text4.contains("all capped"));
     }
 
     #[test]
