@@ -2352,6 +2352,51 @@ fn cached_antigravity_snapshots(live_emails: &std::collections::HashSet<String>)
     cached_list
 }
 
+fn discover_antigravity_env_csrf() -> std::collections::HashMap<u16, String> {
+    let mut map = std::collections::HashMap::new();
+    let Some(home) = dirs::home_dir() else {
+        return map;
+    };
+    let brain_dir = home.join(".gemini/antigravity-cli/brain");
+    let Ok(entries) = std::fs::read_dir(brain_dir) else {
+        return map;
+    };
+    for entry in entries.flatten() {
+        let terminals_dir = entry.path().join(".system_generated/terminals");
+        if let Ok(term_files) = std::fs::read_dir(terminals_dir) {
+            for term_file in term_files.flatten() {
+                let path = term_file.path();
+                if path.extension().is_some_and(|ext| ext == "env") {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        let mut port = None;
+                        let mut token = None;
+                        for line in content.lines() {
+                            if let Some(val) = line.strip_prefix("export ANTIGRAVITY_LS_ADDRESS=") {
+                                let val = val.trim_matches(|c| c == '\'' || c == '"');
+                                if let Some((_, p_str)) = val.rsplit_once(':') {
+                                    port = p_str.parse::<u16>().ok();
+                                }
+                            } else if let Some(val) = line.strip_prefix("export ANTIGRAVITY_CSRF_TOKEN=") {
+                                let val = val.trim_matches(|c| c == '\'' || c == '"');
+                                if !val.is_empty() {
+                                    token = Some(val.to_owned());
+                                }
+                            }
+                        }
+                        if let (Some(p), Some(t)) = (port, token) {
+                            map.insert(p, t.clone());
+                            if p > 0 {
+                                map.insert(p - 1, t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
 pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnapshot> {
     if !options.includes("antigravity") {
         return vec![];
@@ -2369,11 +2414,11 @@ pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnap
             }
             return vec![unavailable_snapshot(
                 "antigravity",
+                "antigravity".into(),
                 "".into(),
-                "Pro".into(),
                 "rpc",
                 SourceHealth::Unavailable,
-                "Process list unavailable",
+                "Process scan failed",
                 141,
             )];
         }
@@ -2386,11 +2431,11 @@ pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnap
         }
         return vec![unavailable_snapshot(
             "antigravity",
+            "antigravity".into(),
             "".into(),
-            "Pro".into(),
             "rpc",
             SourceHealth::Unavailable,
-            "Antigravity language server not running",
+            "Antigravity process not found",
             141,
         )];
     }
@@ -2407,8 +2452,8 @@ pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnap
             }
             return vec![unavailable_snapshot(
                 "antigravity",
+                "antigravity".into(),
                 "".into(),
-                "Pro".into(),
                 "rpc",
                 SourceHealth::Unavailable,
                 "HTTP client unavailable",
@@ -2419,6 +2464,7 @@ pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnap
 
     let mut snapshots = Vec::new();
     let mut live_emails = std::collections::HashSet::new();
+    let env_csrf_map = discover_antigravity_env_csrf();
 
     for server in servers {
         let ports = antigravity_ports(server.pid, options.timeout()).await;
@@ -2427,60 +2473,80 @@ pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnap
             if server_connected {
                 break;
             }
-            for scheme in ["http", "https"] {
-                let result = antigravity_call(
-                    &client,
-                    scheme,
-                    port,
-                    &server.csrf_token,
-                    "RetrieveUserQuotaSummary",
-                    serde_json::json!({"forceRefresh": true}),
-                )
-                .await;
-                let Ok(payload) = result else {
-                    continue;
-                };
-                let windows = antigravity_windows(&payload);
-                if windows.is_empty() {
-                    continue;
-                }
-                let identity = antigravity_call(
-                    &client,
-                    scheme,
-                    port,
-                    &server.csrf_token,
-                    "GetUserStatus",
-                    serde_json::json!({"metadata": {"ide": "antigravity", "locale": "en"}}),
-                )
-                .await
-                .ok();
-                let email = identity
-                    .as_ref()
-                    .and_then(|value| value.get("userStatus"))
-                    .and_then(|value| value.get("email"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("Antigravity");
-                let plan = identity
-                    .as_ref()
-                    .and_then(|value| value.get("userStatus"))
-                    .and_then(|value| value.get("userTier"))
-                    .and_then(|value| value.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("Pro");
 
-                if live_emails.insert(email.to_string()) {
-                    snapshots.push(connected_snapshot(
-                        "antigravity",
-                        account_key("antigravity", email),
-                        email.into(),
-                        plan.into(),
-                        "rpc",
-                        windows,
-                        141,
-                    ));
+            let mut csrf_candidates = Vec::new();
+            if !server.csrf_token.is_empty() {
+                csrf_candidates.push(server.csrf_token.clone());
+            } else {
+                if let Some(t) = env_csrf_map.get(&port) {
+                    csrf_candidates.push(t.clone());
                 }
-                server_connected = true;
-                break;
+                for c in ["tm-1", "tm-2", "tm-3", ""] {
+                    if !csrf_candidates.iter().any(|existing| existing == c) {
+                        csrf_candidates.push(c.to_string());
+                    }
+                }
+            }
+
+            for scheme in ["http", "https"] {
+                if server_connected {
+                    break;
+                }
+                for csrf in &csrf_candidates {
+                    let result = antigravity_call(
+                        &client,
+                        scheme,
+                        port,
+                        csrf,
+                        "RetrieveUserQuotaSummary",
+                        serde_json::json!({"forceRefresh": true}),
+                    )
+                    .await;
+                    let Ok(payload) = result else {
+                        continue;
+                    };
+                    let windows = antigravity_windows(&payload);
+                    if windows.is_empty() {
+                        continue;
+                    }
+                    let identity = antigravity_call(
+                        &client,
+                        scheme,
+                        port,
+                        csrf,
+                        "GetUserStatus",
+                        serde_json::json!({"metadata": {"ide": "antigravity", "locale": "en"}}),
+                    )
+                    .await
+                    .ok();
+                    let email = identity
+                        .as_ref()
+                        .and_then(|value| value.get("userStatus"))
+                        .and_then(|value| value.get("email"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("Antigravity");
+                    let plan = identity
+                        .as_ref()
+                        .and_then(|value| value.get("userStatus"))
+                        .and_then(|value| value.get("userTier"))
+                        .and_then(|value| value.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("Pro");
+
+                    if live_emails.insert(email.to_string()) {
+                        snapshots.push(connected_snapshot(
+                            "antigravity",
+                            account_key("antigravity", email),
+                            email.into(),
+                            plan.into(),
+                            "rpc",
+                            windows,
+                            141,
+                        ));
+                    }
+                    server_connected = true;
+                    break;
+                }
             }
         }
     }
