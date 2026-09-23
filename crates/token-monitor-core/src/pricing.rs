@@ -96,11 +96,45 @@ impl PricingEngine {
             cache
                 .entry(key)
                 .or_insert_with(|| {
-                    service.lookup_with_source_and_provider(
+                    let hinted = service.lookup_with_source_and_provider(
                         &record.model_id,
                         None,
                         Some(&record.provider_id),
-                    )
+                    );
+                    if let Some(res) = &hinted {
+                        let is_strict = res.evidence.exact_model_identity
+                            && res.evidence.price_consensus
+                            && res.evidence.is_submission_safe()
+                            && !matches!(
+                                res.evidence.kind,
+                                tok_scale_resolution::ResolutionKind::Fuzzy
+                                    | tok_scale_resolution::ResolutionKind::ModelPart
+                            );
+                        if is_strict {
+                            return hinted;
+                        }
+                    }
+                    // Fall back to canonical unhinted lookup when the provider hint lands on an
+                    // indirect reseller key (e.g. Bedrock/Perplexity) that downgrades to ModelPart.
+                    let unhinted = service.lookup_with_source_and_provider(
+                        &record.model_id,
+                        None,
+                        None,
+                    );
+                    if let Some(res) = &unhinted {
+                        let is_strict = res.evidence.exact_model_identity
+                            && res.evidence.price_consensus
+                            && res.evidence.is_submission_safe()
+                            && !matches!(
+                                res.evidence.kind,
+                                tok_scale_resolution::ResolutionKind::Fuzzy
+                                    | tok_scale_resolution::ResolutionKind::ModelPart
+                            );
+                        if is_strict {
+                            return unhinted;
+                        }
+                    }
+                    hinted.or(unhinted)
                 })
                 .clone()
         };
@@ -306,5 +340,92 @@ mod tests {
         assert_eq!(quote.reasoning_tokens, 0);
         assert_eq!(quote.priced_tokens, 100);
         assert!((quote.value_usd.unwrap() - 0.000125).abs() < 1e-12);
+    }
+
+    #[test]
+    fn claude_opus_and_sonnet_models_resolve_canonical_pricing() {
+        let engine = PricingEngine::load_cached();
+        if !engine.has_pricing_data() {
+            return;
+        }
+        for (model, provider) in [
+            ("claude-opus-5-5", "anthropic"),
+            ("claude-sonnet-4-6", "anthropic"),
+        ] {
+            let rec = UsageRecord {
+                client: "claude".into(),
+                model_id: model.into(),
+                provider_id: provider.into(),
+                session_id: "s".into(),
+                date: "2026-09-23".into(),
+                timestamp: 0,
+                tokens: UsageTokens {
+                    input: 2,
+                    output: 472,
+                    cache_read: 0,
+                    cache_write: 199678,
+                    reasoning: 0,
+                },
+                message_count: 1,
+            };
+            let quote = engine.quote(&rec);
+            assert_eq!(
+                quote.status,
+                PricingStatus::Exact,
+                "Model {} failed to resolve exact pricing: {:?}",
+                model,
+                quote.warnings
+            );
+            assert!(quote.value_usd.is_some());
+            assert_eq!(quote.priced_tokens, 200152);
+            assert_eq!(quote.unpriced_tokens, 0);
+        }
+    }
+
+    #[test]
+    fn fallback_to_unhinted_lookup_when_provider_hint_hits_reseller_key() {
+        let canonical_pricing = tokscale_core::pricing::ModelPricing {
+            input_cost_per_token: Some(4e-6),
+            output_cost_per_token: Some(20e-6),
+            cache_read_input_token_cost: Some(0.2e-6),
+            cache_creation_input_token_cost: Some(5e-6),
+            ..Default::default()
+        };
+        let bedrock_pricing = tokscale_core::pricing::ModelPricing {
+            input_cost_per_token: Some(4e-6),
+            output_cost_per_token: Some(20e-6),
+            ..Default::default()
+        };
+        let mut litellm = HashMap::new();
+        // Bedrock key has "anthropic" provider tag inside path, which tokscale matches on hint
+        litellm.insert(
+            "bedrock/us-gov-east-1/anthropic.claude-opus-5-5".into(),
+            bedrock_pricing,
+        );
+        // Canonical key
+        litellm.insert("claude-opus-5-5".into(), canonical_pricing);
+        let engine = PricingEngine::from_datasets(litellm, HashMap::new());
+
+        let rec = UsageRecord {
+            client: "claude".into(),
+            model_id: "claude-opus-5-5".into(),
+            provider_id: "anthropic".into(),
+            session_id: "s".into(),
+            date: "2026-09-23".into(),
+            timestamp: 0,
+            tokens: UsageTokens {
+                input: 10,
+                output: 20,
+                cache_read: 30,
+                cache_write: 40,
+                reasoning: 0,
+            },
+            message_count: 1,
+        };
+
+        let quote = engine.quote(&rec);
+        assert_eq!(quote.status, PricingStatus::Exact);
+        assert_eq!(quote.priced_tokens, 100);
+        assert!(quote.value_usd.is_some());
     }
 }
