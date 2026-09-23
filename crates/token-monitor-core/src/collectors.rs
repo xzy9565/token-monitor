@@ -184,15 +184,24 @@ fn connected_snapshot(
             (true, true) => c_capped && o_capped,
             (true, false) => c_capped,
             (false, true) => o_capped,
-            _ => windows.iter().any(|w| (w.kind.durable() || w.metric.is_credit()) && w.effectively_exhausted()),
+            _ => {
+                if windows.iter().any(|w| !w.metric.is_credit()) {
+                    windows.iter().any(|w| !w.metric.is_credit() && w.kind.durable() && w.effectively_exhausted())
+                } else {
+                    windows.iter().all(|w| w.effectively_exhausted())
+                }
+            }
         }
-    } else {
+    } else if windows.is_empty() {
+        false
+    } else if windows.iter().any(|w| !w.metric.is_credit()) {
         windows.iter().any(|window| {
-            (window.metric.is_credit() && window.effectively_exhausted())
-                || (!window.metric.is_credit()
-                    && window.kind.durable()
-                    && window.effectively_exhausted())
+            !window.metric.is_credit()
+                && window.kind.durable()
+                && window.effectively_exhausted()
         })
+    } else {
+        windows.iter().all(|window| window.effectively_exhausted())
     };
     let availability = if is_exhausted {
         Availability::Exhausted
@@ -4984,6 +4993,55 @@ mod tests {
         assert_eq!(window.remaining_amount, Some(72.27));
         assert_eq!(window.currency.as_deref(), Some("USD"));
         assert!(window.resets_at_ms.is_some());
+    }
+
+    #[test]
+    fn subscription_with_zero_prepaid_balance_is_not_exhausted() {
+        let snapshot = connected_snapshot(
+            "claude",
+            "claude:test".into(),
+            "test@example.com".into(),
+            "Pro".into(),
+            "web",
+            vec![
+                LimitWindow {
+                    label: "5h".into(),
+                    kind: WindowKind::Session,
+                    metric: WindowMetric::Quota,
+                    remaining_percent: Some(100.0),
+                    remaining_amount: None,
+                    currency: None,
+                    resets_at_ms: Some(1_000_000),
+                    reset_text: None,
+                    estimated: false,
+                },
+                LimitWindow {
+                    label: "7d".into(),
+                    kind: WindowKind::Weekly,
+                    metric: WindowMetric::Quota,
+                    remaining_percent: Some(98.0),
+                    remaining_amount: None,
+                    currency: None,
+                    resets_at_ms: Some(2_000_000),
+                    reset_text: None,
+                    estimated: false,
+                },
+                LimitWindow {
+                    label: "Balance".into(),
+                    kind: WindowKind::Billing,
+                    metric: WindowMetric::Credits,
+                    remaining_percent: None,
+                    remaining_amount: Some(0.0),
+                    currency: Some("USD".into()),
+                    resets_at_ms: None,
+                    reset_text: None,
+                    estimated: false,
+                },
+            ],
+            209,
+        );
+        assert_eq!(snapshot.availability, Availability::Available);
+        assert!(!snapshot.is_exhausted());
     }
 
     #[test]

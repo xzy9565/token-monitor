@@ -206,12 +206,26 @@ impl ProviderSnapshot {
                 (true, true) => c_capped && o_capped,
                 (true, false) => c_capped,
                 (false, true) => o_capped,
-                _ => self.windows.iter().any(|w| (w.kind.durable() || w.metric.is_credit()) && w.effectively_exhausted()),
+                _ => {
+                    if self.windows.iter().any(|w| !w.metric.is_credit()) {
+                        self.windows
+                            .iter()
+                            .any(|w| !w.metric.is_credit() && w.kind.durable() && w.effectively_exhausted())
+                    } else {
+                        self.windows.iter().all(|w| w.effectively_exhausted())
+                    }
+                }
             };
         }
-        self.windows
-            .iter()
-            .any(|w| (w.kind.durable() || w.metric.is_credit()) && w.effectively_exhausted())
+        if self.windows.is_empty() {
+            false
+        } else if self.windows.iter().any(|w| !w.metric.is_credit()) {
+            self.windows
+                .iter()
+                .any(|w| !w.metric.is_credit() && w.kind.durable() && w.effectively_exhausted())
+        } else {
+            self.windows.iter().all(|w| w.effectively_exhausted())
+        }
     }
 
     pub fn earliest_deadline_ms(&self, now_ms: i64) -> Option<i64> {

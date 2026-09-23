@@ -1067,11 +1067,19 @@ impl App {
                 Filter::Attention => {
                     provider.availability.dimmed()
                         || provider.source_health != SourceHealth::Connected
-                        || provider.windows.iter().any(|w| {
-                            w.effectively_exhausted()
-                                || w.remaining_percent.is_some_and(|p| p <= EFFECTIVE_EXHAUSTION_PERCENT || p.round() <= 0.0)
-                                || w.remaining_amount.is_some_and(|a| a <= 0.0 || (a * 100.0).round() <= 0.0)
-                        })
+                        || if is_wallet_provider(provider) {
+                            provider.windows.iter().any(|w| {
+                                w.effectively_exhausted()
+                                    || w.remaining_amount.is_some_and(|a| a <= 0.0 || (a * 100.0).round() <= 0.0)
+                                    || w.remaining_percent.is_some_and(|p| p <= EFFECTIVE_EXHAUSTION_PERCENT || p.round() <= 0.0)
+                            })
+                        } else {
+                            provider.windows.iter().any(|w| {
+                                !w.metric.is_credit()
+                                    && (w.effectively_exhausted()
+                                        || w.remaining_percent.is_some_and(|p| p <= EFFECTIVE_EXHAUSTION_PERCENT || p.round() <= 0.0))
+                            })
+                        }
                 }
                 Filter::Credits => provider.has_credits(),
                 Filter::Quotas => !provider.has_credits(),
