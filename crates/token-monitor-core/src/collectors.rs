@@ -2980,12 +2980,67 @@ pub async fn collect_grok(options: &CollectorOptions) -> Vec<ProviderSnapshot> {
     }
 }
 
+struct CommandCodeLocalAuth {
+    api_key: String,
+    user_id: Option<String>,
+    user_name: Option<String>,
+}
+
+fn commandcode_local_auth() -> Option<CommandCodeLocalAuth> {
+    let home = dirs::home_dir()?;
+    let config_dir = std::env::var_os("COMMANDCODE_CONFIG_DIR")
+        .or_else(|| std::env::var_os("COMMANDCODE_HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".commandcode"));
+    let auth_path = config_dir.join("auth.json");
+    let content = std::fs::read_to_string(auth_path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+    let api_key = value
+        .get("apiKey")
+        .or_else(|| value.get("api_key"))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())?;
+    let user_id = value
+        .get("userId")
+        .or_else(|| value.get("user_id"))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    let user_name = value
+        .get("userName")
+        .or_else(|| value.get("user_name"))
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    Some(CommandCodeLocalAuth {
+        api_key,
+        user_id,
+        user_name,
+    })
+}
+
+fn commandcode_api_key() -> Option<String> {
+    env_secret(&[
+        "TOKEN_MONITOR_COMMANDCODE_API_KEY",
+        "COMMAND_CODE_API_KEY",
+        "COMMANDCODE_API_KEY",
+    ])
+}
+
 fn commandcode_cookie() -> Option<String> {
     let raw = env_secret(&["TOKEN_MONITOR_COMMANDCODE_COOKIE", "COMMANDCODE_COOKIE"])?;
     let mut forwarded = vec![];
     let mut has_session = false;
     for pair in raw.trim_start_matches("Cookie:").split(';') {
-        let (name, value) = pair.trim().split_once('=')?;
+        let trimmed = pair.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = trimmed.split_once('=') else {
+            continue;
+        };
         let lower = name.trim().to_ascii_lowercase();
         let is_session = matches!(
             lower.as_str(),
@@ -3005,6 +3060,38 @@ fn commandcode_cookie() -> Option<String> {
         }
     }
     has_session.then(|| forwarded.join("; "))
+}
+
+enum CommandCodeAuth {
+    ApiKey {
+        key: String,
+        user_id: Option<String>,
+        user_name: Option<String>,
+    },
+    Cookie {
+        cookie: String,
+    },
+}
+
+fn resolve_commandcode_auth() -> Option<CommandCodeAuth> {
+    if let Some(key) = commandcode_api_key() {
+        return Some(CommandCodeAuth::ApiKey {
+            key,
+            user_id: None,
+            user_name: None,
+        });
+    }
+    if let Some(local) = commandcode_local_auth() {
+        return Some(CommandCodeAuth::ApiKey {
+            key: local.api_key,
+            user_id: local.user_id,
+            user_name: local.user_name,
+        });
+    }
+    if let Some(cookie) = commandcode_cookie() {
+        return Some(CommandCodeAuth::Cookie { cookie });
+    }
+    None
 }
 
 fn commandcode_plan(plan_id: &str) -> Option<(&'static str, f64, f64, f64)> {
@@ -3037,7 +3124,8 @@ fn commandcode_rolling_window(
         remaining_percent: Some(((limit - used).max(0.0) / limit * 100.0).clamp(0.0, 100.0)),
         remaining_amount: Some((limit - used).max(0.0)),
         currency: Some("USD".into()),
-        resets_at_ms: reset_timestamp(raw.get("resetAt").or_else(|| raw.get("reset_at"))),
+        resets_at_ms: reset_timestamp(raw.get("resetAt").or_else(|| raw.get("reset_at")))
+            .filter(|ts| *ts > 0),
         reset_text: None,
         estimated: false,
     })
@@ -3052,69 +3140,88 @@ pub async fn collect_commandcode(options: &CollectorOptions) -> Vec<ProviderSnap
     if !options.includes("commandcode") {
         return vec![];
     }
-    let cookie = match commandcode_cookie() {
-        Some(cookie) => cookie,
+    let auth = match resolve_commandcode_auth() {
+        Some(auth) => auth,
         None => {
             return vec![unavailable_snapshot(
                 "commandcode",
                 "".into(),
                 "Go".into(),
-                "web",
+                "cli",
                 SourceHealth::Unavailable,
-                "Command Code session cookie not configured",
+                "Command Code authentication not configured",
                 220,
-            )]
+            )];
         }
+    };
+    let (source, auth_seed) = match &auth {
+        CommandCodeAuth::ApiKey { key, .. } => ("cli", key.as_str()),
+        CommandCodeAuth::Cookie { cookie } => ("web", cookie.as_str()),
     };
     let client = match Client::builder().timeout(options.timeout()).build() {
         Ok(client) => client,
         Err(_) => {
             return vec![unavailable_snapshot(
                 "commandcode",
-                account_key("commandcode", &cookie),
+                account_key("commandcode", auth_seed),
                 "Go".into(),
-                "web",
+                source,
                 SourceHealth::Unavailable,
                 "HTTP client unavailable",
                 220,
-            )]
+            )];
         }
     };
-    let headers = |request: reqwest::RequestBuilder| {
-        request
-            .header("Cookie", &cookie)
-            .header("Accept", "application/json, text/plain, */*")
-            .header("Origin", "https://commandcode.ai")
-            .header("Referer", "https://commandcode.ai/")
-            .header("User-Agent", "Mozilla/5.0 Token-Monitor-Rust")
+    let (credits_response, subscription_response) = match &auth {
+        CommandCodeAuth::ApiKey { key, .. } => {
+            let headers = |req: reqwest::RequestBuilder| {
+                req.bearer_auth(key)
+                    .header("Accept", "application/json, text/plain, */*")
+                    .header("Content-Type", "application/json")
+                    .header("User-Agent", "Mozilla/5.0 Token-Monitor-Rust")
+            };
+            tokio::join!(
+                headers(client.get("https://api.commandcode.ai/alpha/billing/credits")).send(),
+                headers(client.get("https://api.commandcode.ai/alpha/billing/subscriptions")).send(),
+            )
+        }
+        CommandCodeAuth::Cookie { cookie } => {
+            let headers = |req: reqwest::RequestBuilder| {
+                req.header("Cookie", cookie)
+                    .header("Accept", "application/json, text/plain, */*")
+                    .header("Origin", "https://commandcode.ai")
+                    .header("Referer", "https://commandcode.ai/")
+                    .header("User-Agent", "Mozilla/5.0 Token-Monitor-Rust")
+            };
+            tokio::join!(
+                headers(client.get("https://api.commandcode.ai/internal/billing/credits")).send(),
+                headers(client.get("https://api.commandcode.ai/internal/billing/subscriptions")).send(),
+            )
+        }
     };
-    let (credits_response, subscription_response) = tokio::join!(
-        headers(client.get("https://api.commandcode.ai/internal/billing/credits")).send(),
-        headers(client.get("https://api.commandcode.ai/internal/billing/subscriptions")).send(),
-    );
     let credits_response = match credits_response {
         Ok(response) if response.status().is_success() => response,
         Ok(response) => {
             return vec![unavailable_snapshot(
                 "commandcode",
-                account_key("commandcode", &cookie),
+                account_key("commandcode", auth_seed),
                 "Go".into(),
-                "web",
+                source,
                 status_for_http(response.status()),
                 "Command Code credits unavailable",
                 220,
-            )]
+            )];
         }
         Err(_) => {
             return vec![unavailable_snapshot(
                 "commandcode",
-                account_key("commandcode", &cookie),
+                account_key("commandcode", auth_seed),
                 "Go".into(),
-                "web",
+                source,
                 SourceHealth::Unavailable,
                 "Command Code request failed",
                 220,
-            )]
+            )];
         }
     };
     let credits = match credits_response.json::<Value>().await {
@@ -3122,13 +3229,13 @@ pub async fn collect_commandcode(options: &CollectorOptions) -> Vec<ProviderSnap
         Err(_) => {
             return vec![unavailable_snapshot(
                 "commandcode",
-                account_key("commandcode", &cookie),
+                account_key("commandcode", auth_seed),
                 "Go".into(),
-                "web",
+                source,
                 SourceHealth::Unavailable,
                 "Invalid Command Code credits JSON",
                 220,
-            )]
+            )];
         }
     };
     let subscriptions = subscription_response
@@ -3202,7 +3309,8 @@ pub async fn collect_commandcode(options: &CollectorOptions) -> Vec<ProviderSnap
                             .get("currentPeriodEnd")
                             .or_else(|| value.get("current_period_end")),
                     )
-                }),
+                })
+                .filter(|ts| *ts > 0),
             reset_text: None,
             estimated: trusted_limit.is_none(),
         });
@@ -3217,21 +3325,34 @@ pub async fn collect_commandcode(options: &CollectorOptions) -> Vec<ProviderSnap
                 .or_else(|| value.get("id"))
         })
         .and_then(Value::as_str)
+        .or(match &auth {
+            CommandCodeAuth::ApiKey {
+                user_id: Some(id), ..
+            } if !id.is_empty() => Some(id.as_str()),
+            _ => None,
+        })
         .unwrap_or("");
     let account_key = account_key(
         "commandcode",
         if account_id.is_empty() {
-            &cookie
+            auth_seed
         } else {
             account_id
         },
     );
+    let account_label = match &auth {
+        CommandCodeAuth::ApiKey {
+            user_name: Some(name),
+            ..
+        } if !name.is_empty() => name.clone(),
+        _ => plan.map(|value| value.0).unwrap_or("Command Code").into(),
+    };
     vec![connected_snapshot(
         "commandcode",
         account_key,
-        plan.map(|value| value.0).unwrap_or("Command Code").into(),
+        account_label,
         plan.map(|value| value.0).unwrap_or("").into(),
-        "web",
+        source,
         windows,
         220,
     )]
@@ -5153,6 +5274,41 @@ mod tests {
         .unwrap();
         assert!((window.remaining_percent.unwrap() - 66.66666666666667).abs() < 1e-9);
         assert_eq!(window.remaining_amount, Some(2.0));
+    }
+
+    #[test]
+    fn commandcode_cookie_tolerates_trailing_semicolons_and_whitespace() {
+        let raw = "Cookie: __Secure-commandcode_prod_.session_token=tok123; __Secure-commandcode_prod_.session_data=dat456; ";
+        let mut forwarded = vec![];
+        let mut has_session = false;
+        for pair in raw.trim_start_matches("Cookie:").split(';') {
+            let trimmed = pair.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Some((name, value)) = trimmed.split_once('=') else {
+                continue;
+            };
+            let lower = name.trim().to_ascii_lowercase();
+            let is_session = matches!(
+                lower.as_str(),
+                "__secure-commandcode_prod_.session_token"
+                    | "__host-commandcode_prod_.session_token"
+                    | "commandcode_prod_.session_token"
+            );
+            let is_data = matches!(
+                lower.as_str(),
+                "__secure-commandcode_prod_.session_data"
+                    | "__host-commandcode_prod_.session_data"
+                    | "commandcode_prod_.session_data"
+            );
+            if is_session || is_data {
+                has_session |= is_session;
+                forwarded.push(format!("{}={}", name.trim(), value.trim()));
+            }
+        }
+        assert!(has_session);
+        assert_eq!(forwarded.len(), 2);
     }
 
     #[test]

@@ -97,6 +97,13 @@ fn load_app_support_fallback() -> BTreeMap<String, String> {
                                 "TOKEN_MONITOR_COMMANDCODE_COOKIE".into(),
                                 s.trim().to_owned(),
                             );
+                        } else if lower_provider == "commandcode"
+                            && (lower_field.contains("key") || lower_field.contains("token"))
+                        {
+                            map.insert(
+                                "TOKEN_MONITOR_COMMANDCODE_API_KEY".into(),
+                                s.trim().to_owned(),
+                            );
                         } else if lower_provider == "claude"
                             && (lower_field.contains("cookie") || lower_field.contains("session"))
                         {
