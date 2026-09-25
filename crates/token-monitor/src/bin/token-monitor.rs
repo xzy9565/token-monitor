@@ -2581,8 +2581,21 @@ fn normalize_client_id(client: &str) -> String {
     }
 }
 
+/// `antigravity-cli (xzy9565@gmail.com)` → `antigravity-cli (x***)`, masked like the quota panel.
+// ponytail: always masked, even with --show-account; thread `show_account` in if that's wanted.
+fn mask_client_email(client: &str) -> String {
+    match (client.find('('), client.find('@')) {
+        (Some(open), Some(at)) if open < at => {
+            let first = client[open + 1..].chars().next().unwrap_or('*');
+            format!("{}({first}***)", &client[..open])
+        }
+        _ => client.to_owned(),
+    }
+}
+
 fn format_client_display(client: &str, max_w: usize) -> String {
-    let s = client.trim();
+    let masked = mask_client_email(client.trim());
+    let s = masked.as_str();
     let lower = s.to_ascii_lowercase();
     if (lower.starts_with("antigravity-cli (") || lower.starts_with("antigravity cli ("))
         && lower.ends_with(')')
@@ -2732,6 +2745,9 @@ impl ConsumptionRow {
 
 fn consumption_label(row: &ConsumptionRow) -> String {
     let client = row.client.trim();
+    if client.to_ascii_lowercase().starts_with("antigravity cli (") {
+        return format_client_display(client, usize::MAX);
+    }
     if token_monitor_core::provider_registry::ALL_PROVIDER_IDS.contains(&client) {
         return token_monitor_core::provider_registry::display_name(client).to_owned();
     }
@@ -4657,7 +4673,7 @@ fn print_usage(
             "version": "0.1.0-native",
             "summary": report.summary,
             "records": report.snapshot.records.len(),
-            "clients": report.snapshot.clients(),
+            "clients": report.snapshot.clients().iter().map(|c| mask_client_email(c)).collect::<Vec<_>>(),
             "models": report.snapshot.models(),
             "processingTimeMs": report.snapshot.processing_time_ms,
             "tokscaleRevision": report.snapshot.tokscale_revision,
@@ -6135,6 +6151,11 @@ mod tests {
         assert_eq!(format_client_display("Antigravity Cli", 15), "Antigravity Cli");
         assert_eq!(format_client_display("Antigravity Cli", 12), "Antigravity");
         assert_eq!(format_client_display("Antigravity Cli", 8), "AGY");
+        let email = normalize_client_id("antigravity-cli (xzy9565@gmail.com)");
+        assert_eq!(format_client_display(&email, 30), "Antigravity Cli (x***)");
+        assert_eq!(format_client_display(&email, 10), "AGY (x***)");
+        assert_eq!(consumption_label(&ConsumptionRow::new(&email, "google")), "Antigravity Cli (x***)");
+        assert_eq!(mask_client_email("antigravity-cli (xzy9565@gmail.com)"), "antigravity-cli (x***)");
     }
 
     #[test]

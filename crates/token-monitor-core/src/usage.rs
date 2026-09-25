@@ -6,6 +6,7 @@
 //! subscription ledger.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::pricing::{PriceQuote, PricingEngine, PricingStatus};
@@ -420,100 +421,169 @@ fn collect_commandcode_v3_records(records: &mut Vec<UsageRecord>, since: Option<
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, serde::Deserialize)]
-struct SessionSpanRecord {
-    session_id: String,
-    #[serde(default)]
-    target: Option<u32>,
-    #[serde(default)]
-    account: Option<String>,
-    #[serde(default)]
-    start_ms: Option<i64>,
-    #[serde(default)]
-    end_ms: Option<i64>,
-    #[serde(default)]
-    start_idx: Option<i64>,
-    #[serde(default)]
-    end_idx: Option<i64>,
-    #[serde(default)]
-    status: Option<String>,
+/// AGY log lines that mean "this process is driving that conversation": the user sent a
+/// message or approved a tool, or the process created, forked, or print-ran it.
+const AGY_DRIVER_MARKERS: [&str; 5] = [
+    "Forwarding user message to conversation ",
+    "Tool confirmation for conversation ",
+    "Created conversation ",
+    "Forked conversation ",
+    "Print mode: conversation=",
+];
+/// A call can land in the conversation DB shortly after its process's last log line.
+const AGY_LOG_SLACK_MS: i64 = 120_000;
+
+/// One AGY CLI process, parsed from its own log `~/.gemini/antigravity-cli/log/cli-*.log`.
+#[derive(Debug, Default)]
+struct AgyProcessLog {
+    email: Option<String>,
+    first_ms: i64,
+    last_ms: i64,
+    /// (timestamp, conversation id) of every driver line.
+    events: Vec<(i64, String)>,
 }
 
-fn tag_antigravity_account_records(records: &mut [UsageRecord]) {
-    let home = match dirs::home_dir() {
-        Some(h) => h,
-        None => return,
-    };
-    let spans_file = home.join(".gemini/accounts/session_spans.jsonl");
-    if !spans_file.exists() {
-        return;
-    }
-    let content = match std::fs::read_to_string(&spans_file) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let mut spans_by_session: std::collections::HashMap<String, Vec<SessionSpanRecord>> =
-        std::collections::HashMap::new();
+fn parse_agy_process_log(year: i32, content: &str) -> AgyProcessLog {
+    let mut log = AgyProcessLog::default();
     for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+        let Some(ms) = glog_timestamp_ms(year, line) else {
             continue;
+        };
+        if log.first_ms == 0 {
+            log.first_ms = ms;
         }
-        if let Ok(span) = serde_json::from_str::<SessionSpanRecord>(line) {
-            spans_by_session
-                .entry(span.session_id.clone())
-                .or_default()
-                .push(span);
+        log.last_ms = ms;
+        if let Some((_, rest)) = line.split_once("applyAuthResult: email=") {
+            log.email = rest.split([',', ' ']).next().map(str::to_owned);
+        }
+        for marker in AGY_DRIVER_MARKERS {
+            if let Some((_, rest)) = line.split_once(marker) {
+                let id = rest.get(..36).unwrap_or_default();
+                if id.len() == 36 && id.bytes().all(|b| b == b'-' || b.is_ascii_hexdigit()) {
+                    log.events.push((ms, id.to_owned()));
+                }
+                break;
+            }
         }
     }
-    if spans_by_session.is_empty() {
+    log
+}
+
+/// glog prefix `I0924 18:08:14.490117`, local time; the year comes from the log file name.
+// ponytail: a process log that spans New Year gets January lines in the old year.
+fn glog_timestamp_ms(year: i32, line: &str) -> Option<i64> {
+    if !matches!(line.as_bytes().first(), Some(b'I' | b'W' | b'E' | b'F')) {
+        return None;
+    }
+    let num = |range: std::ops::Range<usize>| -> Option<u32> { line.get(range)?.parse().ok() };
+    let time = chrono::NaiveDate::from_ymd_opt(year, num(1..3)?, num(3..5)?)?.and_hms_micro_opt(
+        num(6..8)?,
+        num(9..11)?,
+        num(12..14)?,
+        num(15..21)?,
+    )?;
+    Some(
+        time.and_local_timezone(chrono::Local)
+            .earliest()?
+            .timestamp_millis(),
+    )
+}
+
+/// Research subagents run inside their parent's process; AGY's summary index links them.
+fn agy_parent_conversations(db: &std::path::Path) -> HashMap<String, String> {
+    let Ok(conn) =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return HashMap::new();
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT conversation_id, parent_conversation_id FROM conversation_summaries WHERE parent_conversation_id != ''",
+    ) else {
+        return HashMap::new();
+    };
+    let parents = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+    parents
+}
+
+/// Tags each Antigravity CLI record with the Google account (email) that made the call. AGY's own
+/// process logs are the ground truth: each logs its signed-in email and every conversation it
+/// drives. A call belongs to the live process that last drove its conversation (or, for a
+/// research subagent, its parent conversation).
+fn tag_antigravity_account_records(records: &mut [UsageRecord]) {
+    let Some(home) = dirs::home_dir() else {
         return;
-    }
-    for spans in spans_by_session.values_mut() {
-        spans.sort_by(|a, b| {
-            a.start_idx
-                .unwrap_or(0)
-                .cmp(&b.start_idx.unwrap_or(0))
-                .then_with(|| a.start_ms.unwrap_or(0).cmp(&b.start_ms.unwrap_or(0)))
-        });
-    }
-
-    let mut session_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    for record in records.iter_mut() {
-        if record.client != "antigravity-cli" {
+    };
+    let cli_dir = home.join(".gemini/antigravity-cli");
+    // ponytail: AGY keeps only ~100 process logs (about two weeks here), so older calls stay
+    // untagged. Persist the parsed logs if long per-account history matters.
+    let mut logs = Vec::new();
+    for entry in std::fs::read_dir(cli_dir.join("log"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(year) = name
+            .strip_prefix("cli-")
+            .and_then(|rest| rest.get(..4))
+            .and_then(|y| y.parse().ok())
+        else {
             continue;
+        };
+        if let Ok(bytes) = std::fs::read(entry.path()) {
+            logs.push(parse_agy_process_log(
+                year,
+                &String::from_utf8_lossy(&bytes),
+            ));
         }
-        let turn_entry = session_counts.entry(record.session_id.clone()).or_insert(0);
-        let current_turn = *turn_entry;
-        *turn_entry += 1;
+    }
+    let parents = agy_parent_conversations(&cli_dir.join("conversation_summaries.db"));
+    tag_antigravity_records_from_logs(records, &logs, &parents);
+}
 
-        if let Some(spans) = spans_by_session.get(&record.session_id) {
-            let first_acct = spans.first().and_then(|s| s.account.as_deref());
-            let all_same = spans.iter().all(|s| s.account.as_deref() == first_acct);
-            if all_same && first_acct.is_some() {
-                if let Some(acct) = first_acct {
-                    record.client = format!("antigravity-cli ({acct})");
-                    continue;
-                }
+fn tag_antigravity_records_from_logs(
+    records: &mut [UsageRecord],
+    logs: &[AgyProcessLog],
+    parents: &HashMap<String, String>,
+) {
+    let mut drivers: HashMap<&str, Vec<(i64, usize)>> = HashMap::new();
+    for (i, log) in logs.iter().enumerate() {
+        for (ms, conversation) in &log.events {
+            drivers
+                .entry(conversation.as_str())
+                .or_default()
+                .push((*ms, i));
+        }
+    }
+    for events in drivers.values_mut() {
+        events.sort_unstable();
+    }
+    for record in records.iter_mut().filter(|r| r.client == "antigravity-cli") {
+        let mut conversation = record.session_id.as_str();
+        for _ in 0..8 {
+            match parents.get(conversation) {
+                Some(parent) if !drivers.contains_key(conversation) => conversation = parent,
+                _ => break,
             }
-
-            for span in spans.iter().rev() {
-                let start_idx = span.start_idx.unwrap_or(0);
-                if current_turn >= start_idx {
-                    if let Some(end_idx) = span.end_idx {
-                        if current_turn > end_idx {
-                            continue;
-                        }
-                    }
-                    let acct_name = span
-                        .account
-                        .clone()
-                        .unwrap_or_else(|| format!("Account {}", span.target.unwrap_or(1)));
-                    record.client = format!("antigravity-cli ({acct_name})");
-                    break;
-                }
-            }
+        }
+        let Some(events) = drivers.get(conversation) else {
+            continue;
+        };
+        let ts = record.timestamp;
+        let before = events.partition_point(|&(ms, _)| ms <= ts);
+        let email = events[..before]
+            .iter()
+            .rev()
+            .map(|&(_, i)| &logs[i])
+            .find(|log| ts <= log.last_ms + AGY_LOG_SLACK_MS)
+            .and_then(|log| log.email.as_deref());
+        if let Some(email) = email {
+            record.client = format!("antigravity-cli ({email})");
         }
     }
 }
@@ -887,4 +957,106 @@ mod tests {
         let ms = extract_proto_timestamp_ms(&buf);
         assert_eq!(ms, Some(1788640000500));
     }
+
+    #[test]
+    fn antigravity_account_tagging_follows_agy_process_logs() {
+        let conv = "aaaaaaaa-0000-4000-8000-000000000001";
+        let log = parse_agy_process_log(
+            2026,
+            &format!(
+                "I0924 18:08:14.490117       1 common.go:391] Resuming conversation {conv}\n\
+                 I0924 18:08:14.532061     315 server_oauth.go:196] applyAuthResult: email=two@example.com, authMethod=consumer, quotaProject=\n\
+                 I0924 18:08:15.990117     921 conversation_manager.go:699] Forwarding user message to conversation {conv} (items=1, media=0)\n"
+            ),
+        );
+        assert_eq!(log.email.as_deref(), Some("two@example.com"));
+        assert_eq!(log.last_ms - log.first_ms, 1_500);
+        // Only the user message drives the conversation; resuming it just opens it.
+        assert_eq!(log.events, vec![(log.last_ms, conv.to_owned())]);
+
+        // Two panes on different accounts share `conv`; the one that last drove it owns the call.
+        let logs = vec![
+            AgyProcessLog {
+                email: Some("two@example.com".into()),
+                first_ms: 0,
+                last_ms: 1_000_000,
+                events: vec![(10, conv.into())],
+            },
+            AgyProcessLog {
+                email: Some("three@example.com".into()),
+                first_ms: 100,
+                last_ms: 1_000_000,
+                events: vec![(200, conv.into())],
+            },
+        ];
+        let parents = HashMap::from([("research-sub".to_owned(), conv.to_owned())]);
+        let mut records: Vec<UsageRecord> = [
+            (conv, 5),
+            (conv, 50),
+            (conv, 300),
+            ("research-sub", 250),
+            (conv, 2_000_000),
+        ]
+        .into_iter()
+        .map(|(session, timestamp)| UsageRecord {
+            client: "antigravity-cli".into(),
+            model_id: "gemini-3.8-flash".into(),
+            provider_id: "google".into(),
+            session_id: session.into(),
+            date: "2026-09-24".into(),
+            timestamp,
+            tokens: UsageTokens::default(),
+            message_count: 1,
+        })
+        .collect();
+
+        tag_antigravity_records_from_logs(&mut records, &logs, &parents);
+
+        let clients: Vec<&str> = records.iter().map(|r| r.client.as_str()).collect();
+        assert_eq!(
+            clients,
+            [
+                "antigravity-cli",                     // before any driver line: unknown
+                "antigravity-cli (two@example.com)",   // pane 2 sent the last message
+                "antigravity-cli (three@example.com)", // pane 3 took over
+                "antigravity-cli (three@example.com)", // subagent follows its parent
+                "antigravity-cli", // both processes long gone: unknown, not guessed
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "live local database audit"]
+    fn audit_live_antigravity_attributions() {
+        let snapshot = match collect_local_usage(UsageOptions::default()) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("Skipping live audit: {}", e);
+                return;
+            }
+        };
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let d7_ms = now_ms - 7 * 86400 * 1000;
+
+        let mut counts = std::collections::HashMap::new();
+        let mut tokens_map = std::collections::HashMap::new();
+
+        for r in snapshot.records.iter() {
+            if r.timestamp >= d7_ms && r.client.starts_with("antigravity-cli") {
+                *counts.entry(r.client.clone()).or_insert(0) += 1;
+                *tokens_map.entry(r.client.clone()).or_insert(0i64) += r.tokens.reported_total_without_reasoning();
+            }
+        }
+
+        println!("=== LIVE LAST 7D BREAKDOWN (CURRENT) ===");
+        let mut clients: Vec<_> = counts.keys().cloned().collect();
+        clients.sort();
+        for c in clients {
+            let cnt = counts.get(&c).copied().unwrap_or(0);
+            let toks = tokens_map.get(&c).copied().unwrap_or(0);
+            println!("{:<30} | turns: {:<6} | tokens: {:>12} ({:.2}M)", c, cnt, toks, toks as f64 / 1_000_000.0);
+        }
+    }
 }
+
