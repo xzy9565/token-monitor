@@ -5,6 +5,7 @@
 //! collectors and the TUI evolve without recreating the third-party GUI.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
 pub mod collectors;
@@ -198,7 +199,11 @@ impl ProviderSnapshot {
                 let l = w.label.to_ascii_lowercase();
                 (l.contains("claude") || l.contains("gpt")) && w.effectively_exhausted()
             });
-            return gemini_capped && claude_capped;
+            let has_claude = self.windows.iter().any(|w| {
+                let l = w.label.to_ascii_lowercase();
+                l.contains("claude") || l.contains("gpt")
+            });
+            return gemini_capped && (claude_capped || !has_claude);
         }
         if pid == "cursor" {
             let cursor_models = self.windows.iter().find(|w| w.label.to_ascii_lowercase().contains("cursor"));
@@ -305,6 +310,8 @@ impl ProviderSnapshot {
 /// resets, while PAYG wallets remain a separate lane at the bottom.
 pub fn sort_burn_first(providers: &mut [ProviderSnapshot], now_ms: i64) {
     providers.sort_by(|left, right| {
+        let (left, right) = (burn_view(left), burn_view(right));
+        let (left, right) = (left.as_ref(), right.as_ref());
         let payg_order = left.payg().cmp(&right.payg());
         if payg_order != Ordering::Equal {
             return payg_order;
@@ -331,6 +338,20 @@ pub fn sort_burn_first(providers: &mut [ProviderSnapshot], now_ms: i64) {
             .unwrap_or(Ordering::Equal)
             .then_with(|| left.account_label.cmp(&right.account_label))
     });
+}
+
+/// AGY's Claude/GPT pool is about a tenth of its Gemini pool (2026-09-25 meters), so
+/// burn-first ranks an AGY account on its Gemini windows alone. Display still sees both pools.
+fn burn_view(provider: &ProviderSnapshot) -> Cow<'_, ProviderSnapshot> {
+    let is_gemini = |w: &LimitWindow| w.label.to_ascii_lowercase().contains("gemini");
+    if !provider.provider_id.eq_ignore_ascii_case("antigravity")
+        || !provider.windows.iter().any(is_gemini)
+    {
+        return Cow::Borrowed(provider);
+    }
+    let mut gemini = provider.clone();
+    gemini.windows.retain(is_gemini);
+    Cow::Owned(gemini)
 }
 
 /// Merge a fresh collector pass over the last-good snapshot. A transient HTTP
@@ -519,6 +540,36 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["commandcode", "claude", "grok", "codex", "openrouter"]
         );
+    }
+
+    #[test]
+    fn antigravity_ranks_on_gemini_pool_alone() {
+        let now = 1_000;
+        let agy = |label: &str, gemini_7d: f64, claude_reset: i64| {
+            let mut row = provider(
+                "antigravity",
+                "Google AI Pro",
+                vec![
+                    window("Gemini 7d", WindowKind::Weekly, gemini_7d, now + 500_000_000),
+                    window("Claude/GPT 7d", WindowKind::Weekly, 86.0, claude_reset),
+                ],
+            );
+            row.account_label = label.into();
+            row
+        };
+        // agy1 sits at the Gemini floor but holds the soonest Claude reset; agy3's Gemini is open.
+        let mut rows = vec![
+            agy("agy1", 0.98, now + 100_000),
+            agy("agy3", 91.0, now + 600_000_000),
+        ];
+        sort_burn_first(&mut rows, now);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.account_label.as_str())
+                .collect::<Vec<_>>(),
+            ["agy3", "agy1"]
+        );
+        assert!(!rows[1].is_exhausted(), "agy1's Claude pool is still usable");
     }
 
     #[test]
