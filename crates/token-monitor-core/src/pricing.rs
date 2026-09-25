@@ -2,8 +2,9 @@
 //!
 //! Tokscale supplies maintained pricing datasets and model lookup. This module
 //! owns the acceptance policy and ledger contract: fuzzy/ambiguous matches do
-//! not become confident dollar amounts, and Codex reasoning is not charged a
-//! second time when it is already included in output.
+//! not become confident dollar amounts, list prices (LiteLLM) outrank reseller
+//! tiers (OpenRouter), and reasoning is charged only where it is logged apart
+//! from output.
 
 use crate::usage::{UsageRecord, UsageTokens};
 use serde::{Deserialize, Serialize};
@@ -83,7 +84,8 @@ impl PricingEngine {
             .input
             .saturating_add(tokens.cache_read)
             .saturating_add(tokens.cache_write)
-            .saturating_add(tokens.output);
+            .saturating_add(tokens.output)
+            .saturating_add(tokens.reasoning);
         let Some(service) = &self.service else {
             return unknown_quote(record, tokens, total_tokens, "pricing dataset unavailable");
         };
@@ -96,45 +98,30 @@ impl PricingEngine {
             cache
                 .entry(key)
                 .or_insert_with(|| {
-                    let hinted = service.lookup_with_source_and_provider(
-                        &record.model_id,
-                        None,
-                        Some(&record.provider_id),
-                    );
-                    if let Some(res) = &hinted {
-                        let is_strict = res.evidence.exact_model_identity
-                            && res.evidence.price_consensus
-                            && res.evidence.is_submission_safe()
-                            && !matches!(
-                                res.evidence.kind,
-                                tok_scale_resolution::ResolutionKind::Fuzzy
-                                    | tok_scale_resolution::ResolutionKind::ModelPart
-                            );
-                        if is_strict {
-                            return hinted;
-                        }
-                    }
-                    // Fall back to canonical unhinted lookup when the provider hint lands on an
+                    // Custom overrides first, then LiteLLM, which carries vendor list prices.
+                    // OpenRouter's author endpoint can be a discounted tier (Gemini and GPT
+                    // "flex" at 50%, seen 2026-09-25), so the default lookup only fills gaps.
+                    // Each source goes hinted, then unhinted: a provider hint can land on an
                     // indirect reseller key (e.g. Bedrock/Perplexity) that downgrades to ModelPart.
-                    let unhinted = service.lookup_with_source_and_provider(
-                        &record.model_id,
-                        None,
-                        None,
-                    );
-                    if let Some(res) = &unhinted {
-                        let is_strict = res.evidence.exact_model_identity
-                            && res.evidence.price_consensus
-                            && res.evidence.is_submission_safe()
-                            && !matches!(
-                                res.evidence.kind,
-                                tok_scale_resolution::ResolutionKind::Fuzzy
-                                    | tok_scale_resolution::ResolutionKind::ModelPart
-                            );
-                        if is_strict {
-                            return unhinted;
+                    let provider = Some(record.provider_id.as_str());
+                    let mut fallback = None;
+                    for (source, hint) in [
+                        (Some("custom"), None),
+                        (Some("litellm"), provider),
+                        (Some("litellm"), None),
+                        (None, provider),
+                        (None, None),
+                    ] {
+                        let found =
+                            service.lookup_with_source_and_provider(&record.model_id, source, hint);
+                        if found.as_ref().is_some_and(is_strict) {
+                            return found;
+                        }
+                        if source.is_none() && fallback.is_none() {
+                            fallback = found;
                         }
                     }
-                    hinted.or(unhinted)
+                    fallback
                 })
                 .clone()
         };
@@ -143,15 +130,7 @@ impl PricingEngine {
         };
 
         let resolution = result.evidence.kind.as_str().to_owned();
-        let strict_identity = result.evidence.exact_model_identity
-            && result.evidence.price_consensus
-            && result.evidence.is_submission_safe()
-            && !matches!(
-                result.evidence.kind,
-                tok_scale_resolution::ResolutionKind::Fuzzy
-                    | tok_scale_resolution::ResolutionKind::ModelPart
-            );
-        if !strict_identity {
+        if !is_strict(&result) {
             return PriceQuote {
                 model_id: record.model_id.clone(),
                 provider_id: record.provider_id.clone(),
@@ -206,6 +185,18 @@ mod tok_scale_resolution {
     pub use tokscale_core::pricing::lookup::ResolutionKind;
 }
 
+/// Only an exact, agreed, submission-safe model match becomes a dollar amount.
+fn is_strict(result: &tokscale_core::pricing::lookup::LookupResult) -> bool {
+    result.evidence.exact_model_identity
+        && result.evidence.price_consensus
+        && result.evidence.is_submission_safe()
+        && !matches!(
+            result.evidence.kind,
+            tok_scale_resolution::ResolutionKind::Fuzzy
+                | tok_scale_resolution::ResolutionKind::ModelPart
+        )
+}
+
 fn calculate_components(
     pricing: &tokscale_core::pricing::ModelPricing,
     tokens: &UsageTokens,
@@ -223,6 +214,7 @@ fn calculate_components(
             "cache write",
         ),
         (tokens.output, pricing.output_cost_per_token, "output"),
+        (tokens.reasoning, pricing.output_cost_per_token, "reasoning"),
     ];
     let mut value = 0.0;
     let mut priced_tokens = 0i64;
@@ -257,9 +249,11 @@ fn calculate_components(
 
 fn safe_tokens(record: &UsageRecord) -> UsageTokens {
     let mut tokens = record.tokens.clone();
-    // Current Codex records expose reasoning as a subset of output. Keep the
-    // raw field in the audit schema but do not charge it twice.
-    if record.client.eq_ignore_ascii_case("codex") {
+    // AGY logs thinking apart from output (Gemini `thoughtsTokenCount`; its Claude rows put all
+    // output there), and both vendors bill thinking at the output rate. Codex reports reasoning
+    // as a subset of output, so it is never charged twice.
+    // ponytail: Grok and OpenCode rows also show reasoning > output at times; verify, then bill.
+    if !record.client.to_ascii_lowercase().starts_with("antigravity") {
         tokens.reasoning = 0;
     }
     tokens
@@ -340,6 +334,43 @@ mod tests {
         assert_eq!(quote.reasoning_tokens, 0);
         assert_eq!(quote.priced_tokens, 100);
         assert!((quote.value_usd.unwrap() - 0.000125).abs() < 1e-12);
+    }
+
+    #[test]
+    fn antigravity_thinking_is_billed_at_output_rate() {
+        let quote = engine().quote(&record("antigravity-cli (a@b.c)", "openai/test-model"));
+        assert_eq!(quote.status, PricingStatus::Exact);
+        assert_eq!(quote.reasoning_tokens, 20);
+        assert_eq!(quote.priced_tokens, 120);
+        // The codex case above prices 100 tokens at $0.000125; 20 thinking tokens add 20 × $2/M.
+        assert!((quote.value_usd.unwrap() - 0.000165).abs() < 1e-12);
+    }
+
+    #[test]
+    fn litellm_list_price_beats_openrouter_discount_tier() {
+        let price = |input: f64, output: f64| tokscale_core::pricing::ModelPricing {
+            input_cost_per_token: Some(input),
+            output_cost_per_token: Some(output),
+            ..Default::default()
+        };
+        let mut litellm = HashMap::new();
+        litellm.insert("gemini-3.8-flash".into(), price(0.75e-6, 3.75e-6));
+        let mut openrouter = HashMap::new();
+        // OpenRouter's first Google endpoint for this model is the 50% "flex" tier.
+        openrouter.insert("google/gemini-3.8-flash".into(), price(0.375e-6, 1.875e-6));
+        let engine = PricingEngine::from_datasets(litellm, openrouter);
+        let mut rec = record("test", "gemini-3.8-flash");
+        rec.provider_id = "google".into();
+        rec.tokens = UsageTokens {
+            input: 1_000_000,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        };
+        let quote = engine.quote(&rec);
+        assert_eq!(quote.source.as_deref(), Some("LiteLLM"));
+        assert!((quote.value_usd.unwrap() - 0.75).abs() < 1e-9);
     }
 
     #[test]
