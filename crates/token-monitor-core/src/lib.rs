@@ -15,7 +15,10 @@ pub mod provider_registry;
 pub mod storage;
 pub mod usage;
 
-pub const EFFECTIVE_EXHAUSTION_PERCENT: f64 = 0.6;
+/// Remaining % at or below which a quota window counts as used up. AGY answered 429 at 0.71% and
+/// 0.98% remaining (2026-09-23/24 process logs) while calls still ran at 1–2%.
+// ponytail: one floor for every provider; make it per-provider if some meter stays usable below 1%.
+pub const EFFECTIVE_EXHAUSTION_PERCENT: f64 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceHealth {
@@ -409,7 +412,8 @@ mod tests {
         assert!(window("G7d", WindowKind::Weekly, 0.103, 100).effectively_exhausted());
         assert!(window("G7d", WindowKind::Weekly, 0.4, 100).effectively_exhausted());
         assert!(window("G7d", WindowKind::Weekly, 0.56, 100).effectively_exhausted());
-        assert!(!window("G7d", WindowKind::Weekly, 1.0, 100).effectively_exhausted());
+        assert!(window("G7d", WindowKind::Weekly, 0.98, 100).effectively_exhausted());
+        assert!(!window("G7d", WindowKind::Weekly, 1.1, 100).effectively_exhausted());
         let credit = LimitWindow {
             label: "credit".into(),
             kind: WindowKind::Billing,
