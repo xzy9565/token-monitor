@@ -101,23 +101,33 @@ impl PricingEngine {
                     // Custom overrides first, then LiteLLM, which carries vendor list prices.
                     // OpenRouter's author endpoint can be a discounted tier (Gemini and GPT
                     // "flex" at 50%, seen 2026-09-25), so the default lookup only fills gaps.
-                    // Each source goes hinted, then unhinted: a provider hint can land on an
-                    // indirect reseller key (e.g. Bedrock/Perplexity) that downgrades to ModelPart.
-                    let provider = Some(record.provider_id.as_str());
+                    // Each source goes hinted with canonical provider aliases, then unhinted:
+                    // a provider hint can land on an indirect reseller key (e.g. Bedrock/Perplexity)
+                    // or miss a vendor namespace (e.g. xiaomi -> xiaomi_mimo).
+                    let hints = canonical_provider_hints(&record.provider_id);
                     let mut fallback = None;
-                    for (source, hint) in [
-                        (Some("custom"), None),
-                        (Some("litellm"), provider),
-                        (Some("litellm"), None),
-                        (None, provider),
-                        (None, None),
-                    ] {
+
+                    let found =
+                        service.lookup_with_source_and_provider(&record.model_id, Some("custom"), None);
+                    if found.as_ref().is_some_and(is_strict) {
+                        return found;
+                    }
+
+                    for &hint in &hints {
                         let found =
-                            service.lookup_with_source_and_provider(&record.model_id, source, hint);
+                            service.lookup_with_source_and_provider(&record.model_id, Some("litellm"), hint);
                         if found.as_ref().is_some_and(is_strict) {
                             return found;
                         }
-                        if source.is_none() && fallback.is_none() {
+                    }
+
+                    for &hint in &hints {
+                        let found =
+                            service.lookup_with_source_and_provider(&record.model_id, None, hint);
+                        if found.as_ref().is_some_and(is_strict) {
+                            return found;
+                        }
+                        if fallback.is_none() {
                             fallback = found;
                         }
                     }
@@ -183,6 +193,41 @@ impl PricingEngine {
 
 mod tok_scale_resolution {
     pub use tokscale_core::pricing::lookup::ResolutionKind;
+}
+
+fn canonical_provider_hints<'a>(provider: &'a str) -> Vec<Option<&'a str>> {
+    let mut hints = Vec::new();
+    match provider {
+        "xiaomi" | "mimo" => {
+            hints.push(Some("xiaomi_mimo"));
+            hints.push(Some(provider));
+        }
+        "google" | "gemini" => {
+            hints.push(Some("gemini"));
+            hints.push(Some("google"));
+        }
+        "anthropic" | "claude" => {
+            hints.push(Some("anthropic"));
+            hints.push(Some("claude"));
+        }
+        "openai" | "codex" => {
+            hints.push(Some("openai"));
+            hints.push(Some("codex"));
+        }
+        "zhipu" | "zai" => {
+            hints.push(Some("zhipu"));
+            hints.push(Some("zai"));
+        }
+        "moonshot" | "kimi" => {
+            hints.push(Some("moonshot"));
+            hints.push(Some("kimi"));
+        }
+        _ => {
+            hints.push(Some(provider));
+        }
+    }
+    hints.push(None);
+    hints
 }
 
 /// Only an exact, agreed, submission-safe model match becomes a dollar amount.
@@ -459,4 +504,48 @@ mod tests {
         assert_eq!(quote.priced_tokens, 100);
         assert!(quote.value_usd.is_some());
     }
+
+    #[test]
+    fn mimo_v2_6_pro_resolves_canonical_xiaomi_pricing() {
+        let engine = PricingEngine::load_cached();
+        if !engine.has_pricing_data() {
+            return;
+        }
+
+        let rec = UsageRecord {
+            client: "commandcode".into(),
+            model_id: "mimo-v2.6-pro".into(),
+            provider_id: "xiaomi".into(),
+            session_id: "s".into(),
+            date: "2026-09-27".into(),
+            timestamp: 0,
+            tokens: UsageTokens {
+                input: 1_000_000,
+                output: 100_000,
+                cache_read: 2_000_000,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            message_count: 1,
+        };
+
+        let quote = engine.quote(&rec);
+        assert_eq!(
+            quote.status,
+            PricingStatus::Exact,
+            "Expected exact pricing for mimo-v2.6-pro, got warnings: {:?}",
+            quote.warnings
+        );
+        assert_eq!(quote.source.as_deref(), Some("LiteLLM"));
+        assert_eq!(quote.matched_key.as_deref(), Some("xiaomi_mimo/mimo-v2.6-pro"));
+        assert!(quote.value_usd.is_some());
+        // Input: 1M * 4.35e-7 = $0.435
+        // Output: 0.1M * 8.7e-7 = $0.087
+        // Cache read: 2M * 3.6e-9 = $0.0072
+        // Total = 0.435 + 0.087 + 0.0072 = $0.5292
+        let val = quote.value_usd.unwrap();
+        assert!((val - 0.5292).abs() < 1e-4, "Expected ~$0.5292, got ${val}");
+    }
 }
+
+

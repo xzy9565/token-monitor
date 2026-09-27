@@ -2342,14 +2342,12 @@ fn cached_antigravity_snapshots(live_emails: &std::collections::HashSet<String>)
                         seen_emails.insert(item.account_label.clone());
                         let mut cached = item;
                         cached.source_health = SourceHealth::Stale;
+                        // AGY refills both the 5h and the 7d pools at their reset time, so a
+                        // cached window past its reset shows a fresh period, not the old floor.
                         for w in &mut cached.windows {
-                            if w.kind == WindowKind::Session {
-                                if let Some(r) = w.resets_at_ms {
-                                    if r <= now_ms {
-                                        w.remaining_percent = Some(100.0);
-                                        w.resets_at_ms = None;
-                                    }
-                                }
+                            if w.resets_at_ms.is_some_and(|r| r <= now_ms) {
+                                w.remaining_percent = Some(100.0);
+                                w.resets_at_ms = None;
                             }
                         }
                         cached_list.push(cached);

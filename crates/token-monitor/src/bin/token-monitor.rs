@@ -5844,6 +5844,47 @@ mod tests {
     }
 
     #[test]
+    fn commandcode_mimo_model_displays_priced_api_eq() {
+        let mut app = App::new(true, false);
+        app.view = View::Consumption;
+        let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
+        if !pricing.has_pricing_data() {
+            return;
+        }
+
+        let records = vec![
+            usage::UsageRecord {
+                client: "commandcode".into(),
+                model_id: "mimo-v2.6-pro".into(),
+                provider_id: "xiaomi".into(),
+                session_id: "s1".into(),
+                date: local_today_str(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                tokens: usage::UsageTokens {
+                    input: 1_000_000,
+                    output: 100_000,
+                    cache_read: 2_000_000,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                message_count: 1,
+            },
+        ];
+        let snapshot = usage::UsageSnapshot {
+            records,
+            processing_time_ms: 1,
+            tokscale_revision: "test".into(),
+        };
+        let report = usage::build_consumption_report(snapshot, &pricing, true);
+        app.set_consumption(report);
+        let lines = consumption_lines(&app, 120);
+        let text = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("mimo-v2.6-pro"));
+        // API-EQ should show dollar amount ($0.53) instead of "—"
+        assert!(text.contains("$0.53"), "Expected $0.53 in text:\n{text}");
+    }
+
+    #[test]
     fn cursor_navigation_and_horizontal_window_switching() {
         let mut app = App::new(true, false);
         app.view = View::Consumption;
