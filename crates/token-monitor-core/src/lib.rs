@@ -363,7 +363,20 @@ pub fn merge_provider_snapshots(
     previous: &[ProviderSnapshot],
     fresh: Vec<ProviderSnapshot>,
 ) -> Vec<ProviderSnapshot> {
-    fresh
+    if fresh.is_empty() {
+        return previous
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                if row.source_health == SourceHealth::Connected {
+                    row.source_health = SourceHealth::Stale;
+                }
+                row
+            })
+            .collect();
+    }
+
+    let mut merged: Vec<ProviderSnapshot> = fresh
         .into_iter()
         .map(|row| {
             if !row.windows.is_empty() || row.source_health == SourceHealth::Connected {
@@ -390,7 +403,25 @@ pub fn merge_provider_snapshots(
             }
             retained
         })
-        .collect()
+        .collect();
+
+    // Retain any previous provider that was not returned in the fresh batch
+    for old in previous {
+        let present = merged.iter().any(|candidate| {
+            candidate.provider_id == old.provider_id
+                && ((!old.account_key.is_empty() && candidate.account_key == old.account_key)
+                    || old.account_key.is_empty())
+        });
+        if !present {
+            let mut retained = old.clone();
+            if retained.source_health == SourceHealth::Connected {
+                retained.source_health = SourceHealth::Stale;
+            }
+            merged.push(retained);
+        }
+    }
+
+    merged
 }
 
 #[cfg(test)]
@@ -600,5 +631,29 @@ mod tests {
         assert_eq!(merged[0].source_health, SourceHealth::Stale);
         assert_eq!(merged[0].windows.len(), 1);
         assert_eq!(merged[0].diagnostics, vec!["HTTP 429"]);
+    }
+
+    #[test]
+    fn empty_or_partial_fresh_keeps_previous_snapshots_as_stale() {
+        let codex = provider("codex", "Plus", vec![window("5h", WindowKind::Session, 80.0, 2_000)]);
+        let claude = provider("claude", "Pro", vec![window("7d", WindowKind::Weekly, 60.0, 5_000)]);
+
+        // 1. Completely empty fresh list (e.g. timeout / network down)
+        let merged_empty = merge_provider_snapshots(&[codex.clone(), claude.clone()], vec![]);
+        assert_eq!(merged_empty.len(), 2, "Never wipe out providers on empty refresh");
+        assert_eq!(merged_empty[0].source_health, SourceHealth::Stale);
+        assert_eq!(merged_empty[1].source_health, SourceHealth::Stale);
+
+        // 2. Partial fresh list (e.g. only codex succeeded, claude missing)
+        let mut fresh_codex = codex.clone();
+        fresh_codex.windows[0].remaining_percent = Some(85.0);
+        fresh_codex.source_health = SourceHealth::Connected;
+
+        let merged_partial = merge_provider_snapshots(&[codex.clone(), claude.clone()], vec![fresh_codex]);
+        assert_eq!(merged_partial.len(), 2, "Retain missing providers from previous snapshots");
+        assert_eq!(merged_partial[0].provider_id, "codex");
+        assert_eq!(merged_partial[0].windows[0].remaining_percent, Some(85.0));
+        assert_eq!(merged_partial[1].provider_id, "claude");
+        assert_eq!(merged_partial[1].source_health, SourceHealth::Stale);
     }
 }

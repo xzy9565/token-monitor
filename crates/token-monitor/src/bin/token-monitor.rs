@@ -3997,8 +3997,19 @@ fn format_matrix_status(
 fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>> {
     let visible = app.visible_providers();
     if visible.is_empty() {
+        let msg = if app.providers.is_empty() {
+            if app.limits_busy {
+                "Connecting to live provider sessions... (press [r] to refresh)"
+            } else {
+                "No configured providers found. Press [3] to configure API keys/cookies."
+            }
+        } else if app.search_query.trim().is_empty() && app.filter == Filter::All {
+            "No providers available."
+        } else {
+            "No providers match this filter."
+        };
         return vec![Line::from(Span::styled(
-            "No providers match this filter.",
+            msg,
             Style::default().fg(GREY),
         ))];
     }
@@ -4869,7 +4880,6 @@ fn load_cached_app(
     let Ok(storage) = token_monitor_core::storage::Storage::open_default() else {
         let mut app = App::new(no_color, show_account);
         app.live = true;
-        app.providers.clear();
         return app;
     };
     let mut app = match storage.latest_provider_snapshots() {
@@ -4913,7 +4923,6 @@ fn load_cached_app(
         _ => {
             let mut app = App::new(no_color, show_account);
             app.live = true;
-            app.providers.clear();
             app
         }
     };
@@ -5545,7 +5554,7 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                 tokio::spawn(async move {
                     let timeout = options.timeout();
                     let providers = match tokio::time::timeout(
-                        timeout + Duration::from_secs(2),
+                        timeout + Duration::from_secs(10),
                         token_monitor_core::collectors::collect_live_limits(&options),
                     )
                     .await
