@@ -171,7 +171,15 @@ impl Storage {
             .connection
             .prepare(
                 "SELECT payload_json FROM provider_snapshots
-                 WHERE id IN (SELECT max(id) FROM provider_snapshots GROUP BY provider_id, account_key)
+                 WHERE id IN (
+                     SELECT max(id) FROM provider_snapshots
+                     WHERE provider_id IN ('antigravity', 'modal')
+                     GROUP BY provider_id, account_key
+                     UNION
+                     SELECT max(id) FROM provider_snapshots
+                     WHERE provider_id NOT IN ('antigravity', 'modal')
+                     GROUP BY provider_id
+                 )
                  ORDER BY collected_at_ms DESC",
             )
             .map_err(|error| format!("prepare snapshot query: {error}"))?;

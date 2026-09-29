@@ -357,6 +357,10 @@ fn burn_view(provider: &ProviderSnapshot) -> Cow<'_, ProviderSnapshot> {
 /// Merge a fresh collector pass over the last-good snapshot. A transient HTTP
 /// 429/5xx, expired local process, or CLI timeout must not erase a useful quota
 /// row and replace it with an empty "unavailable" placeholder. The failed
+pub fn supports_multiple_accounts(provider_id: &str) -> bool {
+    matches!(provider_id.to_ascii_lowercase().as_str(), "antigravity" | "modal")
+}
+
 /// source is marked stale and its diagnostic is retained; a genuinely fresh
 /// row always wins.
 pub fn merge_provider_snapshots(
@@ -382,11 +386,20 @@ pub fn merge_provider_snapshots(
             if !row.windows.is_empty() || row.source_health == SourceHealth::Connected {
                 return row;
             }
+            if !row.visible_by_default() {
+                return row;
+            }
             let old = previous.iter().find(|candidate| {
-                candidate.provider_id == row.provider_id
-                    && ((!row.account_key.is_empty() && candidate.account_key == row.account_key)
-                        || row.account_key.is_empty())
-                    && !candidate.windows.is_empty()
+                if candidate.provider_id != row.provider_id {
+                    return false;
+                }
+                let accounts_match = if supports_multiple_accounts(&row.provider_id) {
+                    (!row.account_key.is_empty() && candidate.account_key == row.account_key)
+                        || row.account_key.is_empty()
+                } else {
+                    true
+                };
+                accounts_match && !candidate.windows.is_empty()
             });
             let Some(old) = old else {
                 return row;
@@ -408,9 +421,16 @@ pub fn merge_provider_snapshots(
     // Retain any previous provider that was not returned in the fresh batch
     for old in previous {
         let present = merged.iter().any(|candidate| {
-            candidate.provider_id == old.provider_id
-                && ((!old.account_key.is_empty() && candidate.account_key == old.account_key)
-                    || old.account_key.is_empty())
+            if candidate.provider_id != old.provider_id {
+                return false;
+            }
+            if supports_multiple_accounts(&candidate.provider_id) {
+                (!old.account_key.is_empty() && candidate.account_key == old.account_key)
+                    || (!old.account_label.is_empty() && candidate.account_label == old.account_label)
+            } else {
+                // For single-account providers, if candidate already exists in merged, old is NOT retained.
+                true
+            }
         });
         if !present {
             let mut retained = old.clone();
@@ -655,5 +675,36 @@ mod tests {
         assert_eq!(merged_partial[0].windows[0].remaining_percent, Some(85.0));
         assert_eq!(merged_partial[1].provider_id, "claude");
         assert_eq!(merged_partial[1].source_health, SourceHealth::Stale);
+    }
+
+    #[test]
+    fn single_account_provider_does_not_duplicate_when_account_key_rotates() {
+        let mut old_codex = provider("codex", "Plus", vec![window("5h", WindowKind::Session, 80.0, 2_000)]);
+        old_codex.account_key = "codex:old_token_hash".into();
+
+        let mut fresh_codex = provider("codex", "Plus", vec![window("5h", WindowKind::Session, 85.0, 3_000)]);
+        fresh_codex.account_key = "codex:new_token_hash".into();
+
+        let merged = merge_provider_snapshots(&[old_codex], vec![fresh_codex.clone()]);
+        assert_eq!(merged.len(), 1, "Must never duplicate single-account providers on token rotation");
+        assert_eq!(merged[0].account_key, "codex:new_token_hash");
+    }
+
+    #[test]
+    fn multi_account_providers_retain_distinct_accounts() {
+        let mut ag_acc1 = provider("antigravity", "Pro", vec![window("5h", WindowKind::Session, 80.0, 2_000)]);
+        ag_acc1.account_key = "antigravity:user1".into();
+        ag_acc1.account_label = "user1@gmail.com".into();
+
+        let mut ag_acc2 = provider("antigravity", "Pro", vec![window("5h", WindowKind::Session, 90.0, 2_000)]);
+        ag_acc2.account_key = "antigravity:user2".into();
+        ag_acc2.account_label = "user2@gmail.com".into();
+
+        // fresh only returns acc1
+        let merged = merge_provider_snapshots(&[ag_acc1.clone(), ag_acc2.clone()], vec![ag_acc1.clone()]);
+        assert_eq!(merged.len(), 2, "Must retain missing account of multi-account provider");
+        assert_eq!(merged[0].account_label, "user1@gmail.com");
+        assert_eq!(merged[1].account_label, "user2@gmail.com");
+        assert_eq!(merged[1].source_health, SourceHealth::Stale);
     }
 }

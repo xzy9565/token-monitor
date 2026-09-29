@@ -4902,14 +4902,28 @@ fn load_cached_app(
                 .filter(|provider| provider.source != "registry")
                 .map(|provider| provider.provider_id.clone())
                 .collect::<HashSet<_>>();
+            let mut seen = HashSet::new();
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let max_cache_age_ms = 7 * 86_400_000;
             providers.retain(|provider| {
+                let fresh_enough =
+                    now_ms.saturating_sub(provider.collected_at_ms) <= max_cache_age_ms;
                 let requested = show_all
                     || selected.is_none_or(|values| values.contains(&provider.provider_id));
                 let configured = selected.is_some() || provider.visible_by_default();
-                requested
-                    && configured
-                    && !(provider.source == "registry"
-                        && implemented.contains(&provider.provider_id))
+                let not_registry_dup = !(provider.source == "registry"
+                    && implemented.contains(&provider.provider_id));
+                let is_first = if token_monitor_core::supports_multiple_accounts(&provider.provider_id) {
+                    let key = if !provider.account_key.is_empty() {
+                        format!("{}:{}", provider.provider_id, provider.account_key)
+                    } else {
+                        format!("{}:{}", provider.provider_id, provider.account_label)
+                    };
+                    seen.insert(key)
+                } else {
+                    seen.insert(provider.provider_id.clone())
+                };
+                fresh_enough && requested && configured && not_registry_dup && is_first
             });
             // The cache is useful for instant first paint, but it is not a live
             // answer until the background collector completes.

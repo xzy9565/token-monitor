@@ -976,7 +976,7 @@ async fn collect_claude_web(
     }
     Ok(connected_snapshot(
         "claude",
-        account_key("claude-web", cookie),
+        account_key("claude-web", &organization_id),
         email.into(),
         plan,
         "web",
@@ -1942,12 +1942,13 @@ pub async fn collect_codex(options: &CollectorOptions) -> Vec<ProviderSnapshot> 
             )]
         }
     };
+    let key_seed = account_id.as_deref().unwrap_or("default");
     let client = match Client::builder().timeout(options.timeout()).build() {
         Ok(client) => client,
         Err(_) => {
             return vec![unavailable_snapshot(
                 "codex",
-                account_key("codex", &token),
+                account_key("codex", key_seed),
                 "Codex".into(),
                 "oauth",
                 SourceHealth::Unavailable,
@@ -1976,7 +1977,7 @@ pub async fn collect_codex(options: &CollectorOptions) -> Vec<ProviderSnapshot> 
         Ok(response) => {
             return vec![unavailable_snapshot(
                 "codex",
-                account_key("codex", &token),
+                account_key("codex", key_seed),
                 "Codex".into(),
                 "oauth",
                 status_for_http(response.status()),
@@ -1987,7 +1988,7 @@ pub async fn collect_codex(options: &CollectorOptions) -> Vec<ProviderSnapshot> 
         Err(_) => {
             return vec![unavailable_snapshot(
                 "codex",
-                account_key("codex", &token),
+                account_key("codex", key_seed),
                 "Codex".into(),
                 "oauth",
                 SourceHealth::Unavailable,
@@ -2001,7 +2002,7 @@ pub async fn collect_codex(options: &CollectorOptions) -> Vec<ProviderSnapshot> 
         Err(_) => {
             return vec![unavailable_snapshot(
                 "codex",
-                account_key("codex", &token),
+                account_key("codex", key_seed),
                 "Codex".into(),
                 "oauth",
                 SourceHealth::Unavailable,
@@ -2039,7 +2040,7 @@ pub async fn collect_codex(options: &CollectorOptions) -> Vec<ProviderSnapshot> 
         .unwrap_or("Codex");
     let mut snapshot = connected_snapshot(
         "codex",
-        account_key("codex", &token),
+        account_key("codex", key_seed),
         email.into(),
         codex_plan(&payload),
         "oauth",
