@@ -261,6 +261,102 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
     })
 }
 
+fn infer_cursor_model_provider(model: &str) -> &'static str {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("claude")
+        || lower.contains("sonnet")
+        || lower.contains("opus")
+        || lower.contains("haiku")
+    {
+        "anthropic"
+    } else if lower.contains("gpt")
+        || lower.contains("o1")
+        || lower.contains("o3")
+        || lower.contains("o4")
+    {
+        "openai"
+    } else if lower.contains("gemini") {
+        "google"
+    } else if lower.contains("grok") {
+        "xai"
+    } else if lower.contains("deepseek") {
+        "deepseek"
+    } else {
+        "cursor"
+    }
+}
+
+fn parse_cursor_json(content: &str, records: &mut Vec<UsageRecord>, since: Option<&str>) {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(content) else {
+        return;
+    };
+    let Some(events) = val.get("usageEventsDisplay").and_then(|v| v.as_array()) else {
+        return;
+    };
+
+    for event in events {
+        let model = event
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if model.is_empty() {
+            continue;
+        }
+
+        let timestamp: i64 = match event.get("timestamp") {
+            Some(serde_json::Value::String(s)) => s.parse::<i64>().unwrap_or(0),
+            Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
+            _ => 0,
+        };
+        if timestamp <= 0 {
+            continue;
+        }
+
+        let date = chrono::DateTime::from_timestamp_millis(timestamp)
+            .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+
+        if let Some(s) = since {
+            if !date.is_empty() && date.as_str() < s {
+                continue;
+            }
+        }
+
+        let provider_id = infer_cursor_model_provider(model).to_string();
+
+        let session_id = event
+            .get("conversationId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("cursor-{}", s))
+            .unwrap_or_else(|| format!("cursor-{}", timestamp));
+
+        let tokens = if let Some(tu) = event.get("tokenUsage").and_then(|u| u.as_object()) {
+            UsageTokens {
+                input: tu.get("inputTokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0),
+                output: tu.get("outputTokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0),
+                cache_read: tu.get("cacheReadTokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0),
+                cache_write: 0,
+                reasoning: 0,
+            }
+        } else {
+            UsageTokens::default()
+        };
+
+        records.push(UsageRecord {
+            client: "cursor".into(),
+            model_id: model.to_string(),
+            provider_id,
+            session_id,
+            date,
+            timestamp,
+            tokens,
+            message_count: 1,
+        });
+    }
+}
+
 fn collect_cursor_cache_records(records: &mut Vec<UsageRecord>, since: Option<&str>) {
     let home = match dirs::home_dir() {
         Some(h) => h,
@@ -275,7 +371,21 @@ fn collect_cursor_cache_records(records: &mut Vec<UsageRecord>, since: Option<&s
         return;
     }
 
+    let mut cursor_records = Vec::new();
+    let usage_json = cursor_cache.join("usage.json");
+    if usage_json.exists() {
+        if let Ok(content) = std::fs::read_to_string(&usage_json) {
+            parse_cursor_json(&content, &mut cursor_records, since);
+        }
+    }
+
+    let mut seen: std::collections::HashSet<(i64, String)> = cursor_records
+        .iter()
+        .map(|r| (r.timestamp, r.model_id.clone()))
+        .collect();
+
     let Ok(entries) = std::fs::read_dir(cursor_cache) else {
+        records.extend(cursor_records);
         return;
     };
     for entry in entries.flatten() {
@@ -291,7 +401,10 @@ fn collect_cursor_cache_records(records: &mut Vec<UsageRecord>, since: Option<&s
                     continue;
                 }
             }
-            records.push(UsageRecord {
+            if !seen.insert((m.timestamp, m.model_id.clone())) {
+                continue;
+            }
+            cursor_records.push(UsageRecord {
                 client: "cursor".into(),
                 model_id: m.model_id,
                 provider_id: m.provider_id,
@@ -309,6 +422,8 @@ fn collect_cursor_cache_records(records: &mut Vec<UsageRecord>, since: Option<&s
             });
         }
     }
+
+    records.extend(cursor_records);
 }
 
 fn collect_commandcode_v3_records(records: &mut Vec<UsageRecord>, since: Option<&str>) {
@@ -1096,6 +1211,54 @@ mod tests {
             date_turns_from_transcript(&turns, &lines),
             [Some(11), Some(13), Some(14), Some(30), Some(31), None]
         );
+    }
+
+    #[test]
+    fn cursor_json_parsing_recovers_tokens_and_models() {
+        let sample = serde_json::json!({
+            "usageEventsDisplay": [
+                {
+                    "model": "grok-4.7-xhigh",
+                    "timestamp": "1790865010602",
+                    "conversationId": "7494881e-291a-438c-b981-790d2e1ed309",
+                    "tokenUsage": {
+                        "inputTokens": 100550,
+                        "outputTokens": 857,
+                        "cacheReadTokens": 141312
+                    }
+                },
+                {
+                    "model": "claude-3.5-sonnet",
+                    "timestamp": "1726694846401",
+                    "conversationId": null
+                }
+            ]
+        })
+        .to_string();
+
+        let mut records = Vec::new();
+        parse_cursor_json(&sample, &mut records, None);
+        assert_eq!(records.len(), 2);
+
+        assert_eq!(records[0].client, "cursor");
+        assert_eq!(records[0].model_id, "grok-4.7-xhigh");
+        assert_eq!(records[0].provider_id, "xai");
+        assert_eq!(records[0].session_id, "cursor-7494881e-291a-438c-b981-790d2e1ed309");
+        assert_eq!(records[0].tokens.input, 100550);
+        assert_eq!(records[0].tokens.output, 857);
+        assert_eq!(records[0].tokens.cache_read, 141312);
+
+        assert_eq!(records[1].client, "cursor");
+        assert_eq!(records[1].model_id, "claude-3.5-sonnet");
+        assert_eq!(records[1].provider_id, "anthropic");
+        assert_eq!(records[1].session_id, "cursor-1726694846401");
+        assert_eq!(records[1].tokens.input, 0);
+
+        // Test since filter
+        let mut filtered = Vec::new();
+        parse_cursor_json(&sample, &mut filtered, Some("2026-01-01"));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].model_id, "grok-4.7-xhigh");
     }
 
     #[test]

@@ -593,6 +593,34 @@ pub async fn collect_cursor(options: &CollectorOptions) -> Vec<ProviderSnapshot>
             provider.availability = Availability::Available;
             provider.diagnostics.push("Cursor Free plan: 0 fast Pro requests included, unlimited slow/auto requests available".into());
         }
+        let plan_used = cursor_number(summary.get("used"));
+        let plan_remaining = cursor_number(summary.get("remaining"));
+        if let Some(used) = plan_used {
+            if plan_limit > 0.0 {
+                let rem = plan_remaining.unwrap_or_else(|| (plan_limit - used).max(0.0));
+                provider.diagnostics.push(format!(
+                    "Included plan allowance: ${:.2} used of ${:.2} (${:.2} remaining)",
+                    used / 100.0,
+                    plan_limit / 100.0,
+                    rem / 100.0,
+                ));
+            }
+        }
+        if let Some(msg) = usage.get("autoModelSelectedDisplayMessage").and_then(Value::as_str) {
+            provider.diagnostics.push(format!("Cursor/Auto models: {}", msg));
+        }
+        if let Some(msg) = usage.get("namedModelSelectedDisplayMessage").and_then(Value::as_str) {
+            provider.diagnostics.push(format!("Other/API models: {}", msg));
+        }
+        if let Some(on_demand) = usage.get("individualUsage").and_then(|u| u.get("onDemand")) {
+            let enabled = on_demand.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+            if enabled {
+                let od_used = cursor_number(on_demand.get("used")).unwrap_or(0.0);
+                provider.diagnostics.push(format!("On-demand PAYG billing: enabled (${:.2} used)", od_used / 100.0));
+            } else {
+                provider.diagnostics.push("On-demand PAYG billing: disabled".into());
+            }
+        }
         if cursor_agent_blocked(reset_ms) {
             provider.availability = Availability::AgentBlocked;
             provider
