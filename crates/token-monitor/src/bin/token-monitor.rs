@@ -17,7 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use token_monitor_core::{
-    credentials, sort_burn_first, usage, Availability, LimitWindow, ProviderSnapshot, SourceHealth,
+    burn_view, credentials, sort_burn_first, usage, Availability, LimitWindow, ProviderSnapshot, SourceHealth,
     WindowKind, WindowMetric, EFFECTIVE_EXHAUSTION_PERCENT,
 };
 
@@ -3749,6 +3749,9 @@ fn find_burn_first_recommendation(providers: &[&ProviderSnapshot], now_ms: i64) 
         if is_wallet_provider(p) {
             continue;
         }
+        // AGY burns on its Gemini pool alone, as in `sort_burn_first`.
+        let view = burn_view(p);
+        let p = view.as_ref();
         // If currently on cooldown (effectively exhausted session remaining), cannot burn right now!
         let pid = p.provider_id.to_ascii_lowercase();
         if pid == "antigravity" {
@@ -3762,7 +3765,7 @@ fn find_burn_first_recommendation(providers: &[&ProviderSnapshot], now_ms: i64) 
             });
             let g_capped = gemini_5h.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent.is_some_and(|pct| pct <= EFFECTIVE_EXHAUSTION_PERCENT || pct.round() <= 0.0));
             let c_capped = claude_5h.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent.is_some_and(|pct| pct <= EFFECTIVE_EXHAUSTION_PERCENT || pct.round() <= 0.0));
-            if g_capped && c_capped {
+            if g_capped && (c_capped || claude_5h.is_none()) {
                 continue;
             }
         } else if p.windows.iter().any(|w| {
@@ -6253,7 +6256,8 @@ mod tests {
         assert_eq!(meter(0.2, 6), "░░░░░░");
         assert_eq!(meter(0.4, 6), "░░░░░░");
         assert_eq!(meter(0.56, 6), "░░░░░░");
-        assert_eq!(meter(1.5, 6), "█░░░░░");
+        assert_eq!(meter(1.5, 6), "░░░░░░");
+        assert_eq!(meter(2.5, 6), "█░░░░░");
         assert_eq!(meter(100.0, 6), "██████");
     }
 
@@ -6700,5 +6704,42 @@ mod tests {
             resets_at_ms: Some(now + 30_000),
         };
         assert_eq!(reset_text(&soon_window), "<1m");
+    }
+
+    #[test]
+    fn burn_first_header_ignores_antigravity_claude_pool() {
+        let now = 1_000;
+        let day = 86_400_000;
+        let window = |label: &str, kind, percent, reset| LimitWindow {
+            currency: None,
+            estimated: false,
+            kind,
+            label: label.into(),
+            metric: WindowMetric::Quota,
+            remaining_amount: None,
+            remaining_percent: Some(percent),
+            reset_text: None,
+            resets_at_ms: Some(reset),
+        };
+        let agy = ProviderSnapshot {
+            account_key: "antigravity:a".into(),
+            account_label: "a@example.com".into(),
+            availability: Availability::Available,
+            collected_at_ms: now,
+            diagnostics: vec![],
+            hue: 141,
+            plan: "Pro".into(),
+            provider_id: "antigravity".into(),
+            source: "rpc".into(),
+            source_health: SourceHealth::Connected,
+            windows: vec![
+                window("Gemini 5h", WindowKind::Session, 90.0, now + day / 8),
+                window("Gemini 7d", WindowKind::Weekly, 0.5, now + 2 * day),
+                window("Claude/GPT 5h", WindowKind::Session, 100.0, now + day / 8),
+                window("Claude/GPT 7d", WindowKind::Weekly, 86.0, now + day),
+            ],
+        };
+        // Gemini is spent; a soon-resetting Claude/GPT pool must not make this account burn-first.
+        assert!(find_burn_first_recommendation(&[&agy], now).is_none());
     }
 }

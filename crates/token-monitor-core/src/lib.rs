@@ -16,10 +16,11 @@ pub mod provider_registry;
 pub mod storage;
 pub mod usage;
 
-/// Remaining % at or below which a quota window counts as used up. AGY answered 429 at 0.71% and
-/// 0.98% remaining (2026-09-23/24 process logs) while calls still ran at 1–2%.
-// ponytail: one floor for every provider; make it per-provider if some meter stays usable below 1%.
-pub const EFFECTIVE_EXHAUSTION_PERCENT: f64 = 1.0;
+/// Remaining % at or below which a quota window counts as used up. AGY's weekly 429s all came at
+/// or below 1% (2026-09-23→10-01 process logs), but once spent its meter keeps reading up to 1.35%
+/// for hours (agy1/agy3, 09-29→10-01), so the floor sits above that bounce.
+// ponytail: one floor for every provider; make it per-provider if another meter needs a lower one.
+pub const EFFECTIVE_EXHAUSTION_PERCENT: f64 = 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceHealth {
@@ -342,7 +343,7 @@ pub fn sort_burn_first(providers: &mut [ProviderSnapshot], now_ms: i64) {
 
 /// AGY's Claude/GPT pool is about a tenth of its Gemini pool (2026-09-25 meters), so
 /// burn-first ranks an AGY account on its Gemini windows alone. Display still sees both pools.
-fn burn_view(provider: &ProviderSnapshot) -> Cow<'_, ProviderSnapshot> {
+pub fn burn_view(provider: &ProviderSnapshot) -> Cow<'_, ProviderSnapshot> {
     let is_gemini = |w: &LimitWindow| w.label.to_ascii_lowercase().contains("gemini");
     if !provider.provider_id.eq_ignore_ascii_case("antigravity")
         || !provider.windows.iter().any(is_gemini)
@@ -484,8 +485,8 @@ mod tests {
         assert!(window("G7d", WindowKind::Weekly, 0.103, 100).effectively_exhausted());
         assert!(window("G7d", WindowKind::Weekly, 0.4, 100).effectively_exhausted());
         assert!(window("G7d", WindowKind::Weekly, 0.56, 100).effectively_exhausted());
-        assert!(window("G7d", WindowKind::Weekly, 0.98, 100).effectively_exhausted());
-        assert!(!window("G7d", WindowKind::Weekly, 1.1, 100).effectively_exhausted());
+        assert!(window("G7d", WindowKind::Weekly, 1.35, 100).effectively_exhausted());
+        assert!(!window("G7d", WindowKind::Weekly, 2.1, 100).effectively_exhausted());
         let credit = LimitWindow {
             label: "credit".into(),
             kind: WindowKind::Billing,
