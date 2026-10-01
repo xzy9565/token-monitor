@@ -208,14 +208,16 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
         Some(list)
     });
 
+    // The date window is applied after enrichment below: until then an AGY turn may still carry
+    // its session's start date, and filtering here would drop a long-running session whole.
     let parsed = tokscale_core::parse_local_clients(tokscale_core::LocalParseOptions {
         home_dir: options
             .home_dir
             .map(|path| path.to_string_lossy().into_owned()),
         use_env_roots: true,
         clients,
-        since: options.since.clone(),
-        until: options.until,
+        since: None,
+        until: None,
         year: options.year,
         scanner_settings: tokscale_core::scanner::ScannerSettings::default(),
     })
@@ -246,6 +248,11 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
     collect_cursor_cache_records(&mut records, options.since.as_deref());
     enrich_antigravity_timestamps(&mut records);
     tag_antigravity_account_records(&mut records);
+    // Same string comparison tokscale applies to `date`.
+    records.retain(|r| {
+        options.since.as_deref().is_none_or(|s| r.date.as_str() >= s)
+            && options.until.as_deref().is_none_or(|u| r.date.as_str() <= u)
+    });
 
     Ok(UsageSnapshot {
         records,
@@ -810,12 +817,21 @@ fn enrich_antigravity_timestamps(records: &mut [UsageRecord]) {
             }
         }
 
-        if step_timestamps.is_empty() {
+        // `agy-dehydrate` renumbers the hot `steps` but leaves `gen_metadata` on the old indices,
+        // so after a dehydration the hot steps date older turns wrongly or not at all. AGY's own
+        // append-only transcript keeps every step it ever logged, so it wins when present.
+        let transcript = read_agy_transcript(
+            &home
+                .join(".gemini/antigravity-cli/brain")
+                .join(&session_id)
+                .join(".system_generated/logs/transcript_full.jsonl"),
+        );
+        if transcript.is_none() && step_timestamps.is_empty() {
             continue;
         }
 
-        // Extract turn timestamps from gen_metadata in order
-        let mut turn_timestamps = Vec::new();
+        // Extract each turn's step indices from gen_metadata in order
+        let mut turns = Vec::new();
         if let Ok(mut stmt) = conn.prepare("SELECT data FROM gen_metadata ORDER BY idx") {
             if let Ok(mut rows) = stmt.query([]) {
                 let mut seen_ids = std::collections::HashSet::new();
@@ -832,17 +848,17 @@ fn enrich_antigravity_timestamps(records: &mut [UsageRecord]) {
                             continue;
                         }
                     }
-                    let mut turn_ts = None;
-                    for s_idx in step_indices {
-                        if let Some(&ts) = step_timestamps.get(&s_idx) {
-                            turn_ts = Some(ts);
-                            break;
-                        }
-                    }
-                    turn_timestamps.push(turn_ts);
+                    turns.push(step_indices);
                 }
             }
         }
+        let turn_timestamps = match &transcript {
+            Some(lines) => date_turns_from_transcript(&turns, lines),
+            None => turns
+                .iter()
+                .map(|steps| steps.iter().find_map(|s| step_timestamps.get(s).copied()))
+                .collect(),
+        };
 
         for (&r_idx, maybe_ts) in record_indices.iter().zip(turn_timestamps) {
             if let Some(ts) = maybe_ts {
@@ -853,6 +869,51 @@ fn enrich_antigravity_timestamps(records: &mut [UsageRecord]) {
             }
         }
     }
+}
+
+/// `(step_index, created_at ms)` for each line of AGY's `transcript_full.jsonl`, in write order.
+fn read_agy_transcript(path: &std::path::Path) -> Option<Vec<(i64, i64)>> {
+    #[derive(Deserialize)]
+    struct Line {
+        step_index: i64,
+        created_at: String,
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<(i64, i64)> = text
+        .lines()
+        .filter_map(|line| {
+            let line: Line = serde_json::from_str(line).ok()?;
+            let at = chrono::DateTime::parse_from_rfc3339(&line.created_at).ok()?;
+            Some((line.step_index, at.timestamp_millis()))
+        })
+        .collect();
+    (!lines.is_empty()).then_some(lines)
+}
+
+/// Dates each turn (its step indices, in `gen_metadata` order) from the transcript. Every
+/// dehydration restarts the step indices, so one index can appear once per era. Both logs are
+/// append-only, so each turn takes the first line for one of its steps at or after the previous
+/// turn's line, which keeps it in its own era.
+fn date_turns_from_transcript(turns: &[Vec<i64>], lines: &[(i64, i64)]) -> Vec<Option<i64>> {
+    let mut positions: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (pos, &(step, _)) in lines.iter().enumerate() {
+        positions.entry(step).or_default().push(pos);
+    }
+    let mut cursor = 0;
+    turns
+        .iter()
+        .map(|steps| {
+            let hit = steps
+                .iter()
+                .filter_map(|step| {
+                    let at = positions.get(step)?;
+                    at.get(at.partition_point(|&pos| pos < cursor)).copied()
+                })
+                .min()?;
+            cursor = hit;
+            Some(lines[hit].1)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1022,6 +1083,18 @@ mod tests {
                 "antigravity-cli (three@example.com)", // subagent follows its parent
                 "antigravity-cli", // both processes long gone: unknown, not guessed
             ]
+        );
+    }
+
+    #[test]
+    fn antigravity_turns_keep_their_era_after_dehydration() {
+        // Era 0 logged steps 0..=5. A dehydration kept two of them, renumbered 0..=1, and the
+        // resumed session logged steps 2 and 3 again. Each turn names steps of its own era.
+        let lines = [(0, 10), (1, 11), (2, 12), (3, 13), (4, 14), (5, 15), (2, 30), (3, 31)];
+        let turns = [vec![1], vec![3], vec![4, 5], vec![2], vec![3], vec![9]];
+        assert_eq!(
+            date_turns_from_transcript(&turns, &lines),
+            [Some(11), Some(13), Some(14), Some(30), Some(31), None]
         );
     }
 
