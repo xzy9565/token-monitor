@@ -246,7 +246,7 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
 
     collect_commandcode_v3_records(&mut records, options.since.as_deref());
     collect_cursor_cache_records(&mut records, options.since.as_deref());
-    enrich_antigravity_timestamps(&mut records);
+    enrich_antigravity_records(&mut records);
     tag_antigravity_account_records(&mut records);
     // Same string comparison tokscale applies to `date`.
     records.retain(|r| {
@@ -809,7 +809,7 @@ fn extract_step_timestamp_ms(metadata: &[u8]) -> Option<i64> {
     None
 }
 
-fn parse_gen_metadata_turn(blob: &[u8]) -> Option<(Option<String>, Vec<i64>)> {
+fn parse_gen_metadata_turn(blob: &[u8]) -> Option<(Option<String>, Vec<u8>, Vec<i64>)> {
     let mut reader = ProtoWireReader::new(blob);
     let mut chat_model_bytes = None;
     let mut step_bytes = None;
@@ -867,10 +867,72 @@ fn parse_gen_metadata_turn(blob: &[u8]) -> Option<(Option<String>, Vec<i64>)> {
             step_indices.push(idx as i64);
         }
     }
-    Some((dedup_id, step_indices))
+    Some((dedup_id, u.to_vec(), step_indices))
 }
 
-fn enrich_antigravity_timestamps(records: &mut [UsageRecord]) {
+/// One `gen_metadata` generation: its identity (the response id, else its usage bytes) and the
+/// step indices it cites.
+type GenTurn = (Vec<u8>, Vec<i64>);
+
+/// The generations in an AGY database's `gen_metadata`, in order. Rows tokscale skips (no usage, a
+/// repeated response id) are skipped too, so they line up 1:1 with its records for the same file.
+fn read_gen_turns(path: &std::path::Path) -> Option<Vec<GenTurn>> {
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .ok()?;
+    let mut stmt = conn.prepare("SELECT data FROM gen_metadata ORDER BY idx").ok()?;
+    let mut rows = stmt.query([]).ok()?;
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut turns = Vec::new();
+    while let Ok(Some(row)) = rows.next() {
+        let Ok(blob) = row.get::<_, Vec<u8>>(0) else {
+            continue;
+        };
+        let Some((dedup_id, usage, steps)) = parse_gen_metadata_turn(&blob) else {
+            continue;
+        };
+        let key = match dedup_id {
+            Some(id) => {
+                if !seen_ids.insert(id.clone()) {
+                    continue;
+                }
+                id.into_bytes()
+            }
+            None => [b"usage:".as_slice(), &usage].concat(),
+        };
+        turns.push((key, steps));
+    }
+    Some(turns)
+}
+
+/// A session's generations in order: everything `agy-dehydrate` archived (the history up to its
+/// last run), then the hot rows the archive lacks, which are newer. AGY >= 1.2.15 overwrites the
+/// hot rows that cite steps past the kept ones when it resumes a dehydrated session, so only the
+/// archive still has them.
+fn gen_history<'a>(archived: &'a [GenTurn], hot: &'a [GenTurn]) -> Vec<&'a GenTurn> {
+    let seen: std::collections::HashSet<&[u8]> =
+        archived.iter().map(|(key, _)| key.as_slice()).collect();
+    archived
+        .iter()
+        .chain(hot.iter().filter(|(key, _)| !seen.contains(key.as_slice())))
+        .collect()
+}
+
+fn set_record_time(record: &mut UsageRecord, ms: i64) {
+    record.timestamp = ms;
+    if let Some(dt) = chrono::DateTime::from_timestamp_millis(ms) {
+        record.date = dt
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d")
+            .to_string();
+    }
+}
+
+/// Dates AGY records from AGY's transcript, and adds the usage that only `agy-dehydrate`'s archive
+/// still holds.
+fn enrich_antigravity_records(records: &mut Vec<UsageRecord>) {
     let home = match dirs::home_dir() {
         Some(h) => h,
         None => return,
@@ -879,6 +941,8 @@ fn enrich_antigravity_timestamps(records: &mut [UsageRecord]) {
     if !conv_dir.exists() {
         return;
     }
+    let archive_dir = home.join(".gemini/antigravity-cli/archive");
+    let mut archived_records = Vec::new();
 
     let mut session_map: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
@@ -894,6 +958,7 @@ fn enrich_antigravity_timestamps(records: &mut [UsageRecord]) {
         }
         // Defensive bypass: only enrich if all records share the exact same fallback timestamp
         let first_ts = records[record_indices[0]].timestamp;
+        let first_date = records[record_indices[0]].date.clone();
         let all_identical = record_indices.iter().all(|&i| records[i].timestamp == first_ts);
         if !all_identical {
             continue;
@@ -945,45 +1010,72 @@ fn enrich_antigravity_timestamps(records: &mut [UsageRecord]) {
             continue;
         }
 
-        // Extract each turn's step indices from gen_metadata in order
-        let mut turns = Vec::new();
-        if let Ok(mut stmt) = conn.prepare("SELECT data FROM gen_metadata ORDER BY idx") {
-            if let Ok(mut rows) = stmt.query([]) {
-                let mut seen_ids = std::collections::HashSet::new();
-                while let Ok(Some(row)) = rows.next() {
-                    let blob: Vec<u8> = match row.get(0) {
-                        Ok(b) => b,
-                        Err(_) => continue,
-                    };
-                    let Some((dedup_id, step_indices)) = parse_gen_metadata_turn(&blob) else {
-                        continue;
-                    };
-                    if let Some(id) = dedup_id {
-                        if !seen_ids.insert(id) {
-                            continue;
-                        }
-                    }
-                    turns.push(step_indices);
+        let Some(hot) = read_gen_turns(&db_path) else {
+            continue;
+        };
+        let Some(lines) = &transcript else {
+            for (&r_idx, (_, steps)) in record_indices.iter().zip(&hot) {
+                if let Some(ts) = steps.iter().find_map(|s| step_timestamps.get(s).copied()) {
+                    set_record_time(&mut records[r_idx], ts);
                 }
+            }
+            continue;
+        };
+        let archive_path = archive_dir.join(format!("{session_id}.cold.db"));
+        let archived = read_gen_turns(&archive_path).unwrap_or_default();
+        let history = gen_history(&archived, &hot);
+        let steps: Vec<Vec<i64>> = history.iter().map(|(_, s)| s.clone()).collect();
+        let dated: HashMap<&[u8], i64> = history
+            .iter()
+            .zip(date_turns_from_transcript(&steps, lines))
+            .filter_map(|((key, _), ts)| Some((key.as_slice(), ts?)))
+            .collect();
+        for (&r_idx, (key, _)) in record_indices.iter().zip(&hot) {
+            if let Some(&ts) = dated.get(key.as_slice()) {
+                set_record_time(&mut records[r_idx], ts);
             }
         }
-        let turn_timestamps = match &transcript {
-            Some(lines) => date_turns_from_transcript(&turns, lines),
-            None => turns
-                .iter()
-                .map(|steps| steps.iter().find_map(|s| step_timestamps.get(s).copied()))
-                .collect(),
-        };
 
-        for (&r_idx, maybe_ts) in record_indices.iter().zip(turn_timestamps) {
-            if let Some(ts) = maybe_ts {
-                records[r_idx].timestamp = ts;
-                if let Some(dt) = chrono::DateTime::from_timestamp_millis(ts) {
-                    records[r_idx].date = dt.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string();
-                }
+        // Usage only the archive still holds. tokscale parses the archive like any AGY database,
+        // so its records line up 1:1 with `archived`.
+        let in_hot: std::collections::HashSet<&[u8]> =
+            hot.iter().map(|(key, _)| key.as_slice()).collect();
+        if archived
+            .iter()
+            .all(|(key, _)| in_hot.contains(key.as_slice()))
+        {
+            continue;
+        }
+        let client = records[record_indices[0]].client.clone();
+        let parsed =
+            tokscale_core::sessions::antigravity_cli::parse_antigravity_cli_file(&archive_path);
+        for ((key, _), m) in archived.iter().zip(parsed) {
+            if in_hot.contains(key.as_slice()) {
+                continue;
             }
+            let mut record = UsageRecord {
+                client: client.clone(),
+                model_id: m.model_id,
+                provider_id: m.provider_id,
+                session_id: session_id.clone(),
+                date: first_date.clone(),
+                timestamp: first_ts,
+                tokens: UsageTokens {
+                    input: m.tokens.input.max(0),
+                    output: m.tokens.output.max(0),
+                    cache_read: m.tokens.cache_read.max(0),
+                    cache_write: m.tokens.cache_write.max(0),
+                    reasoning: m.tokens.reasoning.max(0),
+                },
+                message_count: m.message_count.max(0),
+            };
+            if let Some(&ts) = dated.get(key.as_slice()) {
+                set_record_time(&mut record, ts);
+            }
+            archived_records.push(record);
         }
     }
+    records.extend(archived_records);
 }
 
 /// `(step_index, created_at ms)` for each line of AGY's `transcript_full.jsonl`, in write order.
@@ -1237,6 +1329,24 @@ mod tests {
         assert_eq!(
             date_turns_from_transcript(&turns, &lines),
             [Some(11), Some(12), Some(30), Some(31)]
+        );
+    }
+
+    #[test]
+    fn antigravity_archive_keeps_the_usage_agy_overwrote() {
+        // Era 0 logged steps 0..=3 and generations a, b, c; agy-dehydrate archived all three and
+        // kept two steps. On resume AGY overwrote b and c, and generation d cites the new step 2.
+        let lines = [(0, 10), (1, 11), (2, 12), (3, 13), (2, 30)];
+        let turn = |key: &str, steps: &[i64]| (key.as_bytes().to_vec(), steps.to_vec());
+        let archived = [turn("a", &[1]), turn("b", &[2]), turn("c", &[3])];
+        let hot = [turn("a", &[1]), turn("d", &[2])];
+        let history = gen_history(&archived, &hot);
+        let keys: Vec<&[u8]> = history.iter().map(|(key, _)| key.as_slice()).collect();
+        assert_eq!(keys, [b"a".as_slice(), b"b", b"c", b"d"]);
+        let steps: Vec<Vec<i64>> = history.iter().map(|(_, s)| s.clone()).collect();
+        assert_eq!(
+            date_turns_from_transcript(&steps, &lines),
+            [Some(11), Some(12), Some(13), Some(30)]
         );
     }
 
