@@ -237,6 +237,30 @@ impl ProviderSnapshot {
         }
     }
 
+    /// Whether this provider is temporarily blocked by a session (5h) cooldown
+    /// but still has durable (7d / monthly / billing) capacity remaining.
+    /// These should rank below currently-usable providers in burn-first order.
+    pub fn is_session_capped(&self) -> bool {
+        if self.is_exhausted() {
+            return false; // fully exhausted is a separate, lower tier
+        }
+        let has_session = self.windows.iter().any(|w| {
+            w.kind == WindowKind::Session
+                || w.label.to_ascii_lowercase().contains("5h")
+        });
+        if !has_session {
+            return false;
+        }
+        // Every session window must be exhausted for the provider to be capped.
+        self.windows
+            .iter()
+            .filter(|w| {
+                w.kind == WindowKind::Session
+                    || w.label.to_ascii_lowercase().contains("5h")
+            })
+            .all(|w| w.effectively_exhausted())
+    }
+
     pub fn earliest_deadline_ms(&self, now_ms: i64) -> Option<i64> {
         if self.is_exhausted() {
             return self
@@ -321,6 +345,13 @@ pub fn sort_burn_first(providers: &mut [ProviderSnapshot], now_ms: i64) {
         let exhausted_order = left.is_exhausted().cmp(&right.is_exhausted());
         if exhausted_order != Ordering::Equal {
             return exhausted_order;
+        }
+
+        // Session-capped providers (5h cooldown, durable pools still open)
+        // rank below currently-usable providers but above exhausted ones.
+        let capped_order = left.is_session_capped().cmp(&right.is_session_capped());
+        if capped_order != Ordering::Equal {
+            return capped_order;
         }
 
         let left_deadline = left.earliest_deadline_ms(now_ms);
@@ -622,6 +653,48 @@ mod tests {
             ["agy3", "agy1"]
         );
         assert!(!rows[1].is_exhausted(), "agy1's Claude pool is still usable");
+    }
+
+    #[test]
+    fn session_capped_ranks_below_usable_above_exhausted() {
+        let now = 1_000;
+        // Claude: 5h at 0% (capped), 7d at 87% (still has durable capacity).
+        // Its 5h resets soonest, but you can't use it right now.
+        let claude = provider(
+            "claude",
+            "Pro",
+            vec![
+                window("5h", WindowKind::Session, 0.0, now + 2_000_000),
+                window("7d", WindowKind::Weekly, 87.0, now + 500_000_000),
+            ],
+        );
+        // Codex: 5h at 55%, 7d at 90%. Currently usable.
+        let codex = provider(
+            "codex",
+            "Plus",
+            vec![
+                window("5h", WindowKind::Session, 55.0, now + 3_000_000),
+                window("7d", WindowKind::Weekly, 90.0, now + 600_000_000),
+            ],
+        );
+        // Grok: 7d at 0%. Fully exhausted.
+        let grok = provider(
+            "grok",
+            "SuperGrok",
+            vec![window("7d", WindowKind::Weekly, 0.0, now + 400_000_000)],
+        );
+        let mut rows = vec![claude, codex, grok];
+        sort_burn_first(&mut rows, now);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.provider_id.as_str())
+                .collect::<Vec<_>>(),
+            // Usable first, then session-capped, then exhausted.
+            ["codex", "claude", "grok"]
+        );
+        assert!(rows[1].is_session_capped());
+        assert!(!rows[1].is_exhausted());
+        assert!(rows[2].is_exhausted());
     }
 
     #[test]
