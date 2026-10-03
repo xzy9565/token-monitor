@@ -1062,6 +1062,7 @@ impl App {
         let q = self.search_query.trim().to_ascii_lowercase();
         self.providers
             .iter()
+            .filter(|provider| provider.visible_by_default() || !q.is_empty())
             .filter(|provider| match self.filter {
                 Filter::All => true,
                 Filter::Attention => {

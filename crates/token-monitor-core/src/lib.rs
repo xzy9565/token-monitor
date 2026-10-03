@@ -318,6 +318,8 @@ impl ProviderSnapshot {
             "no modal profile",
             "no coding plan",
             "不存在coding plan",
+            "quota response has no windows",
+            "has no windows",
         ]
         .iter()
         .any(|marker| diagnostics.contains(marker));
@@ -465,6 +467,9 @@ pub fn merge_provider_snapshots(
             }
         });
         if !present {
+            if !old.visible_by_default() {
+                continue;
+            }
             let mut retained = old.clone();
             if retained.source_health == SourceHealth::Connected {
                 retained.source_health = SourceHealth::Stale;
@@ -708,6 +713,18 @@ mod tests {
         failed.source_health = SourceHealth::Unavailable;
         failed.diagnostics = vec!["HTTP 429".into()];
         assert!(failed.visible_by_default());
+
+        let mut zai_no_plan = provider("zai", "", vec![]);
+        zai_no_plan.account_key = "zai:hashed".into();
+        zai_no_plan.source_health = SourceHealth::Unavailable;
+        zai_no_plan.diagnostics = vec!["Z.ai: 当前用户不存在coding plan".into()];
+        assert!(!zai_no_plan.visible_by_default(), "Z.ai without coding plan should be hidden");
+
+        let mut zai_no_windows = provider("zai", "", vec![]);
+        zai_no_windows.account_key = "zai:hashed".into();
+        zai_no_windows.source_health = SourceHealth::Unavailable;
+        zai_no_windows.diagnostics = vec!["Z.ai quota response has no windows".into()];
+        assert!(!zai_no_windows.visible_by_default(), "Z.ai with no windows should be hidden");
     }
 
     #[test]
