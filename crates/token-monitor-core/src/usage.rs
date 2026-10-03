@@ -1007,28 +1007,42 @@ fn read_agy_transcript(path: &std::path::Path) -> Option<Vec<(i64, i64)>> {
 
 /// Dates each turn (its step indices, in `gen_metadata` order) from the transcript. Every
 /// dehydration restarts the step indices, so one index can appear once per era. Both logs are
-/// append-only, so each turn takes the first line for one of its steps at or after the previous
-/// turn's line, which keeps it in its own era.
+/// append-only, so walking back from the newest turn, each turn's latest line at or before the
+/// next turn's line is in its own era; the turn is dated by the earliest of its lines next to it.
+///
+/// The walk goes backward because AGY truncates the tail of `gen_metadata` when a session rewinds
+/// (a retry after an error) and, since 1.2.15, when it resumes a dehydrated session. Walking
+/// forward across that gap dated every newer turn from the discarded lines (2026-10-02: 8979be53
+/// lost 47 h). Anchoring on the latest line, not the earliest, keeps a turn's reference to a
+/// renumbered kept step, whose index is logged only in an older era, from dragging it back.
 fn date_turns_from_transcript(turns: &[Vec<i64>], lines: &[(i64, i64)]) -> Vec<Option<i64>> {
+    // ponytail: a turn's own steps are logged within a few lines of each other; any hit further
+    // back than this is an older era. Results are identical for 4–64 on 59,612 real turns.
+    const SAME_TURN: usize = 16;
     let mut positions: HashMap<i64, Vec<usize>> = HashMap::new();
     for (pos, &(step, _)) in lines.iter().enumerate() {
         positions.entry(step).or_default().push(pos);
     }
-    let mut cursor = 0;
-    turns
+    let mut cursor = usize::MAX;
+    let mut dated: Vec<Option<i64>> = turns
         .iter()
+        .rev()
         .map(|steps| {
-            let hit = steps
+            let hits: Vec<usize> = steps
                 .iter()
                 .filter_map(|step| {
                     let at = positions.get(step)?;
-                    at.get(at.partition_point(|&pos| pos < cursor)).copied()
+                    let n = at.partition_point(|&pos| pos <= cursor);
+                    n.checked_sub(1).map(|i| at[i])
                 })
-                .min()?;
-            cursor = hit;
-            Some(lines[hit].1)
+                .collect();
+            let anchor = *hits.iter().max()?;
+            cursor = hits.into_iter().filter(|&h| anchor - h <= SAME_TURN).min()?;
+            Some(lines[cursor].1)
         })
-        .collect()
+        .collect();
+    dated.reverse();
+    dated
 }
 
 #[cfg(test)]
@@ -1210,6 +1224,33 @@ mod tests {
         assert_eq!(
             date_turns_from_transcript(&turns, &lines),
             [Some(11), Some(13), Some(14), Some(30), Some(31), None]
+        );
+    }
+
+    #[test]
+    fn antigravity_turns_survive_an_overwritten_metadata_tail() {
+        // Era 0 logged steps 0..=5; the dehydration kept 0..=2 and the resumed session logged 3..=5
+        // again. AGY overwrote era 0's turns for steps 3..=5, so `gen_metadata` jumps from era 0's
+        // step 2 straight to era 1's step 3, which also exists in era 0.
+        let lines = [(0, 10), (1, 11), (2, 12), (3, 13), (4, 14), (5, 15), (3, 30), (4, 31), (5, 32)];
+        let turns = [vec![1], vec![2], vec![3], vec![4, 5]];
+        assert_eq!(
+            date_turns_from_transcript(&turns, &lines),
+            [Some(11), Some(12), Some(30), Some(31)]
+        );
+    }
+
+    #[test]
+    fn antigravity_turn_citing_a_kept_step_stays_in_its_era() {
+        // Era 0 logged steps 0..=19 (t = 100..=119); the dehydration kept two, renumbered 0..=1,
+        // and the resumed session logged 2 and 3. Its first turn also cites kept step 0, which the
+        // transcript holds only as era 0's step 0.
+        let mut lines: Vec<(i64, i64)> = (0..20).map(|s| (s, 100 + s)).collect();
+        lines.extend([(2, 300), (3, 301)]);
+        let turns = [vec![18], vec![0, 2], vec![3]];
+        assert_eq!(
+            date_turns_from_transcript(&turns, &lines),
+            [Some(118), Some(300), Some(301)]
         );
     }
 
