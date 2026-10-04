@@ -559,25 +559,29 @@ const AGY_LOG_SLACK_MS: i64 = 120_000;
 #[derive(Debug, Default)]
 struct AgyProcessLog {
     email: Option<String>,
-    first_ms: i64,
     last_ms: i64,
     /// (timestamp, conversation id) of every driver line.
     events: Vec<(i64, String)>,
 }
 
 fn parse_agy_process_log(year: i32, content: &str) -> AgyProcessLog {
-    let mut log = AgyProcessLog::default();
-    for line in content.lines() {
-        let Some(ms) = glog_timestamp_ms(year, line) else {
+    let stamp = |line: &str| glog_timestamp_ms(year, line);
+    let mut log = AgyProcessLog {
+        last_ms: content.lines().rev().find_map(stamp).unwrap_or_default(),
+        ..AgyProcessLog::default()
+    };
+    for line in lines_containing(content, "applyAuthResult: email=") {
+        if let Some((_, rest)) = line.split_once("applyAuthResult: email=") {
+            if stamp(line).is_some() {
+                log.email = rest.split([',', ' ']).next().map(str::to_owned);
+            }
+        }
+    }
+    // Every driver marker names a conversation.
+    for line in lines_containing(content, "conversation") {
+        let Some(ms) = stamp(line) else {
             continue;
         };
-        if log.first_ms == 0 {
-            log.first_ms = ms;
-        }
-        log.last_ms = ms;
-        if let Some((_, rest)) = line.split_once("applyAuthResult: email=") {
-            log.email = rest.split([',', ' ']).next().map(str::to_owned);
-        }
         for marker in AGY_DRIVER_MARKERS {
             if let Some((_, rest)) = line.split_once(marker) {
                 let id = rest.get(..36).unwrap_or_default();
@@ -589,6 +593,21 @@ fn parse_agy_process_log(year: i32, content: &str) -> AgyProcessLog {
         }
     }
     log
+}
+
+/// Each line of `content` that contains `needle`, in order. One scan of the whole text: a
+/// search per line took a second over the ~800k lines of AGY's process logs.
+fn lines_containing<'a>(content: &'a str, needle: &'a str) -> impl Iterator<Item = &'a str> {
+    let mut line_end = 0;
+    content.match_indices(needle).filter_map(move |(at, _)| {
+        if at < line_end {
+            return None; // another hit on the line just yielded
+        }
+        let start = content[..at].rfind('\n').map_or(0, |i| i + 1);
+        let line = content[start..].lines().next().unwrap_or_default();
+        line_end = start + line.len();
+        Some(line)
+    })
 }
 
 /// glog prefix `I0924 18:08:14.490117`, local time; the year comes from the log file name.
@@ -1252,21 +1271,27 @@ mod tests {
             ),
         );
         assert_eq!(log.email.as_deref(), Some("two@example.com"));
-        assert_eq!(log.last_ms - log.first_ms, 1_500);
+        let stamp = |line| glog_timestamp_ms(2026, line).unwrap();
+        assert_eq!(
+            stamp("I0924 18:08:15.990117") - stamp("I0924 18:08:14.490117"),
+            1_500
+        );
         // Only the user message drives the conversation; resuming it just opens it.
         assert_eq!(log.events, vec![(log.last_ms, conv.to_owned())]);
+        // The parser only looks at lines that mention a conversation.
+        assert!(AGY_DRIVER_MARKERS
+            .iter()
+            .all(|m| m.contains("conversation")));
 
         // Two panes on different accounts share `conv`; the one that last drove it owns the call.
         let logs = vec![
             AgyProcessLog {
                 email: Some("two@example.com".into()),
-                first_ms: 0,
                 last_ms: 1_000_000,
                 events: vec![(10, conv.into())],
             },
             AgyProcessLog {
                 email: Some("three@example.com".into()),
-                first_ms: 100,
                 last_ms: 1_000_000,
                 events: vec![(200, conv.into())],
             },
