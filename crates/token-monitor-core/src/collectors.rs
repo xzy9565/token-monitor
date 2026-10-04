@@ -42,6 +42,20 @@ impl CollectorOptions {
     }
 }
 
+/// The HTTP client collectors share. Building one loads the macOS trust store, ~130 ms of
+/// blocking work that every collector used to repeat inside one `join!` on each refresh.
+fn http_client(timeout: Duration) -> reqwest::Result<Client> {
+    static SHARED: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    if timeout != DEFAULT_TIMEOUT {
+        return Client::builder().timeout(timeout).build();
+    }
+    if let Some(client) = SHARED.get() {
+        return Ok(client.clone());
+    }
+    let client = Client::builder().timeout(timeout).build()?;
+    Ok(SHARED.get_or_init(|| client).clone())
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -485,7 +499,7 @@ pub async fn collect_cursor(options: &CollectorOptions) -> Vec<ProviderSnapshot>
             75,
         )];
     }
-    let client = match Client::builder().timeout(options.timeout()).build() {
+    let client = match http_client(options.timeout()) {
         Ok(client) => client,
         Err(_) => {
             return vec![unavailable_snapshot(
@@ -936,9 +950,7 @@ async fn collect_claude_web(
     options: &CollectorOptions,
     cookie: &str,
 ) -> Result<ProviderSnapshot, (SourceHealth, String)> {
-    let client = Client::builder()
-        .timeout(options.timeout())
-        .build()
+    let client = http_client(options.timeout())
         .map_err(|_| (SourceHealth::Unavailable, "HTTP client unavailable".into()))?;
     let organizations =
         request_cookie_json(&client, "https://claude.ai/api/organizations", cookie).await?;
@@ -1048,7 +1060,7 @@ pub async fn collect_claude(options: &CollectorOptions) -> Vec<ProviderSnapshot>
             )]
         }
     };
-    let client = match Client::builder().timeout(options.timeout()).build() {
+    let client = match http_client(options.timeout()) {
         Ok(client) => client,
         Err(_) => {
             return vec![unavailable_snapshot(
@@ -1206,7 +1218,7 @@ pub async fn collect_openrouter(options: &CollectorOptions) -> Vec<ProviderSnaps
             )]
         }
     };
-    let client = match Client::builder().timeout(options.timeout()).build() {
+    let client = match http_client(options.timeout()) {
         Ok(client) => client,
         Err(_) => {
             return vec![unavailable_snapshot(
@@ -1321,7 +1333,7 @@ pub async fn collect_deepseek(options: &CollectorOptions) -> Vec<ProviderSnapsho
             )]
         }
     };
-    let client = match Client::builder().timeout(options.timeout()).build() {
+    let client = match http_client(options.timeout()) {
         Ok(client) => client,
         Err(_) => {
             return vec![unavailable_snapshot(
@@ -1971,7 +1983,7 @@ pub async fn collect_codex(options: &CollectorOptions) -> Vec<ProviderSnapshot> 
         }
     };
     let key_seed = account_id.as_deref().unwrap_or("default");
-    let client = match Client::builder().timeout(options.timeout()).build() {
+    let client = match http_client(options.timeout()) {
         Ok(client) => client,
         Err(_) => {
             return vec![unavailable_snapshot(
@@ -2478,6 +2490,8 @@ pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnap
     let client = match Client::builder()
         .timeout(options.timeout())
         .danger_accept_invalid_certs(true)
+        // Only localhost with self-signed certs: skip loading the trust store (~130 ms).
+        .tls_built_in_root_certs(false)
         .build()
     {
         Ok(client) => client,
@@ -2501,15 +2515,14 @@ pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnap
     let mut snapshots = Vec::new();
     let mut live_emails = std::collections::HashSet::new();
     let env_csrf_map = discover_antigravity_env_csrf();
+    let (client, env_csrf_map, timeout) = (&client, &env_csrf_map, options.timeout());
 
-    for server in servers {
-        let ports = antigravity_ports(server.pid, options.timeout()).await;
-        let mut server_connected = false;
-        for port in ports {
-            if server_connected {
-                break;
-            }
-
+    // Probe every server at once: each costs an lsof and a forced quota refresh, which one
+    // after another took seconds with a dozen agy panes open.
+    // ponytail: still one forced refresh per server, not per account; poll one server per
+    // account if AGY starts rate-limiting them.
+    let probes = servers.iter().map(|server| async move {
+        for port in antigravity_ports(server.pid, timeout).await {
             let mut csrf_candidates = Vec::new();
             if !server.csrf_token.is_empty() {
                 csrf_candidates.push(server.csrf_token.clone());
@@ -2525,12 +2538,9 @@ pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnap
             }
 
             for scheme in ["http", "https"] {
-                if server_connected {
-                    break;
-                }
                 for csrf in &csrf_candidates {
                     let result = antigravity_call(
-                        &client,
+                        client,
                         scheme,
                         port,
                         csrf,
@@ -2546,7 +2556,7 @@ pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnap
                         continue;
                     }
                     let identity = antigravity_call(
-                        &client,
+                        client,
                         scheme,
                         port,
                         csrf,
@@ -2568,22 +2578,25 @@ pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnap
                         .and_then(|value| value.get("name"))
                         .and_then(Value::as_str)
                         .unwrap_or("Pro");
-
-                    if live_emails.insert(email.to_string()) {
-                        snapshots.push(connected_snapshot(
-                            "antigravity",
-                            account_key("antigravity", email),
-                            email.into(),
-                            plan.into(),
-                            "rpc",
-                            windows,
-                            141,
-                        ));
-                    }
-                    server_connected = true;
-                    break;
+                    return Some((email.to_owned(), plan.to_owned(), windows));
                 }
             }
+        }
+        None
+    });
+    // join_all keeps pid order, so the same server as before speaks for a shared account.
+    let probed = futures::future::join_all(probes).await;
+    for (email, plan, windows) in probed.into_iter().flatten() {
+        if live_emails.insert(email.clone()) {
+            snapshots.push(connected_snapshot(
+                "antigravity",
+                account_key("antigravity", &email),
+                email,
+                plan,
+                "rpc",
+                windows,
+                141,
+            ));
         }
     }
 
@@ -2932,10 +2945,8 @@ fn parse_grok_grpc_billing(bytes: &[u8]) -> Option<LimitWindow> {
 }
 
 async fn grok_web_billing(options: &CollectorOptions, token: &str) -> Result<LimitWindow, String> {
-    let client = Client::builder()
-        .timeout(options.timeout())
-        .build()
-        .map_err(|_| "HTTP client unavailable".to_owned())?;
+    let client =
+        http_client(options.timeout()).map_err(|_| "HTTP client unavailable".to_owned())?;
     let response = client
         .post("https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig")
         .header("Authorization", format!("Bearer {token}"))
@@ -3185,7 +3196,7 @@ pub async fn collect_commandcode(options: &CollectorOptions) -> Vec<ProviderSnap
         CommandCodeAuth::ApiKey { key, .. } => ("cli", key.as_str()),
         CommandCodeAuth::Cookie { cookie } => ("web", cookie.as_str()),
     };
-    let client = match Client::builder().timeout(options.timeout()).build() {
+    let client = match http_client(options.timeout()) {
         Ok(client) => client,
         Err(_) => {
             return vec![unavailable_snapshot(
@@ -3745,7 +3756,7 @@ pub async fn collect_zai(options: &CollectorOptions) -> Vec<ProviderSnapshot> {
     } else {
         "https://api.z.ai"
     };
-    let client = match Client::builder().timeout(options.timeout()).build() {
+    let client = match http_client(options.timeout()) {
         Ok(client) => client,
         Err(_) => {
             return vec![unavailable_snapshot(
@@ -3866,7 +3877,7 @@ pub async fn collect_zai_team(options: &CollectorOptions) -> Vec<ProviderSnapsho
             75,
         )];
     }
-    let client = match Client::builder().timeout(options.timeout()).build() {
+    let client = match http_client(options.timeout()) {
         Ok(client) => client,
         Err(_) => {
             return vec![unavailable_snapshot(
@@ -4014,7 +4025,7 @@ pub async fn collect_copilot(options: &CollectorOptions) -> Vec<ProviderSnapshot
             )]
         }
     };
-    let client = match Client::builder().timeout(options.timeout()).build() {
+    let client = match http_client(options.timeout()) {
         Ok(client) => client,
         Err(_) => {
             return vec![unavailable_snapshot(
@@ -4257,7 +4268,7 @@ pub async fn collect_qoder(options: &CollectorOptions) -> Vec<ProviderSnapshot> 
     } else {
         "https://qoder.com"
     };
-    let client = match Client::builder().timeout(options.timeout()).build() {
+    let client = match http_client(options.timeout()) {
         Ok(client) => client,
         Err(_) => {
             return vec![unavailable_snapshot(
@@ -4396,7 +4407,7 @@ pub async fn collect_trae(options: &CollectorOptions) -> Vec<ProviderSnapshot> {
             )]
         }
     };
-    let client = match Client::builder().timeout(options.timeout()).build() {
+    let client = match http_client(options.timeout()) {
         Ok(client) => client,
         Err(_) => {
             return vec![unavailable_snapshot(
@@ -4820,7 +4831,7 @@ pub async fn collect_ollama(options: &CollectorOptions) -> Vec<ProviderSnapshot>
             )]
         }
     };
-    let client = match Client::builder().timeout(options.timeout()).build() {
+    let client = match http_client(options.timeout()) {
         Ok(client) => client,
         Err(_) => {
             return vec![unavailable_snapshot(
