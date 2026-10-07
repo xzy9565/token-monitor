@@ -326,6 +326,9 @@ impl ProviderSnapshot {
         if not_configured {
             return false;
         }
+        if self.provider_id.eq_ignore_ascii_case("zai") && self.windows.is_empty() {
+            return false;
+        }
         !self.windows.is_empty()
             || !self.account_key.trim().is_empty()
             || self.source_health == SourceHealth::Unauthorized
@@ -467,7 +470,7 @@ pub fn merge_provider_snapshots(
             }
         });
         if !present {
-            if !old.visible_by_default() {
+            if !old.visible_by_default() || old.windows.is_empty() {
                 continue;
             }
             let mut retained = old.clone();
