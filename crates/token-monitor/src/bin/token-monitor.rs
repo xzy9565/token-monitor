@@ -1143,6 +1143,7 @@ fn mock_consumption_report() -> usage::ConsumptionReport {
                 reasoning: 0,
             },
             message_count: 42,
+            reported_cost_micros: None,
         },
         usage::UsageRecord {
             client: "Claude".into(),
@@ -1159,6 +1160,7 @@ fn mock_consumption_report() -> usage::ConsumptionReport {
                 reasoning: 150_000,
             },
             message_count: 35,
+            reported_cost_micros: None,
         },
         usage::UsageRecord {
             client: "Antigravity Cli".into(),
@@ -1175,6 +1177,7 @@ fn mock_consumption_report() -> usage::ConsumptionReport {
                 reasoning: 0,
             },
             message_count: 58,
+            reported_cost_micros: None,
         },
         usage::UsageRecord {
             client: "Cursor".into(),
@@ -1191,6 +1194,7 @@ fn mock_consumption_report() -> usage::ConsumptionReport {
                 reasoning: 0,
             },
             message_count: 80,
+            reported_cost_micros: None,
         },
         usage::UsageRecord {
             client: "Codex".into(),
@@ -1207,6 +1211,7 @@ fn mock_consumption_report() -> usage::ConsumptionReport {
                 reasoning: 1_200_000,
             },
             message_count: 150,
+            reported_cost_micros: None,
         },
         usage::UsageRecord {
             client: "Claude".into(),
@@ -1223,6 +1228,7 @@ fn mock_consumption_report() -> usage::ConsumptionReport {
                 reasoning: 0,
             },
             message_count: 420,
+            reported_cost_micros: None,
         },
     ];
 
@@ -2567,6 +2573,9 @@ fn normalize_client_id(client: &str) -> String {
         "Antigravity".to_owned()
     } else if lower.contains("opencode") {
         "OpenCode".to_owned()
+    } else if lower == "grokbot" {
+        // Cursor's Grok Bot, a separate pool from Grok (X Premium) below.
+        "Grok Bot".to_owned()
     } else if lower.contains("grok") || lower.contains("xai") {
         "Grok".to_owned()
     } else if lower.contains("cursor") {
@@ -5895,6 +5904,7 @@ mod tests {
                     reasoning: 0,
                 },
                 message_count: 1,
+                reported_cost_micros: None,
             },
         ];
         let snapshot = usage::UsageSnapshot {
@@ -6198,6 +6208,7 @@ mod tests {
     #[test]
     fn normalize_client_id_handles_multi_account_antigravity() {
         assert_eq!(normalize_client_id("antigravity-cli"), "Antigravity Cli");
+        assert_eq!(normalize_client_id("grokbot"), "Grok Bot");
         assert_eq!(
             normalize_client_id("antigravity-cli (Account 1)"),
             "Antigravity Cli (Account 1)"

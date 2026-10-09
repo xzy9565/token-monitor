@@ -86,6 +86,17 @@ impl PricingEngine {
             .saturating_add(tokens.cache_write)
             .saturating_add(tokens.output)
             .saturating_add(tokens.reasoning);
+        if let Some(micros) = record.reported_cost_micros {
+            return PriceQuote {
+                value_usd: Some(micros as f64 / 1e6),
+                status: PricingStatus::Exact,
+                source: Some("provider-reported".into()),
+                priced_tokens: total_tokens,
+                unpriced_tokens: 0,
+                warnings: vec![],
+                ..unknown_quote(record, tokens, total_tokens, "")
+            };
+        }
         let Some(service) = &self.service else {
             return unknown_quote(record, tokens, total_tokens, "pricing dataset unavailable");
         };
@@ -349,6 +360,7 @@ mod tests {
                 reasoning: 20,
             },
             message_count: 1,
+            reported_cost_micros: None,
         }
     }
 
@@ -371,6 +383,16 @@ mod tests {
         assert_eq!(quote.status, PricingStatus::Unknown);
         assert_eq!(quote.value_usd, None);
         assert_eq!(quote.unpriced_tokens, 100);
+    }
+
+    #[test]
+    fn provider_reported_cost_is_priced_as_is() {
+        let mut rec = record("grokbot", "grok-bot-default");
+        rec.reported_cost_micros = Some(197_022);
+        let quote = engine().quote(&rec);
+        assert_eq!(quote.status, PricingStatus::Exact);
+        assert!((quote.value_usd.unwrap() - 0.197022).abs() < 1e-12);
+        assert_eq!(quote.unpriced_tokens, 0);
     }
 
     #[test]
@@ -443,6 +465,7 @@ mod tests {
                     reasoning: 0,
                 },
                 message_count: 1,
+                reported_cost_micros: None,
             };
             let quote = engine.quote(&rec);
             assert_eq!(
@@ -497,6 +520,7 @@ mod tests {
                 reasoning: 0,
             },
             message_count: 1,
+            reported_cost_micros: None,
         };
 
         let quote = engine.quote(&rec);
@@ -527,6 +551,7 @@ mod tests {
                 reasoning: 0,
             },
             message_count: 1,
+            reported_cost_micros: None,
         };
 
         let quote = engine.quote(&rec);

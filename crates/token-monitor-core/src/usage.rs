@@ -54,6 +54,10 @@ pub struct UsageRecord {
     pub timestamp: i64,
     pub tokens: UsageTokens,
     pub message_count: i32,
+    /// What the provider billed for this row, in millionths of a dollar. Set only where no list
+    /// price can exist (Cursor's Grok Bot rows name a task type, not a model); priced as-is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_cost_micros: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +245,7 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
                 reasoning: message.reasoning.max(0),
             },
             message_count: message.message_count.max(0),
+            reported_cost_micros: None,
         })
         .collect();
 
@@ -344,8 +349,14 @@ fn parse_cursor_json(content: &str, records: &mut Vec<UsageRecord>, since: Optio
             UsageTokens::default()
         };
 
+        // Grok Bot has its own weekly pool, so it gets its own ledger row, priced by Cursor's charge.
+        let grok_bot = model.starts_with("grok-bot");
+        let reported_cost_micros = grok_bot
+            .then(|| event.get("chargedCents").and_then(|v| v.as_f64()))
+            .flatten()
+            .map(|cents| (cents * 10_000.0).round() as i64);
         records.push(UsageRecord {
-            client: "cursor".into(),
+            client: if grok_bot { "grokbot" } else { "cursor" }.into(),
             model_id: model.to_string(),
             provider_id,
             session_id,
@@ -353,6 +364,7 @@ fn parse_cursor_json(content: &str, records: &mut Vec<UsageRecord>, since: Optio
             timestamp,
             tokens,
             message_count: 1,
+            reported_cost_micros,
         });
     }
 }
@@ -419,6 +431,7 @@ fn collect_cursor_cache_records(records: &mut Vec<UsageRecord>, since: Option<&s
                     reasoning: m.tokens.reasoning.max(0),
                 },
                 message_count: m.message_count.max(0),
+                reported_cost_micros: None,
             });
         }
     }
@@ -537,6 +550,7 @@ fn collect_commandcode_v3_records(records: &mut Vec<UsageRecord>, since: Option<
                     timestamp,
                     tokens,
                     message_count: 1,
+                    reported_cost_micros: None,
                 });
             }
         }
@@ -1115,6 +1129,7 @@ fn enrich_antigravity_records(records: &mut Vec<UsageRecord>) {
                     reasoning: m.tokens.reasoning.max(0),
                 },
                 message_count: m.message_count.max(0),
+                reported_cost_micros: None,
             };
             if let Some(&ts) = dated.get(key.as_slice()) {
                 set_record_time(&mut record, ts);
@@ -1213,6 +1228,7 @@ mod tests {
                     timestamp: 0,
                     tokens: UsageTokens::default(),
                     message_count: 1,
+                    reported_cost_micros: None,
                 },
                 UsageRecord {
                     client: "codex".into(),
@@ -1223,6 +1239,7 @@ mod tests {
                     timestamp: 1,
                     tokens: UsageTokens::default(),
                     message_count: 1,
+                    reported_cost_micros: None,
                 },
             ],
             processing_time_ms: 1,
@@ -1250,6 +1267,7 @@ mod tests {
                     reasoning: 5,
                 },
                 message_count: 1,
+                reported_cost_micros: None,
             }],
             processing_time_ms: 1,
             tokscale_revision: TOKSCALE_REVISION.into(),
@@ -1350,6 +1368,7 @@ mod tests {
             timestamp,
             tokens: UsageTokens::default(),
             message_count: 1,
+            reported_cost_micros: None,
         })
         .collect();
 
@@ -1423,6 +1442,23 @@ mod tests {
             date_turns_from_transcript(&turns, &lines),
             [Some(118), Some(300), Some(301)]
         );
+    }
+
+    #[test]
+    fn grok_bot_rows_get_their_own_client_and_cursors_charge() {
+        let sample = serde_json::json!({
+            "usageEventsDisplay": [
+                {"model": "grok-bot-default", "timestamp": "1790289578354", "chargedCents": 19.70219993591309},
+                {"model": "grok-4.7-xhigh", "timestamp": "1790289578355", "chargedCents": 3.5}
+            ]
+        })
+        .to_string();
+        let mut records = Vec::new();
+        parse_cursor_json(&sample, &mut records, None);
+        assert_eq!(records[0].client, "grokbot");
+        assert_eq!(records[0].reported_cost_micros, Some(197_022));
+        assert_eq!(records[1].client, "cursor");
+        assert_eq!(records[1].reported_cost_micros, None);
     }
 
     #[test]
