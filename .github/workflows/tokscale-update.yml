@@ -1,0 +1,72 @@
+name: tokscale update
+
+# Weekly: when tokscale publishes a release, pin it, build and test here, and open a PR.
+# The ledger check against real usage needs the Mac's local data, so it stays a manual step:
+# check out the PR branch and run scripts/verify-tokscale-upgrade.py before merging.
+
+on:
+  schedule:
+    - cron: '0 13 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Pin the latest tokscale release
+        id: pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh api repos/junhoyeo/tokscale/releases/latest --jq .tag_name)
+          new=$(gh api "repos/junhoyeo/tokscale/commits/$tag" --jq .sha)
+          old=$(python3 -c 'import re; print(re.search(r"tokscale\.git\", rev = \"([0-9a-f]{40})", open("crates/token-monitor-core/Cargo.toml").read())[1])')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ "$new" = "$old" ]; then echo "tokscale $tag is already pinned"; exit 0; fi
+          if git ls-remote --exit-code --heads origin "tokscale-$tag" > /dev/null; then echo "PR branch exists"; exit 0; fi
+          python3 - "$old" "$new" <<'EOF'
+          import pathlib, sys
+          old, new = sys.argv[1:]
+          for name in ("crates/token-monitor-core/Cargo.toml", "crates/token-monitor-core/src/usage.rs"):
+              path = pathlib.Path(name)
+              path.write_text(path.read_text().replace(old, new))
+          EOF
+          cargo update -p tokscale-core
+          gh api "repos/junhoyeo/tokscale/compare/$old...$new" --jq '.commits[] | "- " + (.commit.message | split("\n")[0])' > "$RUNNER_TEMP/changes.md"
+          echo "bumped=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build and test
+        if: steps.pin.outputs.bumped == 'true'
+        run: cargo test --workspace
+
+      - name: Open the pull request
+        if: steps.pin.outputs.bumped == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.pin.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "tokscale-$TAG"
+          git commit -am "chore: upgrade tokscale-core to $TAG"
+          git push origin "tokscale-$TAG"
+          {
+            echo "Builds and passes tests on macOS. Before merging, on the Mac:"
+            echo
+            echo '```sh'
+            echo "git fetch origin && git switch tokscale-$TAG && scripts/verify-tokscale-upgrade.py"
+            echo '```'
+            echo
+            echo "It compares the ledger with the installed build on local data and checks AGY against its transcripts."
+            echo
+            echo "## Upstream changes"
+            cat "$RUNNER_TEMP/changes.md"
+          } > "$RUNNER_TEMP/body.md"
+          gh pr create --title "chore: upgrade tokscale-core to $TAG" --body-file "$RUNNER_TEMP/body.md"
