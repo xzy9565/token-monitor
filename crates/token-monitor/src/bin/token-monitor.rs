@@ -33,7 +33,7 @@ const DIM_GREY: Color = Color::Rgb(86, 95, 137);
 #[derive(Debug, Parser)]
 #[command(
     name = "token-monitor",
-    version,
+    version = env!("TM_VERSION"),
     about = "Native terminal token monitor"
 )]
 struct Args {
