@@ -342,7 +342,7 @@ fn parse_cursor_json(content: &str, records: &mut Vec<UsageRecord>, since: Optio
                 input: tu.get("inputTokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0),
                 output: tu.get("outputTokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0),
                 cache_read: tu.get("cacheReadTokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0),
-                cache_write: 0,
+                cache_write: tu.get("cacheWriteTokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0),
                 reasoning: 0,
             }
         } else {
@@ -1448,7 +1448,8 @@ mod tests {
     fn grok_bot_rows_get_their_own_client_and_cursors_charge() {
         let sample = serde_json::json!({
             "usageEventsDisplay": [
-                {"model": "grok-bot-default", "timestamp": "1790289578354", "chargedCents": 19.70219993591309},
+                {"model": "grok-bot-default", "timestamp": "1790289578354", "chargedCents": 19.70219993591309,
+                 "tokenUsage": {"inputTokens": 42412, "cacheWriteTokens": 1280}},
                 {"model": "grok-4.7-xhigh", "timestamp": "1790289578355", "chargedCents": 3.5}
             ]
         })
@@ -1457,6 +1458,7 @@ mod tests {
         parse_cursor_json(&sample, &mut records, None);
         assert_eq!(records[0].client, "grokbot");
         assert_eq!(records[0].reported_cost_micros, Some(197_022));
+        assert_eq!(records[0].tokens.cache_write, 1280);
         assert_eq!(records[1].client, "cursor");
         assert_eq!(records[1].reported_cost_micros, None);
     }
