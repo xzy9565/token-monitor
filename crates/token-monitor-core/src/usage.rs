@@ -949,6 +949,20 @@ fn set_record_time(record: &mut UsageRecord, ms: i64) {
     }
 }
 
+/// The session start tokscale gives every AGY row it could not date: the timestamp most records
+/// share, since a row's own generation time is unique. None when no two records share one.
+fn fallback_timestamp(timestamps: impl Iterator<Item = i64>) -> Option<i64> {
+    let mut counts: HashMap<i64, usize> = HashMap::new();
+    for ts in timestamps {
+        *counts.entry(ts).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .filter(|&(_, n)| n > 1)
+        .max_by_key(|&(ts, n)| (n, std::cmp::Reverse(ts)))
+        .map(|(ts, _)| ts)
+}
+
 /// Dates AGY records from AGY's transcript, and adds the usage that only `agy-dehydrate`'s archive
 /// still holds.
 fn enrich_antigravity_records(records: &mut Vec<UsageRecord>) {
@@ -975,13 +989,21 @@ fn enrich_antigravity_records(records: &mut Vec<UsageRecord>) {
         if record_indices.len() <= 1 {
             continue;
         }
-        // Defensive bypass: only enrich if all records share the exact same fallback timestamp
-        let first_ts = records[record_indices[0]].timestamp;
-        let first_date = records[record_indices[0]].date.clone();
-        let all_identical = record_indices.iter().all(|&i| records[i].timestamp == first_ts);
-        if !all_identical {
+        // Only the records tokscale could not date get re-dated: those all sit on the session's
+        // start. A session that spans an AGY upgrade also has rows dated by their own
+        // generation time (agy <= 1.1.17 wrote one), and skipping it whole left 6baa4b1b's
+        // October usage on 08-30.
+        let Some(first_ts) =
+            fallback_timestamp(record_indices.iter().map(|&i| records[i].timestamp))
+        else {
             continue;
-        }
+        };
+        let first_date = record_indices
+            .iter()
+            .map(|&i| &records[i])
+            .find(|r| r.timestamp == first_ts)
+            .map(|r| r.date.clone())
+            .unwrap_or_default();
 
         let db_path = conv_dir.join(format!("{session_id}.db"));
         if !db_path.exists() {
@@ -1034,6 +1056,9 @@ fn enrich_antigravity_records(records: &mut Vec<UsageRecord>) {
         };
         let Some(lines) = &transcript else {
             for (&r_idx, (_, steps)) in record_indices.iter().zip(&hot) {
+                if records[r_idx].timestamp != first_ts {
+                    continue;
+                }
                 if let Some(ts) = steps.iter().find_map(|s| step_timestamps.get(s).copied()) {
                     set_record_time(&mut records[r_idx], ts);
                 }
@@ -1050,6 +1075,9 @@ fn enrich_antigravity_records(records: &mut Vec<UsageRecord>) {
             .filter_map(|((key, _), ts)| Some((key.as_slice(), ts?)))
             .collect();
         for (&r_idx, (key, _)) in record_indices.iter().zip(&hot) {
+            if records[r_idx].timestamp != first_ts {
+                continue;
+            }
             if let Some(&ts) = dated.get(key.as_slice()) {
                 set_record_time(&mut records[r_idx], ts);
             }
@@ -1257,6 +1285,14 @@ mod tests {
 
         let ms = extract_proto_timestamp_ms(&buf);
         assert_eq!(ms, Some(1788640000500));
+    }
+
+    #[test]
+    fn antigravity_rows_on_the_session_start_are_the_undated_ones() {
+        // Rows from agy <= 1.1.17 carry their own time; later ones all get the session start.
+        assert_eq!(fallback_timestamp([5, 7, 1, 9, 1, 1].into_iter()), Some(1));
+        assert_eq!(fallback_timestamp([1, 1, 1].into_iter()), Some(1));
+        assert_eq!(fallback_timestamp([5, 7, 9].into_iter()), None);
     }
 
     #[test]
