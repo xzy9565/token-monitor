@@ -306,6 +306,8 @@ async fn request_cursor_json(
         .header("Accept", "*/*")
         .header("Accept-Language", "en-US,en;q=0.9")
         .header("Referer", "https://cursor.com/dashboard")
+        // Dashboard POSTs fail without it: "Invalid origin for state-changing request".
+        .header("Origin", "https://cursor.com")
         .header("User-Agent", "Mozilla/5.0 Token-Monitor-Rust")
         .header(
             "Cookie",
@@ -395,6 +397,34 @@ fn cursor_window(
         currency: None,
         resets_at_ms: reset_ms,
         reset_text: reset,
+        estimated: false,
+    })
+}
+
+/// Grok Bot's "Weekly usage limit" from its Usage & Billing page, or None when the plan includes no
+/// Grok Bot usage.
+fn grok_bot_window(status: &Value) -> Option<LimitWindow> {
+    let included = status
+        .get("hasNonZeroIncludedLimit")
+        .and_then(Value::as_bool);
+    if included != Some(true) {
+        return None;
+    }
+    let remaining = cursor_remaining_percent(cursor_number(status.get("usagePercent")))?;
+    let resets_at_ms = status
+        .get("nextResetTimestampUtc")
+        .and_then(Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|date| date.timestamp_millis());
+    Some(LimitWindow {
+        label: "Grok Bot".into(),
+        kind: WindowKind::Weekly,
+        metric: WindowMetric::Quota,
+        remaining_percent: Some(remaining),
+        remaining_amount: None,
+        currency: None,
+        resets_at_ms,
+        reset_text: None,
         estimated: false,
     })
 }
@@ -642,6 +672,54 @@ pub async fn collect_cursor(options: &CollectorOptions) -> Vec<ProviderSnapshot>
                 .push("Cursor Agent blocked by a provider usage gate".into());
         }
         rows.push(provider);
+    }
+    rows
+}
+
+/// Grok Bot is billed through the Cursor plan, so it signs in with Cursor's session. Its weekly
+/// pool is not in usage-summary; only its own dashboard endpoint has it.
+pub async fn collect_grokbot(options: &CollectorOptions) -> Vec<ProviderSnapshot> {
+    if !options.includes("grokbot") {
+        return vec![];
+    }
+    let Ok(client) = http_client(options.timeout()) else {
+        return vec![];
+    };
+    let mut rows = vec![];
+    for (token, label) in cursor_accounts() {
+        let key = account_key("grokbot", &token);
+        let status = match request_cursor_json(
+            &client,
+            "https://cursor.com/api/dashboard/get-sand-usage-status",
+            &token,
+            reqwest::Method::POST,
+        )
+        .await
+        {
+            Ok(status) => status,
+            Err((health, detail)) => {
+                rows.push(unavailable_snapshot(
+                    "grokbot", key, label, "web", health, &detail, 75,
+                ));
+                continue;
+            }
+        };
+        let Some(window) = grok_bot_window(&status) else {
+            continue;
+        };
+        let plan = status
+            .get("cursorPlanName")
+            .and_then(Value::as_str)
+            .unwrap_or("Cursor");
+        rows.push(connected_snapshot(
+            "grokbot",
+            key,
+            label,
+            plan.into(),
+            "web",
+            vec![window],
+            75,
+        ));
     }
     rows
 }
@@ -4922,6 +5000,7 @@ pub async fn collect_live_limits(options: &CollectorOptions) -> Vec<ProviderSnap
         modal,
         vast,
         cursor,
+        grokbot,
         claude,
         codex,
         antigravity,
@@ -4941,6 +5020,7 @@ pub async fn collect_live_limits(options: &CollectorOptions) -> Vec<ProviderSnap
         collect_modal(options),
         collect_vast(options),
         collect_cursor(options),
+        collect_grokbot(options),
         collect_claude(options),
         collect_codex(options),
         collect_antigravity(options),
@@ -4961,6 +5041,7 @@ pub async fn collect_live_limits(options: &CollectorOptions) -> Vec<ProviderSnap
         modal,
         vast,
         cursor,
+        grokbot,
         claude,
         codex,
         antigravity,
@@ -5035,6 +5116,20 @@ mod tests {
         let window = openrouter_credit_window(&value).unwrap();
         assert_eq!(window.remaining_amount, Some(9.97765528));
         assert!((window.remaining_percent.unwrap() - 99.7765528).abs() < 0.000001);
+    }
+
+    #[test]
+    fn grok_bot_weekly_window_reads_sand_usage_status() {
+        let status = serde_json::json!({
+            "nextResetTimestampUtc": "2026-10-15T22:39:38.307Z",
+            "usagePercent": 0.216348,
+            "hasNonZeroIncludedLimit": true
+        });
+        let window = grok_bot_window(&status).unwrap();
+        assert_eq!(window.kind, WindowKind::Weekly);
+        assert!((window.remaining_percent.unwrap() - 99.783652).abs() < 1e-9);
+        assert_eq!(window.resets_at_ms, Some(1_792_103_978_307));
+        assert!(grok_bot_window(&serde_json::json!({"usagePercent": 5.0})).is_none());
     }
 
     #[test]

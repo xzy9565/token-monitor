@@ -3595,7 +3595,7 @@ fn provider_brand_color(provider_id: &str) -> Color {
         "antigravity" | "google" => Color::Rgb(66, 133, 244),   // Google Azure #4285F4
         "cursor" => Color::Rgb(0, 180, 216),                   // Cursor Cyan #00B4D8
         "commandcode" => Color::Rgb(245, 175, 45),              // Command Code Gold #F5AF2D
-        "grok" | "xai" => Color::Rgb(210, 215, 225),            // xAI Silver #D2D7E1
+        "grok" | "grokbot" | "xai" => Color::Rgb(210, 215, 225),            // xAI Silver #D2D7E1
         "modal" => Color::Rgb(0, 210, 106),                     // Modal Emerald #00D26A
         "openrouter" => Color::Rgb(140, 100, 255),              // OpenRouter Royal Violet #7624F4
         "vast" | "vastai" => Color::Rgb(255, 140, 50),          // Vast.ai Sunset Orange #FF8C32
