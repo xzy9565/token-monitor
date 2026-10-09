@@ -201,14 +201,29 @@ impl Storage {
         let payload = serde_json::to_string(snapshot)
             .map_err(|error| format!("encode usage snapshot: {error}"))?;
         let digest = sha256(payload.as_bytes());
-        let inserted = self
+        // Only the newest snapshot is ever read (the TUI's startup cache), so the older ones go.
+        // Kept, they grew this table to 6.9 GB in a month: `processing_time_ms` alone makes every
+        // payload unique, so the hash never skipped one.
+        let transaction = self
             .connection
+            .unchecked_transaction()
+            .map_err(|error| format!("begin usage snapshot transaction: {error}"))?;
+        let inserted = transaction
             .execute(
                 "INSERT OR IGNORE INTO usage_snapshots(collected_at_ms, payload_json, payload_sha256)
                  VALUES (?1, ?2, ?3)",
                 params![collected_at_ms, payload, digest],
             )
             .map_err(|error| format!("store usage snapshot: {error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM usage_snapshots WHERE payload_sha256 != ?1",
+                params![digest],
+            )
+            .map_err(|error| format!("drop older usage snapshots: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit usage snapshot: {error}"))?;
         Ok(inserted > 0)
     }
 
@@ -419,7 +434,22 @@ mod tests {
         };
         assert!(storage.save_usage_snapshot(&snapshot, 1).unwrap());
         assert!(!storage.save_usage_snapshot(&snapshot, 2).unwrap());
-        assert_eq!(storage.latest_usage_snapshot().unwrap(), Some(snapshot));
+        assert_eq!(
+            storage.latest_usage_snapshot().unwrap(),
+            Some(snapshot.clone())
+        );
+        // A newer snapshot replaces the old one instead of piling up beside it.
+        let newer = UsageSnapshot {
+            processing_time_ms: 2,
+            ..snapshot
+        };
+        assert!(storage.save_usage_snapshot(&newer, 3).unwrap());
+        let rows: i64 = storage
+            .connection
+            .query_row("SELECT count(*) FROM usage_snapshots", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(storage.latest_usage_snapshot().unwrap(), Some(newer));
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
         let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
