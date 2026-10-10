@@ -6,6 +6,7 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.80+-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![Ratatui](https://img.shields.io/badge/Ratatui-0.29-blue.svg?style=flat-square)](https://ratatui.rs)
+[![Mentioned in Awesome Ratatui](https://awesome.re/mentioned-badge.svg)](https://github.com/ratatui/awesome-ratatui)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](./LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-black.svg?style=flat-square)](https://github.com/xzy9565/token-monitor)
 
