@@ -39,12 +39,13 @@ This causes **Subscription Fragmentation**:
 
 ## ⚡ Key Features
 
-### 🔥 1. "Burn-First" Rate-Limit Scheduler
-Instead of just reporting static numbers, `token-monitor` ranks subscriptions by urgency:
-- Compares rolling session deadlines (e.g. 5h window) against durable weekly cycle resets (7d).
-- Factors in remaining headroom and time-to-reset.
-- Suggests exactly which model or subscription you should burn first before its quota expires.
-- Automatically demotes exhausted accounts to the bottom of the stack.
+### 🔥 1. "Burn-First" Rate-Limit Scheduler & Quota Governor
+Instead of just reporting static numbers, `token-monitor` acts as an active resource governor that ranks subscriptions by urgency:
+- **Urgency-Ranked Burn Sequence**: Compares rolling session deadlines (5h) against durable weekly cycle resets (7d) and suggests which quota to burn first before it resets unused.
+- **Banked Reset Credits Radar**: Discovers banked OpenAI Codex rate-limit reset credits, tracks individual expiration countdowns (e.g., `expires in 1d 8h`), and alerts you to full-reset availability before tokens expire.
+- **Session-Capped Cooldown Demotion**: Distinguishes between short 5-hour rolling limits and 7-day ceilings. Accounts on 5-hour cooldown are dynamically deprioritized below active ones—ensuring the top suggestion is always immediately usable right now.
+- **Dual-Track & Gatekeeper Detection**: Separates in-house models (Cursor Auto models, Grok Bot sandbox) from third-party API allowance pools ($20 cap), while inspecting local IDE logs to detect silent agent limit blocks.
+- **Zero-Config Local Daemon Discovery**: Auto-detects running agents (e.g., Antigravity) via OS process inspection without manual API keys, isolating Gemini quota from Claude/GPT pools, with seamless multi-account tracking.
 
 ### 📊 2. Actuarial Local Token Ledger
 Press `2` (or `t`) to switch to the full-featured accounting ledger:
@@ -133,10 +134,10 @@ Run the compiled binary directly:
 | Provider / Service | Type | Collected Metrics |
 |:---|:---:|:---|
 | **Claude** | Subscription / Web | 5h session window, 7d cycle ceiling, minor-units credit balance |
-| **Cursor** | Subscription / Agent | Fast/Pro requests, agent limits, cycle reset deadlines |
+| **Cursor** | Subscription / Agent | In-house Auto pool vs $20 API model cap, Grok Bot sandbox pool, local agent gatekeeper detection |
 | **Command Code** | Subscription | Go plan limits, 5h / 7d rolling windows |
-| **Codex (ChatGPT)** | Subscription | Plus/Team 5h window, 7d weekly quota |
-| **Antigravity CLI** | Multi-Pool | Gemini Flash/Pro pool + Claude/GPT pool via local server discovery |
+| **Codex (ChatGPT)** | Subscription | Plus/Team 5h window, 7d weekly ceiling, banked reset credits & expiration countdowns |
+| **Antigravity CLI** | Multi-Pool | Gemini Flash/Pro + Claude/GPT pool split, zero-config daemon discovery, multi-account support |
 | **Grok (SuperGrok)** | Subscription | SuperGrok remaining quota percentages |
 | **GitHub Copilot** | Subscription | Premium entitlement and remaining usage |
 | **Modal** | Cloud Credit | Profile allowance ($30/mo), compute spend, cycle resets |
@@ -162,7 +163,7 @@ token-monitor/
 │       ├── pricing.rs          # Model pricing catalog & token cost evaluation
 │       ├── usage.rs            # Actuarial JSONL/SQLite log aggregation engine
 │       └── storage.rs          # Idempotent local SQLite snapshot store
-└── tests/                      # 67+ comprehensive automated regression tests
+└── tests/                      # 88+ comprehensive automated regression tests
 ```
 
 ---
