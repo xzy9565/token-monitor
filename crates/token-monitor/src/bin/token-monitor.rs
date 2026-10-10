@@ -5103,10 +5103,15 @@ fn modal_lines(modal: &DetailModal, width: u16) -> Vec<Line<'static>> {
                 for d in &p.diagnostics {
                     if d.contains("rate limit reset credit") || (d.contains("reset credit") && !d.starts_with("Credit #")) || (d.contains("★") && !d.starts_with("Credit #")) {
                         let clean = d.trim_start_matches('★').trim();
+                        let avail_note = if p.provider_id.eq_ignore_ascii_case("claude") {
+                            "  (Available in Claude Web / Claude Code to reset quota immediately)"
+                        } else {
+                            "  (Available in ChatGPT Web / Codex to reset quota immediately)"
+                        };
                         lines.push(Line::from(vec![
                             Span::styled("  ★ ", Style::default().fg(Color::Rgb(245, 175, 45)).add_modifier(Modifier::BOLD)),
                             Span::styled(clean.to_string(), Style::default().fg(Color::Rgb(245, 175, 45)).add_modifier(Modifier::BOLD)),
-                            Span::styled("  (Available in ChatGPT Web / Codex to reset quota immediately)", Style::default().fg(GREY)),
+                            Span::styled(avail_note, Style::default().fg(GREY)),
                         ]));
                     } else if d.starts_with("Credit #") {
                         lines.push(Line::from(vec![

@@ -1038,7 +1038,7 @@ async fn collect_claude_web(
     ))?;
     let usage = request_cookie_json(
         &client,
-        &format!("https://claude.ai/api/organizations/{organization_id}/usage"),
+        &format!("https://claude.ai/api/organizations/{organization_id}/usage?cedar_ember=1"),
         cookie,
     )
     .await?;
@@ -1092,7 +1092,7 @@ async fn collect_claude_web(
             "Claude web response has no quota windows".into(),
         ));
     }
-    Ok(connected_snapshot(
+    let mut snapshot = connected_snapshot(
         "claude",
         account_key("claude-web", &organization_id),
         email.into(),
@@ -1100,7 +1100,9 @@ async fn collect_claude_web(
         "web",
         windows,
         209,
-    ))
+    );
+    snapshot.diagnostics = parse_claude_reset_credits(&usage, chrono::Utc::now());
+    Ok(snapshot)
 }
 
 pub async fn collect_claude(options: &CollectorOptions) -> Vec<ProviderSnapshot> {
@@ -1155,9 +1157,12 @@ pub async fn collect_claude(options: &CollectorOptions) -> Vec<ProviderSnapshot>
     let (usage_result, profile_result) = tokio::join!(
         request_bearer_json(
             &client,
-            "https://api.anthropic.com/api/oauth/usage",
+            "https://api.anthropic.com/api/oauth/usage?cedar_ember=1",
             &token,
-            &[("anthropic-beta", "oauth-2025-04-20")]
+            &[
+                ("anthropic-beta", "oauth-2025-04-20"),
+                ("User-Agent", "claude-cli/2.1.280 (external, cli)"),
+            ]
         ),
         request_bearer_json(
             &client,
@@ -1210,7 +1215,7 @@ pub async fn collect_claude(options: &CollectorOptions) -> Vec<ProviderSnapshot>
         .or_else(|| account.get("subscription_type"))
         .and_then(Value::as_str)
         .unwrap_or("Claude");
-    vec![connected_snapshot(
+    let mut snapshot = connected_snapshot(
         "claude",
         account_key("claude", &token),
         email.into(),
@@ -1218,7 +1223,9 @@ pub async fn collect_claude(options: &CollectorOptions) -> Vec<ProviderSnapshot>
         "oauth",
         windows,
         209,
-    )]
+    );
+    snapshot.diagnostics = parse_claude_reset_credits(&usage, chrono::Utc::now());
+    vec![snapshot]
 }
 
 fn openrouter_key_window(data: &Value) -> Option<LimitWindow> {
@@ -2037,6 +2044,149 @@ fn parse_codex_reset_credits(
                 .unwrap_or_default();
             diagnostics.push(format!("Credit #{num}: available{title_part}"));
         }
+    }
+
+    diagnostics
+}
+
+fn parse_claude_reset_credits(
+    usage_payload: &Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let block = match usage_payload.get("cedar_ember") {
+        Some(b) if b.is_object() => b,
+        _ => return vec![],
+    };
+
+    let grants = match block.get("grants").and_then(Value::as_array) {
+        Some(arr) => arr,
+        None => return vec![],
+    };
+
+    struct ClaudeGrant {
+        label: Option<String>,
+        ends_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+        clears: Vec<String>,
+        usable_now: Option<bool>,
+        use_requires_limit: Option<bool>,
+        paused: bool,
+    }
+
+    let mut valid_grants = Vec::new();
+    let mut total_resets = 0i64;
+
+    for g in grants {
+        let resets_left = g
+            .get("resets_left")
+            .or_else(|| g.get("resetsLeft"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if resets_left <= 0 {
+            continue;
+        }
+
+        let ends_at = g
+            .get("ends_at")
+            .or_else(|| g.get("endsAt"))
+            .and_then(Value::as_str)
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok());
+
+        if let Some(exp) = ends_at {
+            if exp.timestamp() <= now.timestamp() {
+                continue;
+            }
+        }
+
+        let label = g.get("label").and_then(Value::as_str).map(str::to_owned);
+        let paused = g.get("paused").and_then(Value::as_bool).unwrap_or(false);
+        let usable_now = g
+            .get("usable_now")
+            .or_else(|| g.get("usableNow"))
+            .and_then(Value::as_bool);
+        let use_requires_limit = g
+            .get("use_requires_limit")
+            .or_else(|| g.get("useRequiresLimit"))
+            .and_then(Value::as_bool);
+
+        let clears = g
+            .get("clears")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(|k| match k {
+                        "five_hour" | "session" => "Session (5h)".to_string(),
+                        "seven_day" | "weekly" => "Weekly (7d)".to_string(),
+                        other => other.replace('_', " "),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        total_resets += resets_left;
+        valid_grants.push(ClaudeGrant {
+            label,
+            ends_at,
+            clears,
+            usable_now,
+            use_requires_limit,
+            paused,
+        });
+    }
+
+    if total_resets <= 0 || valid_grants.is_empty() {
+        return vec![];
+    }
+
+    valid_grants.sort_by_key(|g| g.ends_at);
+
+    let mut diagnostics = Vec::new();
+    let s = if total_resets > 1 { "s" } else { "" };
+    let earliest_exp = valid_grants.iter().filter_map(|g| g.ends_at).next();
+
+    if let Some(exp) = earliest_exp {
+        let diff_sec = (exp.timestamp() - now.timestamp()).max(0);
+        let cd = format_countdown(diff_sec);
+        let date_str = exp.format("%b %-d").to_string();
+        let qualifier = if total_resets > 1 { "earliest " } else { "" };
+        diagnostics.push(format!(
+            "★ {total_resets} rate limit reset credit{s} available ({qualifier}expires in {cd} · {date_str})"
+        ));
+    } else {
+        diagnostics.push(format!("★ {total_resets} rate limit reset credit{s} available"));
+    }
+
+    for (idx, grant) in valid_grants.iter().enumerate() {
+        let num = idx + 1;
+        let mut parts = Vec::new();
+        if let Some(exp) = grant.ends_at {
+            let diff_sec = (exp.timestamp() - now.timestamp()).max(0);
+            let cd = format_countdown(diff_sec);
+            let full_date = exp.format("%Y-%m-%d %H:%M UTC").to_string();
+            parts.push(format!("expires in {cd} ({full_date})"));
+        } else if grant.paused {
+            parts.push("paused".to_string());
+        } else {
+            parts.push("available".to_string());
+        }
+
+        if !grant.clears.is_empty() {
+            parts.push(format!("clears: {}", grant.clears.join(" · ")));
+        }
+
+        if grant.use_requires_limit == Some(true) {
+            parts.push("usable at limit only".to_string());
+        } else if grant.usable_now == Some(false) {
+            parts.push("not usable right now".to_string());
+        }
+
+        let desc = parts.join(" · ");
+        let title_part = grant
+            .label
+            .as_deref()
+            .map(|t| format!(" — {t}"))
+            .unwrap_or_default();
+        diagnostics.push(format!("Credit #{num}: {desc}{title_part}"));
     }
 
     diagnostics
@@ -5494,5 +5644,59 @@ mod tests {
         let diags = parse_codex_reset_credits(&usage, None, now);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0], "★ 1 rate limit reset credit available");
+    }
+
+    #[test]
+    fn claude_reset_credits_surfaces_expiration_countdown_and_breakdown() {
+        let usage = serde_json::json!({
+            "cedar_ember": {
+                "grants": [
+                    {
+                        "id": "grant_opus_launch",
+                        "label": "Claude Opus 5.5 Launch: one usage-limit reset for Pro and Max",
+                        "resets_left": 1,
+                        "resets_total": 1,
+                        "starts_at": "2026-10-10T12:00:00Z",
+                        "ends_at": "2026-10-22T16:00:00Z",
+                        "clears": ["session", "weekly"],
+                        "usable_now": true,
+                        "use_requires_limit": false,
+                        "paused": false
+                    }
+                ]
+            }
+        });
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-10T16:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let diags = parse_claude_reset_credits(&usage, now);
+        assert_eq!(diags.len(), 2);
+        assert!(diags[0].contains("★ 1 rate limit reset credit available (expires in 12d 0h · Oct 22)"));
+        assert!(diags[1].contains("Credit #1: expires in 12d 0h (2026-10-22 16:00 UTC) · clears: Session (5h) · Weekly (7d) — Claude Opus 5.5 Launch: one usage-limit reset for Pro and Max"));
+    }
+
+    #[test]
+    fn claude_reset_credits_ignores_expired_and_spent_grants() {
+        let usage = serde_json::json!({
+            "cedar_ember": {
+                "grants": [
+                    {
+                        "id": "g1",
+                        "resets_left": 0,
+                        "ends_at": "2026-10-22T16:00:00Z"
+                    },
+                    {
+                        "id": "g2",
+                        "resets_left": 1,
+                        "ends_at": "2026-10-01T00:00:00Z"
+                    }
+                ]
+            }
+        });
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-10T16:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let diags = parse_claude_reset_credits(&usage, now);
+        assert!(diags.is_empty());
     }
 }
