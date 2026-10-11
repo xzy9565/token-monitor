@@ -299,6 +299,22 @@ fn parse_cursor_json(content: &str, records: &mut Vec<UsageRecord>, since: Optio
         return;
     };
 
+    // Pre-scan: Identify conversation IDs that belong to Grok Bot.
+    // Any session containing "grok-bot-*" models is an agent conversation on the Sand cloud machine.
+    let mut grok_bot_sessions = std::collections::HashSet::new();
+    for event in events {
+        if let Some(m) = event.get("model").and_then(|v| v.as_str()) {
+            if m.starts_with("grok-bot") {
+                if let Some(cid) = event.get("conversationId").and_then(|v| v.as_str()) {
+                    let trimmed = cid.trim();
+                    if !trimmed.is_empty() {
+                        grok_bot_sessions.insert(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     for event in events {
         let model = event
             .get("model")
@@ -330,12 +346,16 @@ fn parse_cursor_json(content: &str, records: &mut Vec<UsageRecord>, since: Optio
 
         let provider_id = infer_cursor_model_provider(model).to_string();
 
-        let session_id = event
+        let raw_cid = event
             .get("conversationId")
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| format!("cursor-{}", s))
-            .unwrap_or_else(|| format!("cursor-{}", timestamp));
+            .unwrap_or("")
+            .trim();
+        let session_id = if !raw_cid.is_empty() {
+            format!("cursor-{}", raw_cid)
+        } else {
+            format!("cursor-{}", timestamp)
+        };
 
         let tokens = if let Some(tu) = event.get("tokenUsage").and_then(|u| u.as_object()) {
             UsageTokens {
@@ -349,14 +369,19 @@ fn parse_cursor_json(content: &str, records: &mut Vec<UsageRecord>, since: Optio
             UsageTokens::default()
         };
 
-        // Grok Bot has its own weekly pool, so it gets its own ledger row, priced by Cursor's charge.
-        let grok_bot = model.starts_with("grok-bot");
-        let reported_cost_micros = grok_bot
+        // Grok Bot has its own weekly pool, so it gets its own ledger row.
+        // Attribute to grokbot if the model is a grok-bot task type OR if the conversation belongs to Grok Bot.
+        let is_grok_bot = model.starts_with("grok-bot")
+            || (!raw_cid.is_empty() && grok_bot_sessions.contains(raw_cid));
+
+        let reported_cost_micros = model
+            .starts_with("grok-bot")
             .then(|| event.get("chargedCents").and_then(|v| v.as_f64()))
             .flatten()
             .map(|cents| (cents * 10_000.0).round() as i64);
+
         records.push(UsageRecord {
-            client: if grok_bot { "grokbot" } else { "cursor" }.into(),
+            client: if is_grok_bot { "grokbot" } else { "cursor" }.into(),
             model_id: model.to_string(),
             provider_id,
             session_id,
@@ -1461,6 +1486,38 @@ mod tests {
         assert_eq!(records[0].tokens.cache_write, 1280);
         assert_eq!(records[1].client, "cursor");
         assert_eq!(records[1].reported_cost_micros, None);
+    }
+
+    #[test]
+    fn grok_bot_session_aware_attribution_for_auxiliary_models() {
+        let sample = serde_json::json!({
+            "usageEventsDisplay": [
+                {
+                    "conversationId": "grok-session-1",
+                    "model": "grok-bot-default",
+                    "timestamp": "1790289578354",
+                    "chargedCents": 19.70219993591309
+                },
+                {
+                    "conversationId": "grok-session-1",
+                    "model": "gemini-2.5-flash",
+                    "timestamp": "1790289578355",
+                    "chargedCents": 5.8
+                },
+                {
+                    "conversationId": "cursor-local-session-2",
+                    "model": "gemini-2.5-flash",
+                    "timestamp": "1790289578356",
+                    "chargedCents": 5.8
+                }
+            ]
+        })
+        .to_string();
+        let mut records = Vec::new();
+        parse_cursor_json(&sample, &mut records, None);
+        assert_eq!(records[0].client, "grokbot");
+        assert_eq!(records[1].client, "grokbot");
+        assert_eq!(records[2].client, "cursor");
     }
 
     #[test]
