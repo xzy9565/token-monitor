@@ -424,6 +424,7 @@ impl App {
     fn set_consumption(&mut self, report: usage::ConsumptionReport) {
         self.cached_ledger = Some(CachedLedger::from_report(&report));
         self.consumption = Some(report);
+        self.refresh_active_modal();
     }
 
     fn open_limits_detail(&mut self) {
@@ -449,6 +450,238 @@ impl App {
         }
     }
 
+    fn compute_window_detail(
+        report: &usage::ConsumptionReport,
+        target_win: LedgerWindow,
+    ) -> (
+        usize,
+        usage::UsageTokens,
+        f64,
+        Vec<WindowClientItem>,
+        Vec<(String, String, i64, f64, usize)>,
+    ) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let today_str = local_today_str();
+        let mut win_tokens = usage::UsageTokens::default();
+        let mut win_records = 0;
+        let mut win_usd = 0.0;
+        let mut client_map: HashMap<String, (i64, f64, usize, HashMap<String, (i64, f64, usize)>)> = HashMap::new();
+        let mut model_map: HashMap<String, (i64, f64, usize, HashMap<String, usize>)> = HashMap::new();
+        let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
+
+        for (idx, rec) in report.snapshot.records.iter().enumerate() {
+            if !record_in_window(rec, target_win, now_ms, &today_str) {
+                continue;
+            }
+            win_records += 1;
+            win_tokens.add_assign(&rec.tokens);
+            let val = report.quotes.as_ref().and_then(|q| q.get(idx)).and_then(|q| q.value_usd).unwrap_or_else(|| pricing.quote(rec).value_usd.unwrap_or(0.0));
+            win_usd += val;
+            let c_norm = normalize_client_id(&rec.client);
+            let c_entry = client_map.entry(c_norm.clone()).or_insert_with(|| (0, 0.0, 0, HashMap::new()));
+            c_entry.0 += rec.tokens.reported_total_without_reasoning();
+            c_entry.1 += val;
+            c_entry.2 += 1;
+            let sub_m = c_entry.3.entry(rec.model_id.clone()).or_insert((0, 0.0, 0));
+            sub_m.0 += rec.tokens.reported_total_without_reasoning();
+            sub_m.1 += val;
+            sub_m.2 += 1;
+
+            let m_entry = model_map.entry(rec.model_id.clone()).or_insert_with(|| (0, 0.0, 0, HashMap::new()));
+            m_entry.0 += rec.tokens.reported_total_without_reasoning();
+            m_entry.1 += val;
+            m_entry.2 += 1;
+            *m_entry.3.entry(c_norm).or_insert(0) += 1;
+        }
+
+        let mut c_vec: Vec<WindowClientItem> = client_map.into_iter().map(|(c, (t, u, n, sub_map))| {
+            let mut sub_vec: Vec<(String, i64, f64, usize)> = sub_map.into_iter().map(|(m, (st, su, sn))| (m, st, su, sn)).collect();
+            sub_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
+            WindowClientItem {
+                client: c,
+                tokens: t,
+                api_usd: u,
+                calls: n,
+                models: sub_vec,
+            }
+        }).collect();
+        c_vec.sort_by_key(|a| std::cmp::Reverse(a.tokens));
+
+        let mut m_vec: Vec<(String, String, i64, f64, usize)> = model_map.into_iter().map(|(m, (t, u, n, c_map))| {
+            let mut c_list: Vec<(String, usize)> = c_map.into_iter().collect();
+            c_list.sort_by_key(|a| std::cmp::Reverse(a.1));
+            let c_str = c_list.into_iter().map(|(c, _)| c).collect::<Vec<_>>().join(", ");
+            (m, c_str, t, u, n)
+        }).collect();
+        m_vec.sort_by_key(|a| std::cmp::Reverse(a.2));
+
+        (win_records, win_tokens, win_usd, c_vec, m_vec)
+    }
+
+    fn compute_client_detail(
+        report: &usage::ConsumptionReport,
+        target_client: &str,
+        cur_window: LedgerWindow,
+        metric: ConsumptionMetric,
+        query: &str,
+    ) -> (usize, usage::UsageTokens, f64, Vec<(String, i64, f64, usize)>) {
+        let rows = consumption_rows(report, metric, cur_window, query);
+        let (records, tokens, api_usd) = if let Some(row) = rows.iter().find(|r| r.client == target_client) {
+            (row.records, row.tokens.clone(), row.api_value_usd)
+        } else {
+            let unqueried_rows = consumption_rows(report, metric, cur_window, "");
+            if let Some(row) = unqueried_rows.iter().find(|r| r.client == target_client) {
+                (row.records, row.tokens.clone(), row.api_value_usd)
+            } else {
+                (0, usage::UsageTokens::default(), 0.0)
+            }
+        };
+
+        let mut client_models: std::collections::HashMap<String, (i64, f64, usize)> = std::collections::HashMap::new();
+        let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let today_str = local_today_str();
+
+        for (idx, rec) in report.snapshot.records.iter().enumerate() {
+            if !record_in_window(rec, cur_window, now_ms, &today_str) {
+                continue;
+            }
+            if normalize_client_id(&rec.client) == target_client {
+                let entry = client_models.entry(rec.model_id.clone()).or_insert((0, 0.0, 0));
+                entry.0 += rec.tokens.reported_total_without_reasoning();
+                let val = report.quotes.as_ref().and_then(|q| q.get(idx)).and_then(|q| q.value_usd).unwrap_or_else(|| pricing.quote(rec).value_usd.unwrap_or(0.0));
+                entry.1 += val;
+                entry.2 += 1;
+            }
+        }
+        let mut models_vec: Vec<(String, i64, f64, usize)> = client_models.into_iter().map(|(m, (t, u, c))| (m, t, u, c)).collect();
+        models_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
+
+        (records, tokens, api_usd, models_vec)
+    }
+
+    fn compute_model_detail(
+        report: &usage::ConsumptionReport,
+        target_model: &str,
+        cur_window: LedgerWindow,
+        metric: ConsumptionMetric,
+        query: &str,
+    ) -> (usize, usage::UsageTokens, f64, Vec<(String, i64, f64, usize)>) {
+        let m_rows = model_consumption_rows(report, metric, cur_window, query);
+        let (records, tokens, api_usd) = if let Some(m_row) = m_rows.iter().find(|r| r.model == target_model) {
+            (m_row.records, m_row.tokens.clone(), m_row.api_value_usd)
+        } else {
+            let unqueried_m_rows = model_consumption_rows(report, metric, cur_window, "");
+            if let Some(m_row) = unqueried_m_rows.iter().find(|r| r.model == target_model) {
+                (m_row.records, m_row.tokens.clone(), m_row.api_value_usd)
+            } else {
+                (0, usage::UsageTokens::default(), 0.0)
+            }
+        };
+
+        let mut model_clients: std::collections::HashMap<String, (i64, f64, usize)> = std::collections::HashMap::new();
+        let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let today_str = local_today_str();
+
+        for (idx, rec) in report.snapshot.records.iter().enumerate() {
+            if !record_in_window(rec, cur_window, now_ms, &today_str) {
+                continue;
+            }
+            if rec.model_id == target_model {
+                let c_norm = normalize_client_id(&rec.client);
+                let entry = model_clients.entry(c_norm).or_insert((0, 0.0, 0));
+                entry.0 += rec.tokens.reported_total_without_reasoning();
+                let val = report.quotes.as_ref().and_then(|q| q.get(idx)).and_then(|q| q.value_usd).unwrap_or_else(|| pricing.quote(rec).value_usd.unwrap_or(0.0));
+                entry.1 += val;
+                entry.2 += 1;
+            }
+        }
+        let mut clients_vec: Vec<(String, i64, f64, usize)> = model_clients.into_iter().map(|(c, (t, u, k))| (c, t, u, k)).collect();
+        clients_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
+
+        (records, tokens, api_usd, clients_vec)
+    }
+
+    fn refresh_active_modal(&mut self) {
+        match &mut self.modal {
+            DetailModal::None => {}
+            DetailModal::LimitsProvider(p) => {
+                if let Some(updated) = self
+                    .providers
+                    .iter()
+                    .find(|pr| {
+                        pr.provider_id == p.provider_id
+                            && (pr.account_key == p.account_key
+                                || (p.account_key.is_empty() && pr.account_label == p.account_label))
+                    })
+                    .cloned()
+                {
+                    *p = Box::new(updated);
+                }
+            }
+            DetailModal::ConsumptionWindow {
+                window,
+                records,
+                tokens,
+                api_usd,
+                clients,
+                models,
+            } => {
+                let Some(report) = &self.consumption else { return; };
+                let (win_records, win_tokens, win_usd, c_vec, m_vec) =
+                    Self::compute_window_detail(report, *window);
+                *records = win_records;
+                *tokens = win_tokens;
+                *api_usd = win_usd;
+                *clients = c_vec;
+                *models = m_vec;
+            }
+            DetailModal::ConsumptionClient {
+                client,
+                window,
+                records,
+                tokens,
+                api_usd,
+                models,
+            } => {
+                let Some(report) = &self.consumption else { return; };
+                let (r_records, r_tokens, r_usd, m_vec) = Self::compute_client_detail(
+                    report,
+                    client,
+                    *window,
+                    self.consumption_metric,
+                    &self.search_query,
+                );
+                *records = r_records;
+                *tokens = r_tokens;
+                *api_usd = r_usd;
+                *models = m_vec;
+            }
+            DetailModal::ConsumptionModel {
+                model,
+                window,
+                records,
+                tokens,
+                api_usd,
+                clients,
+            } => {
+                let Some(report) = &self.consumption else { return; };
+                let (r_records, r_tokens, r_usd, c_vec) = Self::compute_model_detail(
+                    report,
+                    model,
+                    *window,
+                    self.consumption_metric,
+                    &self.search_query,
+                );
+                *records = r_records;
+                *tokens = r_tokens;
+                *api_usd = r_usd;
+                *clients = c_vec;
+            }
+        }
+    }
+
     fn open_consumption_detail(&mut self) {
         let Some(report) = &self.consumption else { return; };
         let cur_window = self.ledger_window;
@@ -460,66 +693,10 @@ impl App {
         let sel = self.consumption_selected.min(total_selectable - 1);
 
         if sel == 0 {
-            let target_win = cur_window;
-
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let today_str = local_today_str();
-            let mut win_tokens = usage::UsageTokens::default();
-            let mut win_records = 0;
-            let mut win_usd = 0.0;
-            let mut client_map: HashMap<String, (i64, f64, usize, HashMap<String, (i64, f64, usize)>)> = HashMap::new();
-            let mut model_map: HashMap<String, (i64, f64, usize, HashMap<String, usize>)> = HashMap::new();
-            let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
-
-            for (idx, rec) in report.snapshot.records.iter().enumerate() {
-                if !record_in_window(rec, target_win, now_ms, &today_str) {
-                    continue;
-                }
-                win_records += 1;
-                win_tokens.add_assign(&rec.tokens);
-                let val = report.quotes.as_ref().and_then(|q| q.get(idx)).and_then(|q| q.value_usd).unwrap_or_else(|| pricing.quote(rec).value_usd.unwrap_or(0.0));
-                win_usd += val;
-                let c_norm = normalize_client_id(&rec.client);
-                let c_entry = client_map.entry(c_norm.clone()).or_insert_with(|| (0, 0.0, 0, HashMap::new()));
-                c_entry.0 += rec.tokens.reported_total_without_reasoning();
-                c_entry.1 += val;
-                c_entry.2 += 1;
-                let sub_m = c_entry.3.entry(rec.model_id.clone()).or_insert((0, 0.0, 0));
-                sub_m.0 += rec.tokens.reported_total_without_reasoning();
-                sub_m.1 += val;
-                sub_m.2 += 1;
-
-                let m_entry = model_map.entry(rec.model_id.clone()).or_insert_with(|| (0, 0.0, 0, HashMap::new()));
-                m_entry.0 += rec.tokens.reported_total_without_reasoning();
-                m_entry.1 += val;
-                m_entry.2 += 1;
-                *m_entry.3.entry(c_norm).or_insert(0) += 1;
-            }
-
-            let mut c_vec: Vec<WindowClientItem> = client_map.into_iter().map(|(c, (t, u, n, sub_map))| {
-                let mut sub_vec: Vec<(String, i64, f64, usize)> = sub_map.into_iter().map(|(m, (st, su, sn))| (m, st, su, sn)).collect();
-                sub_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
-                WindowClientItem {
-                    client: c,
-                    tokens: t,
-                    api_usd: u,
-                    calls: n,
-                    models: sub_vec,
-                }
-            }).collect();
-            c_vec.sort_by_key(|a| std::cmp::Reverse(a.tokens));
-
-            let mut m_vec: Vec<(String, String, i64, f64, usize)> = model_map.into_iter().map(|(m, (t, u, n, c_map))| {
-                let mut c_list: Vec<(String, usize)> = c_map.into_iter().collect();
-                c_list.sort_by_key(|a| std::cmp::Reverse(a.1));
-                let c_str = c_list.into_iter().map(|(c, _)| c).collect::<Vec<_>>().join(", ");
-                (m, c_str, t, u, n)
-            }).collect();
-            m_vec.sort_by_key(|a| std::cmp::Reverse(a.2));
-
+            let (win_records, win_tokens, win_usd, c_vec, m_vec) = Self::compute_window_detail(report, cur_window);
             self.modal_scroll = 0;
             self.modal = DetailModal::ConsumptionWindow {
-                window: target_win,
+                window: cur_window,
                 records: win_records,
                 tokens: win_tokens,
                 api_usd: win_usd,
@@ -530,67 +707,40 @@ impl App {
             let row_idx = sel - num_windows;
             let row = &rows[row_idx];
             let target_client = row.client.clone();
-            let mut client_models: std::collections::HashMap<String, (i64, f64, usize)> = std::collections::HashMap::new();
-            let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let today_str = local_today_str();
-
-            for (idx, rec) in report.snapshot.records.iter().enumerate() {
-                if !record_in_window(rec, cur_window, now_ms, &today_str) {
-                    continue;
-                }
-                if normalize_client_id(&rec.client) == target_client {
-                    let entry = client_models.entry(rec.model_id.clone()).or_insert((0, 0.0, 0));
-                    entry.0 += rec.tokens.reported_total_without_reasoning();
-                    let val = report.quotes.as_ref().and_then(|q| q.get(idx)).and_then(|q| q.value_usd).unwrap_or_else(|| pricing.quote(rec).value_usd.unwrap_or(0.0));
-                    entry.1 += val;
-                    entry.2 += 1;
-                }
-            }
-            let mut models_vec: Vec<(String, i64, f64, usize)> = client_models.into_iter().map(|(m, (t, u, c))| (m, t, u, c)).collect();
-            models_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
-
+            let (r_records, r_tokens, r_usd, models_vec) = Self::compute_client_detail(
+                report,
+                &target_client,
+                cur_window,
+                self.consumption_metric,
+                &self.search_query,
+            );
             self.modal_scroll = 0;
             self.modal = DetailModal::ConsumptionClient {
                 client: target_client,
                 window: cur_window,
-                records: row.records,
-                tokens: row.tokens.clone(),
-                api_usd: row.api_value_usd,
+                records: r_records,
+                tokens: r_tokens,
+                api_usd: r_usd,
                 models: models_vec,
             };
         } else {
             let m_idx = sel - num_windows - rows.len();
             let m_row = &m_rows[m_idx];
             let target_model = m_row.model.clone();
-            let mut model_clients: std::collections::HashMap<String, (i64, f64, usize)> = std::collections::HashMap::new();
-            let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let today_str = local_today_str();
-
-            for (idx, rec) in report.snapshot.records.iter().enumerate() {
-                if !record_in_window(rec, cur_window, now_ms, &today_str) {
-                    continue;
-                }
-                if rec.model_id == target_model {
-                    let c_norm = normalize_client_id(&rec.client);
-                    let entry = model_clients.entry(c_norm).or_insert((0, 0.0, 0));
-                    entry.0 += rec.tokens.reported_total_without_reasoning();
-                    let val = report.quotes.as_ref().and_then(|q| q.get(idx)).and_then(|q| q.value_usd).unwrap_or_else(|| pricing.quote(rec).value_usd.unwrap_or(0.0));
-                    entry.1 += val;
-                    entry.2 += 1;
-                }
-            }
-            let mut clients_vec: Vec<(String, i64, f64, usize)> = model_clients.into_iter().map(|(c, (t, u, k))| (c, t, u, k)).collect();
-            clients_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
-
+            let (r_records, r_tokens, r_usd, clients_vec) = Self::compute_model_detail(
+                report,
+                &target_model,
+                cur_window,
+                self.consumption_metric,
+                &self.search_query,
+            );
             self.modal_scroll = 0;
             self.modal = DetailModal::ConsumptionModel {
                 model: target_model,
                 window: cur_window,
-                records: m_row.records,
-                tokens: m_row.tokens.clone(),
-                api_usd: m_row.api_value_usd,
+                records: r_records,
+                tokens: r_tokens,
+                api_usd: r_usd,
                 clients: clients_vec,
             };
         }
@@ -680,6 +830,16 @@ impl App {
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.modal_scroll = self.modal_scroll.saturating_add(1);
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.refreshes = self.refreshes.saturating_add(1);
+                    self.last_refresh = Instant::now();
+                    if self.view == View::Consumption {
+                        self.usage_busy = true;
+                    } else {
+                        self.limits_busy = true;
+                        self.refresh_requested = true;
+                    }
                 }
                 _ => {}
             }
@@ -5471,10 +5631,20 @@ fn draw(frame: &mut Frame, app: &App, forced_width: Option<u16>, refresh_seconds
         let popup_area = centered_rect(88, 86, area);
         frame.render_widget(Clear, popup_area);
         let m_lines = modal_lines(&app.modal, popup_area.width);
+        let is_refreshing = match app.view {
+            View::Consumption => app.usage_busy,
+            View::Limits | View::Settings => app.limits_busy,
+        } || app.last_refresh.elapsed() < Duration::from_millis(1500);
+
+        let title = if is_refreshing {
+            " DETAIL DRILL-DOWN · ↻ refreshing... "
+        } else {
+            " DETAIL DRILL-DOWN "
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD))
-            .title(" DETAIL DRILL-DOWN ");
+            .title(title);
         let paragraph = Paragraph::new(m_lines).scroll((app.modal_scroll, 0)).block(block);
         frame.render_widget(paragraph, popup_area);
     }
@@ -5562,6 +5732,7 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                 if let Ok(storage) = token_monitor_core::storage::Storage::open_default() {
                     let _ = storage.save_provider_snapshots(&app.providers);
                 }
+                app.refresh_active_modal();
                 changed = true;
             }
             if let Ok(result) = usage_rx.try_recv() {
@@ -5848,6 +6019,51 @@ mod tests {
                 assert_eq!(line.len(), width as usize);
             }
         }
+    }
+
+    #[test]
+    fn active_modal_refreshes_reactively_on_new_consumption_report() {
+        let mut app = App::new(true, false);
+        app.view = View::Consumption;
+        let mut report = mock_consumption_report();
+        app.set_consumption(report.clone());
+
+        // Select a client row (sel = 1 is the first client row after window summary)
+        app.ledger_window = LedgerWindow::Today;
+        app.consumption_selected = 1;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let (initial_records, opened_client) = match &app.modal {
+            DetailModal::ConsumptionClient { records, client, .. } => (*records, client.clone()),
+            _ => panic!("expected ConsumptionClient modal"),
+        };
+        assert!(initial_records > 0);
+
+        // Add a new record for the opened client in today's window
+        let mut new_record = report
+            .snapshot
+            .records
+            .iter()
+            .find(|r| normalize_client_id(&r.client) == opened_client)
+            .unwrap()
+            .clone();
+        new_record.tokens.input = 10_000_000;
+        new_record.tokens.output = 500_000;
+        report.snapshot.records.push(new_record);
+
+        // Update consumption - modal should update reactively without closing!
+        app.set_consumption(report);
+
+        let updated_records = match &app.modal {
+            DetailModal::ConsumptionClient { records, .. } => *records,
+            _ => panic!("expected ConsumptionClient modal to remain open"),
+        };
+        assert_eq!(updated_records, initial_records + 1);
+
+        // Test pressing 'r' inside modal sets usage_busy
+        app.usage_busy = false;
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(app.usage_busy);
     }
 
     #[test]
