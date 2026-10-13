@@ -2797,8 +2797,12 @@ pub async fn collect_antigravity(options: &CollectorOptions) -> Vec<ProviderSnap
                         .as_ref()
                         .and_then(|value| value.get("userStatus"))
                         .and_then(|value| value.get("email"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("Antigravity");
+                        .and_then(Value::as_str);
+                    let Some(email) = email.filter(|e| e.contains('@')) else {
+                        // Skip language server instances that fail to provide a verified user email,
+                        // preventing duplicate anonymous ghost accounts from corrupting the pool list.
+                        continue;
+                    };
                     let plan = identity
                         .as_ref()
                         .and_then(|value| value.get("userStatus"))
