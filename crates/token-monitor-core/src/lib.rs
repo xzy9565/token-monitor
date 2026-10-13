@@ -473,6 +473,10 @@ pub fn merge_provider_snapshots(
             if !old.visible_by_default() || old.windows.is_empty() {
                 continue;
             }
+            // For Antigravity, ignore any historical ghost snapshots that lack a valid email.
+            if old.provider_id == "antigravity" && !old.account_label.contains('@') {
+                continue;
+            }
             let mut retained = old.clone();
             if retained.source_health == SourceHealth::Connected {
                 retained.source_health = SourceHealth::Stale;
@@ -800,5 +804,20 @@ mod tests {
         assert_eq!(merged[0].account_label, "user1@gmail.com");
         assert_eq!(merged[1].account_label, "user2@gmail.com");
         assert_eq!(merged[1].source_health, SourceHealth::Stale);
+    }
+
+    #[test]
+    fn antigravity_ghost_snapshots_without_email_are_never_retained() {
+        let mut ag_real = provider("antigravity", "Pro", vec![window("5h", WindowKind::Session, 80.0, 2_000)]);
+        ag_real.account_key = "antigravity:user1".into();
+        ag_real.account_label = "user1@gmail.com".into();
+
+        let mut ag_ghost = provider("antigravity", "Pro", vec![window("5h", WindowKind::Session, 85.0, 2_000)]);
+        ag_ghost.account_key = "antigravity:ghost".into();
+        ag_ghost.account_label = "Antigravity".into(); // no '@'
+
+        let merged = merge_provider_snapshots(&[ag_ghost, ag_real.clone()], vec![ag_real.clone()]);
+        assert_eq!(merged.len(), 1, "Must purge anonymous antigravity snapshots without valid email");
+        assert_eq!(merged[0].account_label, "user1@gmail.com");
     }
 }
