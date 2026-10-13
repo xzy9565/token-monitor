@@ -3617,7 +3617,7 @@ pub async fn collect_commandcode(options: &CollectorOptions) -> Vec<ProviderSnap
         } if !name.is_empty() => name.clone(),
         _ => plan.map(|value| value.0).unwrap_or("Command Code").into(),
     };
-    vec![connected_snapshot(
+    let mut snapshot = connected_snapshot(
         "commandcode",
         account_key,
         account_label,
@@ -3625,7 +3625,11 @@ pub async fn collect_commandcode(options: &CollectorOptions) -> Vec<ProviderSnap
         source,
         windows,
         220,
-    )]
+    );
+    snapshot.diagnostics = vec![
+        "Tip: Run '/model' or press Option+P in Command Code to switch models (free tiers tagged)".into(),
+    ];
+    vec![snapshot]
 }
 
 fn minimax_token() -> Option<String> {
