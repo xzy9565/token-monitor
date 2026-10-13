@@ -6975,4 +6975,31 @@ mod tests {
         // Gemini is spent; a soon-resetting Claude/GPT pool must not make this account burn-first.
         assert!(find_burn_first_recommendation(&[&agy], now).is_none());
     }
+
+    #[test]
+    fn commandcode_modal_lines_renders_diagnostics_tip() {
+        let snapshot = ProviderSnapshot {
+            account_key: "commandcode:user".into(),
+            account_label: "Command Code".into(),
+            availability: Availability::Available,
+            collected_at_ms: 1000,
+            diagnostics: vec![
+                "Tip: Run '/model' or press Option+P in Command Code to switch models (free tiers tagged)".into(),
+            ],
+            hue: 220,
+            plan: "Go".into(),
+            provider_id: "commandcode".into(),
+            source: "web".into(),
+            source_health: SourceHealth::Connected,
+            windows: vec![],
+        };
+        let modal = DetailModal::LimitsProvider(Box::new(snapshot.clone()));
+        let lines = modal_lines(&modal, 100);
+        let text = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("DIAGNOSTICS & DETAILS:"));
+        assert!(text.contains("Option+P"));
+
+        let status_span = format_matrix_status(&snapshot, None, 20, false, false);
+        assert_eq!(status_span.content.trim(), "ready");
+    }
 }
