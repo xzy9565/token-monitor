@@ -65,7 +65,7 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     clients: Option<Vec<String>>,
     /// Number of recent calendar days to include (0 means all local history).
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 0)]
     days: u32,
     /// Force a terminal width for layout smoke tests.
     #[arg(long, short = 'w')]
@@ -6278,6 +6278,7 @@ mod tests {
         args.resolve_live();
         assert!(args.live);
         assert!(!args.mock);
+        assert_eq!(args.days, 0);
 
         let mut args_mock = Args::parse_from(["token-monitor", "--mock"]);
         args_mock.resolve_live();
