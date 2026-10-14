@@ -1005,6 +1005,8 @@ fn fallback_timestamp(timestamps: impl Iterator<Item = i64>) -> Option<i64> {
 /// Dates AGY records from AGY's transcript, and adds the usage that only `agy-dehydrate`'s archive
 /// still holds.
 fn enrich_antigravity_records(records: &mut Vec<UsageRecord>) {
+    use rayon::prelude::*;
+
     let home = match dirs::home_dir() {
         Some(h) => h,
         None => return,
@@ -1014,7 +1016,6 @@ fn enrich_antigravity_records(records: &mut Vec<UsageRecord>) {
         return;
     }
     let archive_dir = home.join(".gemini/antigravity-cli/archive");
-    let mut archived_records = Vec::new();
 
     let mut session_map: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
@@ -1024,163 +1025,189 @@ fn enrich_antigravity_records(records: &mut Vec<UsageRecord>) {
         }
     }
 
-    for (session_id, record_indices) in session_map {
-        if record_indices.len() <= 1 {
-            continue;
-        }
-        // Only the records tokscale could not date get re-dated: those all sit on the session's
-        // start. A session that spans an AGY upgrade also has rows dated by their own
-        // generation time (agy <= 1.1.17 wrote one), and skipping it whole left 6baa4b1b's
-        // October usage on 08-30.
-        let Some(first_ts) =
-            fallback_timestamp(record_indices.iter().map(|&i| records[i].timestamp))
-        else {
-            continue;
-        };
-        let first_date = record_indices
-            .iter()
-            .map(|&i| &records[i])
-            .find(|r| r.timestamp == first_ts)
-            .map(|r| r.date.clone())
-            .unwrap_or_default();
+    struct SessionEnrichment {
+        time_updates: Vec<(usize, i64)>,
+        archived_records: Vec<UsageRecord>,
+    }
 
-        let db_path = conv_dir.join(format!("{session_id}.db"));
-        if !db_path.exists() {
-            continue;
-        }
+    let records_ref = records.as_slice();
 
-        let conn = match rusqlite::Connection::open_with_flags(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        ) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+    let results: Vec<SessionEnrichment> = session_map
+        .into_par_iter()
+        .filter_map(|(session_id, record_indices)| {
+            if record_indices.len() <= 1 {
+                return None;
+            }
+            // Only the records tokscale could not date get re-dated: those all sit on the session's
+            // start. A session that spans an AGY upgrade also has rows dated by their own
+            // generation time (agy <= 1.1.17 wrote one), and skipping it whole left 6baa4b1b's
+            // October usage on 08-30.
+            let first_ts =
+                fallback_timestamp(record_indices.iter().map(|&i| records_ref[i].timestamp))?;
+            let first_date = record_indices
+                .iter()
+                .map(|&i| &records_ref[i])
+                .find(|r| r.timestamp == first_ts)
+                .map(|r| r.date.clone())
+                .unwrap_or_default();
 
-        // Extract step timestamps
-        let mut step_timestamps: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-        if let Ok(mut stmt) = conn.prepare("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL") {
-            if let Ok(mut rows) = stmt.query([]) {
-                while let Ok(Some(row)) = rows.next() {
-                    let idx: i64 = match row.get(0) {
-                        Ok(i) => i,
-                        Err(_) => continue,
-                    };
-                    let meta: Vec<u8> = match row.get(1) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-                    if let Some(ts) = extract_step_timestamp_ms(&meta) {
-                        step_timestamps.insert(idx, ts);
+            let db_path = conv_dir.join(format!("{session_id}.db"));
+            if !db_path.exists() {
+                return None;
+            }
+
+            let conn = rusqlite::Connection::open_with_flags(
+                &db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            ).ok()?;
+
+            // Extract step timestamps
+            let mut step_timestamps: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+            if let Ok(mut stmt) = conn.prepare("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL") {
+                if let Ok(mut rows) = stmt.query([]) {
+                    while let Ok(Some(row)) = rows.next() {
+                        let idx: i64 = match row.get(0) {
+                            Ok(i) => i,
+                            Err(_) => continue,
+                        };
+                        let meta: Vec<u8> = match row.get(1) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+                        if let Some(ts) = extract_step_timestamp_ms(&meta) {
+                            step_timestamps.insert(idx, ts);
+                        }
                     }
                 }
             }
-        }
 
-        // `agy-dehydrate` renumbers the hot `steps` but leaves `gen_metadata` on the old indices,
-        // so after a dehydration the hot steps date older turns wrongly or not at all. AGY's own
-        // append-only transcript keeps every step it ever logged, so it wins when present.
-        let transcript = read_agy_transcript(
-            &home
+            // `agy-dehydrate` renumbers the hot `steps` but leaves `gen_metadata` on the old indices,
+            // so after a dehydration the hot steps date older turns wrongly or not at all. AGY's own
+            // append-only transcript keeps every step it ever logged, so it wins when present.
+            let logs_dir = home
                 .join(".gemini/antigravity-cli/brain")
                 .join(&session_id)
-                .join(".system_generated/logs/transcript_full.jsonl"),
-        );
-        if transcript.is_none() && step_timestamps.is_empty() {
-            continue;
-        }
+                .join(".system_generated/logs");
+            let compact_path = logs_dir.join("transcript.jsonl");
+            let full_path = logs_dir.join("transcript_full.jsonl");
+            let transcript_path = if compact_path.exists() {
+                &compact_path
+            } else {
+                &full_path
+            };
+            let transcript = read_agy_transcript(transcript_path);
+            if transcript.is_none() && step_timestamps.is_empty() {
+                return None;
+            }
 
-        let Some(hot) = read_gen_turns(&db_path) else {
-            continue;
-        };
-        let Some(lines) = &transcript else {
-            for (&r_idx, (_, steps)) in record_indices.iter().zip(&hot) {
-                if records[r_idx].timestamp != first_ts {
+            let hot = read_gen_turns(&db_path)?;
+            let mut time_updates = Vec::new();
+
+            let Some(lines) = &transcript else {
+                for (&r_idx, (_, steps)) in record_indices.iter().zip(&hot) {
+                    if records_ref[r_idx].timestamp != first_ts {
+                        continue;
+                    }
+                    if let Some(ts) = steps.iter().find_map(|s| step_timestamps.get(s).copied()) {
+                        time_updates.push((r_idx, ts));
+                    }
+                }
+                return Some(SessionEnrichment {
+                    time_updates,
+                    archived_records: Vec::new(),
+                });
+            };
+
+            let archive_path = archive_dir.join(format!("{session_id}.cold.db"));
+            let archived = read_gen_turns(&archive_path).unwrap_or_default();
+            let history = gen_history(&archived, &hot);
+            let steps: Vec<Vec<i64>> = history.iter().map(|(_, s)| s.clone()).collect();
+            let dated: HashMap<&[u8], i64> = history
+                .iter()
+                .zip(date_turns_from_transcript(&steps, lines))
+                .filter_map(|((key, _), ts)| Some((key.as_slice(), ts?)))
+                .collect();
+
+            for (&r_idx, (key, _)) in record_indices.iter().zip(&hot) {
+                if records_ref[r_idx].timestamp != first_ts {
                     continue;
                 }
-                if let Some(ts) = steps.iter().find_map(|s| step_timestamps.get(s).copied()) {
-                    set_record_time(&mut records[r_idx], ts);
+                if let Some(&ts) = dated.get(key.as_slice()) {
+                    time_updates.push((r_idx, ts));
                 }
             }
-            continue;
-        };
-        let archive_path = archive_dir.join(format!("{session_id}.cold.db"));
-        let archived = read_gen_turns(&archive_path).unwrap_or_default();
-        let history = gen_history(&archived, &hot);
-        let steps: Vec<Vec<i64>> = history.iter().map(|(_, s)| s.clone()).collect();
-        let dated: HashMap<&[u8], i64> = history
-            .iter()
-            .zip(date_turns_from_transcript(&steps, lines))
-            .filter_map(|((key, _), ts)| Some((key.as_slice(), ts?)))
-            .collect();
-        for (&r_idx, (key, _)) in record_indices.iter().zip(&hot) {
-            if records[r_idx].timestamp != first_ts {
-                continue;
-            }
-            if let Some(&ts) = dated.get(key.as_slice()) {
-                set_record_time(&mut records[r_idx], ts);
-            }
-        }
 
-        // Usage only the archive still holds. tokscale parses the archive like any AGY database,
-        // so its records line up 1:1 with `archived`.
-        let in_hot: std::collections::HashSet<&[u8]> =
-            hot.iter().map(|(key, _)| key.as_slice()).collect();
-        if archived
-            .iter()
-            .all(|(key, _)| in_hot.contains(key.as_slice()))
-        {
-            continue;
-        }
-        let client = records[record_indices[0]].client.clone();
-        let parsed =
-            tokscale_core::sessions::antigravity_cli::parse_antigravity_cli_file(&archive_path);
-        for ((key, _), m) in archived.iter().zip(parsed) {
-            if in_hot.contains(key.as_slice()) {
-                continue;
+            // Usage only the archive still holds. tokscale parses the archive like any AGY database,
+            // so its records line up 1:1 with `archived`.
+            let in_hot: std::collections::HashSet<&[u8]> =
+                hot.iter().map(|(key, _)| key.as_slice()).collect();
+            let mut session_archived = Vec::new();
+            if !archived.iter().all(|(key, _)| in_hot.contains(key.as_slice())) {
+                let client = records_ref[record_indices[0]].client.clone();
+                let parsed =
+                    tokscale_core::sessions::antigravity_cli::parse_antigravity_cli_file(&archive_path);
+                for ((key, _), m) in archived.iter().zip(parsed) {
+                    if in_hot.contains(key.as_slice()) {
+                        continue;
+                    }
+                    let mut record = UsageRecord {
+                        client: client.clone(),
+                        model_id: m.model_id,
+                        provider_id: m.provider_id,
+                        session_id: session_id.clone(),
+                        date: first_date.clone(),
+                        timestamp: first_ts,
+                        tokens: UsageTokens {
+                            input: m.tokens.input.max(0),
+                            output: m.tokens.output.max(0),
+                            cache_read: m.tokens.cache_read.max(0),
+                            cache_write: m.tokens.cache_write.max(0),
+                            reasoning: m.tokens.reasoning.max(0),
+                        },
+                        message_count: m.message_count.max(0),
+                        reported_cost_micros: None,
+                    };
+                    if let Some(&ts) = dated.get(key.as_slice()) {
+                        set_record_time(&mut record, ts);
+                    }
+                    session_archived.push(record);
+                }
             }
-            let mut record = UsageRecord {
-                client: client.clone(),
-                model_id: m.model_id,
-                provider_id: m.provider_id,
-                session_id: session_id.clone(),
-                date: first_date.clone(),
-                timestamp: first_ts,
-                tokens: UsageTokens {
-                    input: m.tokens.input.max(0),
-                    output: m.tokens.output.max(0),
-                    cache_read: m.tokens.cache_read.max(0),
-                    cache_write: m.tokens.cache_write.max(0),
-                    reasoning: m.tokens.reasoning.max(0),
-                },
-                message_count: m.message_count.max(0),
-                reported_cost_micros: None,
-            };
-            if let Some(&ts) = dated.get(key.as_slice()) {
-                set_record_time(&mut record, ts);
-            }
-            archived_records.push(record);
+
+            Some(SessionEnrichment {
+                time_updates,
+                archived_records: session_archived,
+            })
+        })
+        .collect();
+
+    for res in results {
+        for (r_idx, ts) in res.time_updates {
+            set_record_time(&mut records[r_idx], ts);
         }
+        records.extend(res.archived_records);
     }
-    records.extend(archived_records);
 }
 
-/// `(step_index, created_at ms)` for each line of AGY's `transcript_full.jsonl`, in write order.
+/// `(step_index, created_at ms)` for each line of AGY's transcript, in write order.
 fn read_agy_transcript(path: &std::path::Path) -> Option<Vec<(i64, i64)>> {
     #[derive(Deserialize)]
     struct Line {
         step_index: i64,
         created_at: String,
     }
-    let text = std::fs::read_to_string(path).ok()?;
-    let lines: Vec<(i64, i64)> = text
-        .lines()
-        .filter_map(|line| {
-            let line: Line = serde_json::from_str(line).ok()?;
-            let at = chrono::DateTime::parse_from_rfc3339(&line.created_at).ok()?;
-            Some((line.step_index, at.timestamp_millis()))
-        })
-        .collect();
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut lines = Vec::new();
+    for line_res in reader.lines() {
+        let line_str = line_res.ok()?;
+        if let Ok(line) = serde_json::from_str::<Line>(&line_str) {
+            if let Ok(at) = chrono::DateTime::parse_from_rfc3339(&line.created_at) {
+                lines.push((line.step_index, at.timestamp_millis()));
+            }
+        }
+    }
     (!lines.is_empty()).then_some(lines)
 }
 
