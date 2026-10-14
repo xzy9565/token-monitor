@@ -2027,6 +2027,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokscale-core",
+ "zstd",
 ]
 
 [[package]]
