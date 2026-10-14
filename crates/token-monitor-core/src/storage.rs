@@ -90,6 +90,18 @@ impl Storage {
         Ok(storage)
     }
 
+    pub fn auto_maintenance(&self) -> Result<usize, String> {
+        let count: i64 = self
+            .connection
+            .query_row("SELECT count(*) FROM provider_snapshots", [], |row| row.get(0))
+            .unwrap_or(0);
+        if count > 50_000 {
+            self.downsample_provider_snapshots()
+        } else {
+            Ok(0)
+        }
+    }
+
     fn migrate(&self) -> Result<(), String> {
         self.connection
             .execute_batch(
@@ -137,33 +149,191 @@ impl Storage {
             .unchecked_transaction()
             .map_err(|error| format!("begin snapshot transaction: {error}"))?;
         let mut inserted = 0;
-        for snapshot in snapshots {
-            let payload = serde_json::to_string(snapshot)
-                .map_err(|error| format!("encode snapshot: {error}"))?;
-            let digest = sha256(payload.as_bytes());
-            let source_health = format!("{:?}", snapshot.source_health);
-            let availability = format!("{:?}", snapshot.availability);
-            inserted += transaction
-                .execute(
-                    "INSERT OR IGNORE INTO provider_snapshots
-                     (collected_at_ms, provider_id, account_key, source_health, availability, payload_json, payload_sha256)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        snapshot.collected_at_ms,
-                        snapshot.provider_id,
-                        snapshot.account_key,
-                        source_health,
-                        availability,
-                        payload,
-                        digest,
-                    ],
+        {
+            let mut check_stmt = transaction
+                .prepare(
+                    "SELECT collected_at_ms, payload_json FROM provider_snapshots
+                     WHERE provider_id = ?1 AND account_key = ?2
+                     ORDER BY collected_at_ms DESC, id DESC LIMIT 1",
                 )
-                .map_err(|error| format!("insert provider snapshot: {error}"))?;
+                .map_err(|error| format!("prepare deduplication check: {error}"))?;
+
+            for snapshot in snapshots {
+                let latest: Option<(i64, String)> = check_stmt
+                    .query_row(params![&snapshot.provider_id, &snapshot.account_key], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .optional()
+                    .map_err(|error| format!("check latest snapshot: {error}"))?;
+
+                if let Some((prev_ms, prev_payload)) = latest {
+                    let elapsed_ms = snapshot.collected_at_ms.saturating_sub(prev_ms);
+                    // 6 hours heartbeat checkpoint interval
+                    if elapsed_ms < 6 * 3600 * 1000 {
+                        if let Ok(prev_snapshot) = serde_json::from_str::<ProviderSnapshot>(&prev_payload) {
+                            if snapshot_state_eq(&prev_snapshot, snapshot) {
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                let payload = serde_json::to_string(snapshot)
+                    .map_err(|error| format!("encode snapshot: {error}"))?;
+                let digest = sha256(payload.as_bytes());
+                let source_health = format!("{:?}", snapshot.source_health);
+                let availability = format!("{:?}", snapshot.availability);
+                inserted += transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO provider_snapshots
+                         (collected_at_ms, provider_id, account_key, source_health, availability, payload_json, payload_sha256)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            snapshot.collected_at_ms,
+                            snapshot.provider_id,
+                            snapshot.account_key,
+                            source_health,
+                            availability,
+                            payload,
+                            digest,
+                        ],
+                    )
+                    .map_err(|error| format!("insert provider snapshot: {error}"))?;
+            }
         }
         transaction
             .commit()
             .map_err(|error| format!("commit snapshot transaction: {error}"))?;
         Ok(inserted)
+    }
+
+    pub fn downsample_provider_snapshots(&self) -> Result<usize, String> {
+        let pairs: Vec<(String, String)> = {
+            let mut stmt = self
+                .connection
+                .prepare("SELECT DISTINCT provider_id, account_key FROM provider_snapshots")
+                .map_err(|error| format!("prepare distinct pairs query: {error}"))?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                .map_err(|error| format!("query distinct pairs: {error}"))?;
+            let mut list = Vec::new();
+            for r in rows {
+                if let Ok(pair) = r {
+                    list.push(pair);
+                }
+            }
+            list
+        };
+
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+
+        let mut ids_to_keep: Vec<i64> = Vec::new();
+        let heartbeat_window_ms = 6 * 3600 * 1000i64;
+
+        let mut select_stmt = self
+            .connection
+            .prepare(
+                "SELECT id, collected_at_ms, payload_json FROM provider_snapshots
+                 WHERE provider_id = ?1 AND account_key = ?2
+                 ORDER BY collected_at_ms ASC, id ASC",
+            )
+            .map_err(|error| format!("prepare select provider rows: {error}"))?;
+
+        for (provider_id, account_key) in &pairs {
+            let mut rows = select_stmt
+                .query_map(params![provider_id, account_key], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+                })
+                .map_err(|error| format!("query provider rows: {error}"))?;
+
+            let mut last_kept_state: Option<ProviderSnapshot> = None;
+            let mut last_heartbeat_ms = 0i64;
+            let mut last_id = None;
+
+            while let Some(Ok((id, ms, payload))) = rows.next() {
+                last_id = Some(id);
+                let snap = match serde_json::from_str::<ProviderSnapshot>(&payload) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        ids_to_keep.push(id);
+                        continue;
+                    }
+                };
+
+                if let Some(ref prev) = last_kept_state {
+                    if !snapshot_state_eq(prev, &snap) {
+                        last_kept_state = Some(snap);
+                        last_heartbeat_ms = ms;
+                        ids_to_keep.push(id);
+                    } else if ms.saturating_sub(last_heartbeat_ms) >= heartbeat_window_ms {
+                        last_heartbeat_ms = ms;
+                        ids_to_keep.push(id);
+                    }
+                } else {
+                    last_kept_state = Some(snap);
+                    last_heartbeat_ms = ms;
+                    ids_to_keep.push(id);
+                }
+            }
+
+            if let Some(lid) = last_id {
+                if ids_to_keep.last().copied() != Some(lid) {
+                    ids_to_keep.push(lid);
+                }
+            }
+        }
+        drop(select_stmt);
+
+        let initial_count: i64 = self
+            .connection
+            .query_row("SELECT count(*) FROM provider_snapshots", [], |row| row.get(0))
+            .map_err(|error| format!("query initial count: {error}"))?;
+
+        if ids_to_keep.len() >= initial_count as usize {
+            return Ok(0);
+        }
+
+        self.connection
+            .execute_batch("CREATE TEMP TABLE keep_ids (id INTEGER PRIMARY KEY);")
+            .map_err(|error| format!("create temp table: {error}"))?;
+
+        {
+            let tx = self
+                .connection
+                .unchecked_transaction()
+                .map_err(|error| format!("begin temp insert tx: {error}"))?;
+            {
+                let mut ins_stmt = tx
+                    .prepare("INSERT INTO keep_ids (id) VALUES (?1)")
+                    .map_err(|error| format!("prepare temp insert: {error}"))?;
+                for id in &ids_to_keep {
+                    let _ = ins_stmt.execute(params![id]);
+                }
+            }
+            tx.commit()
+                .map_err(|error| format!("commit temp insert: {error}"))?;
+        }
+
+        self.connection
+            .execute_batch(
+                "BEGIN;
+                 CREATE TABLE provider_snapshots_compact AS
+                   SELECT * FROM provider_snapshots WHERE id IN (SELECT id FROM keep_ids);
+                 DROP TABLE provider_snapshots;
+                 ALTER TABLE provider_snapshots_compact RENAME TO provider_snapshots;
+                 CREATE INDEX IF NOT EXISTS provider_snapshots_lookup
+                   ON provider_snapshots(provider_id, account_key, collected_at_ms DESC);
+                 DROP TABLE keep_ids;
+                 COMMIT;",
+            )
+            .map_err(|error| format!("swap compacted table: {error}"))?;
+
+        let _ = self.connection.execute("VACUUM;", []);
+
+        let pruned = (initial_count as usize).saturating_sub(ids_to_keep.len());
+        Ok(pruned)
     }
 
     pub fn latest_provider_snapshots(&self) -> Result<Vec<ProviderSnapshot>, String> {
@@ -318,6 +488,47 @@ fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn opt_f64_approx_eq(a: Option<f64>, b: Option<f64>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => (x - y).abs() < 1e-4,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn limit_window_state_eq(a: &crate::LimitWindow, b: &crate::LimitWindow) -> bool {
+    let both_full = a.remaining_percent.is_some_and(|p| p >= 99.99)
+        && b.remaining_percent.is_some_and(|p| p >= 99.99);
+    let resets_eq = both_full
+        || a.resets_at_ms == b.resets_at_ms
+        || match (a.resets_at_ms, b.resets_at_ms) {
+            (Some(r1), Some(r2)) => (r1 - r2).abs() < 300_000, // within 5 minutes sliding jitter
+            _ => a.resets_at_ms == b.resets_at_ms,
+        };
+
+    a.label == b.label
+        && a.kind == b.kind
+        && a.metric == b.metric
+        && opt_f64_approx_eq(a.remaining_percent, b.remaining_percent)
+        && opt_f64_approx_eq(a.remaining_amount, b.remaining_amount)
+        && a.currency == b.currency
+        && resets_eq
+}
+
+pub fn snapshot_state_eq(a: &ProviderSnapshot, b: &ProviderSnapshot) -> bool {
+    use crate::SourceHealth;
+    let health_eq = a.source_health == b.source_health
+        || (a.source_health != SourceHealth::Connected && b.source_health != SourceHealth::Connected);
+
+    a.provider_id == b.provider_id
+        && a.account_key == b.account_key
+        && a.plan == b.plan
+        && health_eq
+        && a.availability == b.availability
+        && a.windows.len() == b.windows.len()
+        && a.windows.iter().zip(&b.windows).all(|(w1, w2)| limit_window_state_eq(w1, w2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,16 +581,72 @@ mod tests {
     fn provider_snapshots_round_trip_and_deduplicate() {
         let path = temp_db("snapshot");
         let storage = Storage::open_at(&path).unwrap();
-        assert_eq!(
-            storage
-                .save_provider_snapshots(&[snapshot(), snapshot()])
-                .unwrap(),
-            1
-        );
+        let s1 = snapshot();
+        assert_eq!(storage.save_provider_snapshots(&[s1.clone()]).unwrap(), 1);
+
+        // Same snapshot 1 minute later -> deduplicated (0 inserted)
+        let mut s2 = snapshot();
+        s2.collected_at_ms = 60_000;
+        assert_eq!(storage.save_provider_snapshots(&[s2]).unwrap(), 0);
+
+        // Substantive state change (quota consumed to 50%) -> inserted (1 inserted)
+        let mut s3 = snapshot();
+        s3.collected_at_ms = 120_000;
+        s3.windows[0].remaining_percent = Some(50.0);
+        assert_eq!(storage.save_provider_snapshots(&[s3.clone()]).unwrap(), 1);
+
+        // Heartbeat checkpoint after 7 hours without change -> inserted (1 inserted)
+        let mut s4 = s3.clone();
+        s4.collected_at_ms = 120_000 + 7 * 3600 * 1000;
+        assert_eq!(storage.save_provider_snapshots(&[s4.clone()]).unwrap(), 1);
+
         assert_eq!(
             storage.latest_provider_snapshots().unwrap(),
-            vec![snapshot()]
+            vec![s4]
         );
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn provider_snapshots_downsample_retains_changes_and_heartbeats() {
+        let path = temp_db("downsample");
+        let storage = Storage::open_at(&path).unwrap();
+
+        // Directly insert 50 identical rows simulating 1-minute polls
+        let s = snapshot();
+        for i in 0..50 {
+            let mut row = s.clone();
+            row.collected_at_ms = 1_000_000 + i * 60_000;
+            let payload = serde_json::to_string(&row).unwrap();
+            let digest = sha256(payload.as_bytes());
+            storage.connection.execute(
+                "INSERT INTO provider_snapshots
+                 (collected_at_ms, provider_id, account_key, source_health, availability, payload_json, payload_sha256)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    row.collected_at_ms,
+                    row.provider_id,
+                    row.account_key,
+                    "Connected",
+                    "Available",
+                    payload,
+                    digest,
+                ],
+            ).unwrap();
+        }
+
+        let initial_count: i64 = storage.connection.query_row("SELECT count(*) FROM provider_snapshots", [], |r| r.get(0)).unwrap();
+        assert_eq!(initial_count, 50);
+
+        let pruned = storage.downsample_provider_snapshots().unwrap();
+        assert!(pruned > 0);
+
+        let final_count: i64 = storage.connection.query_row("SELECT count(*) FROM provider_snapshots", [], |r| r.get(0)).unwrap();
+        // Since all 50 were within 50 minutes (no state changes, within 6h heartbeat), only the first and latest row are kept!
+        assert_eq!(final_count, 2);
+
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
         let _ = fs::remove_file(path.with_extension("sqlite3-shm"));

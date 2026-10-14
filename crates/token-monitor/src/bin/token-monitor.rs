@@ -369,20 +369,124 @@ struct CachedLedger {
 
 impl CachedLedger {
     fn from_report(report: &usage::ConsumptionReport) -> Self {
-        let buckets = compute_temporal_usage(report);
-        let windows = [
-            LedgerWindow::Today,
-            LedgerWindow::Last24h,
-            LedgerWindow::Last7d,
-            LedgerWindow::Last30d,
-            LedgerWindow::AllTime,
-        ];
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let today_date = local_today_str();
+        let today_start_ms = local_today_start_ms();
+        let h24_ms = now_ms - 24 * 3600 * 1000;
+        let d7_ms = now_ms - 7 * 86400 * 1000;
+        let d30_ms = now_ms - 30 * 86400 * 1000;
+
+        let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
+
+        let mut today_b = TemporalUsageBucket { label: "Today", tokens: 0, input: 0, output: 0, cache: 0, api_usd: 0.0, records: 0 };
+        let mut h24_b = TemporalUsageBucket { label: "Last 24h", tokens: 0, input: 0, output: 0, cache: 0, api_usd: 0.0, records: 0 };
+        let mut d7_b = TemporalUsageBucket { label: "Last 7d", tokens: 0, input: 0, output: 0, cache: 0, api_usd: 0.0, records: 0 };
+        let mut d30_b = TemporalUsageBucket { label: "Last 30d", tokens: 0, input: 0, output: 0, cache: 0, api_usd: 0.0, records: 0 };
+        let mut all_b = TemporalUsageBucket { label: "All Time", tokens: 0, input: 0, output: 0, cache: 0, api_usd: 0.0, records: 0 };
+
+        let mut client_groups: [HashMap<String, ConsumptionRow>; 5] = Default::default();
+        let mut model_groups: [HashMap<String, ModelConsumptionRow>; 5] = Default::default();
+
+        for (index, record) in report.snapshot.records.iter().enumerate() {
+            let in_today = record.date == today_date || (today_start_ms > 0 && record.timestamp >= today_start_ms);
+            let in_h24 = record.timestamp >= h24_ms;
+            let in_d7 = record.timestamp >= d7_ms;
+            let in_d30 = record.timestamp >= d30_ms;
+
+            let cached_quote = report.quotes.as_ref().and_then(|quotes| quotes.get(index));
+            let (val, priced_tokens, unpriced_tokens, partial, unknown) = if let Some(quote) = cached_quote {
+                (
+                    quote.value_usd.unwrap_or(0.0),
+                    quote.priced_tokens,
+                    quote.unpriced_tokens,
+                    quote.status == token_monitor_core::pricing::PricingStatus::Partial,
+                    quote.status == token_monitor_core::pricing::PricingStatus::Unknown,
+                )
+            } else {
+                let quote = pricing.quote(record);
+                (
+                    quote.value_usd.unwrap_or(0.0),
+                    quote.priced_tokens,
+                    quote.unpriced_tokens,
+                    quote.status == token_monitor_core::pricing::PricingStatus::Partial,
+                    quote.status == token_monitor_core::pricing::PricingStatus::Unknown,
+                )
+            };
+
+            let tok = record.tokens.reported_total_without_reasoning();
+            let inp = record.tokens.input;
+            let out = record.tokens.output;
+            let cch = record.tokens.cache_read.saturating_add(record.tokens.cache_write);
+
+            let add_bucket = |b: &mut TemporalUsageBucket| {
+                b.tokens = b.tokens.saturating_add(tok);
+                b.input = b.input.saturating_add(inp);
+                b.output = b.output.saturating_add(out);
+                b.cache = b.cache.saturating_add(cch);
+                b.api_usd += val;
+                b.records += 1;
+            };
+
+            add_bucket(&mut all_b);
+            if in_today { add_bucket(&mut today_b); }
+            if in_h24 { add_bucket(&mut h24_b); }
+            if in_d7 { add_bucket(&mut d7_b); }
+            if in_d30 { add_bucket(&mut d30_b); }
+
+            let client_norm = normalize_client_id(&record.client);
+            let win_mask = [in_today, in_h24, in_d7, in_d30, true];
+
+            for (w_idx, &is_in) in win_mask.iter().enumerate() {
+                if !is_in {
+                    continue;
+                }
+
+                let c_row = client_groups[w_idx]
+                    .entry(client_norm.clone())
+                    .or_insert_with(|| ConsumptionRow::new(&client_norm, &record.provider_id));
+                c_row.records += 1;
+                c_row.tokens.add_assign(&record.tokens);
+                if val > 0.0 {
+                    c_row.api_value_usd += val;
+                    c_row.api_rows += 1;
+                }
+                c_row.priced_tokens = c_row.priced_tokens.saturating_add(priced_tokens);
+                c_row.unpriced_tokens = c_row.unpriced_tokens.saturating_add(unpriced_tokens);
+                if partial {
+                    c_row.partial_rows += 1;
+                }
+                if unknown {
+                    c_row.unknown_rows += 1;
+                }
+
+                let m_row = model_groups[w_idx]
+                    .entry(record.model_id.clone())
+                    .or_insert_with(|| ModelConsumptionRow {
+                        model: record.model_id.clone(),
+                        records: 0,
+                        tokens: usage::UsageTokens::default(),
+                        api_value_usd: 0.0,
+                        clients: HashMap::new(),
+                    });
+                m_row.records += 1;
+                m_row.tokens.add_assign(&record.tokens);
+                *m_row.clients.entry(client_norm.clone()).or_insert(0) += 1;
+                m_row.api_value_usd += val;
+            }
+        }
+
+        let buckets = vec![today_b, h24_b, d7_b, d30_b, all_b];
         let mut clients: [Vec<ConsumptionRow>; 5] = Default::default();
         let mut models: [Vec<ModelConsumptionRow>; 5] = Default::default();
 
-        for (idx, w) in windows.iter().enumerate() {
-            clients[idx] = consumption_rows(report, ConsumptionMetric::Tokens, *w, "");
-            models[idx] = model_consumption_rows(report, ConsumptionMetric::Tokens, *w, "");
+        for i in 0..5 {
+            let mut c_list: Vec<ConsumptionRow> = client_groups[i].drain().map(|(_, v)| v).collect();
+            c_list.sort_by(|l, r| r.token_total().cmp(&l.token_total()));
+            clients[i] = c_list;
+
+            let mut m_list: Vec<ModelConsumptionRow> = model_groups[i].drain().map(|(_, v)| v).collect();
+            m_list.sort_by(|l, r| r.token_total().cmp(&l.token_total()));
+            models[i] = m_list;
         }
 
         Self {
@@ -423,6 +527,12 @@ struct App {
 impl App {
     fn set_consumption(&mut self, report: usage::ConsumptionReport) {
         self.cached_ledger = Some(CachedLedger::from_report(&report));
+        self.consumption = Some(report);
+        self.refresh_active_modal();
+    }
+
+    fn set_consumption_cached(&mut self, report: usage::ConsumptionReport, cached: CachedLedger) {
+        self.cached_ledger = Some(cached);
         self.consumption = Some(report);
         self.refresh_active_modal();
     }
@@ -2171,7 +2281,7 @@ fn header_lines(app: &App, width: u16, refresh_seconds: u64) -> Vec<Line<'static
     let is_refreshing = match app.view {
         View::Consumption => app.usage_busy,
         View::Limits | View::Settings => app.limits_busy,
-    } || app.last_refresh.elapsed() < Duration::from_millis(1500);
+    };
 
     let refresh_indicator = if is_refreshing {
         Span::styled(
@@ -5634,7 +5744,7 @@ fn draw(frame: &mut Frame, app: &App, forced_width: Option<u16>, refresh_seconds
         let is_refreshing = match app.view {
             View::Consumption => app.usage_busy,
             View::Limits | View::Settings => app.limits_busy,
-        } || app.last_refresh.elapsed() < Duration::from_millis(1500);
+        };
 
         let title = if is_refreshing {
             " DETAIL DRILL-DOWN · ↻ refreshing... "
@@ -5701,7 +5811,7 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
     let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<Vec<ProviderSnapshot>>();
     let (usage_tx, usage_rx) =
-        std::sync::mpsc::channel::<Result<usage::ConsumptionReport, String>>();
+        std::sync::mpsc::channel::<Result<(usage::ConsumptionReport, CachedLedger), String>>();
     let mut refresh_in_flight = false;
     let mut usage_in_flight = false;
     let mut next_refresh = Instant::now();
@@ -5729,23 +5839,21 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                 app.live = true;
                 refresh_in_flight = false;
                 app.limits_busy = false;
-                if let Ok(storage) = token_monitor_core::storage::Storage::open_default() {
-                    let _ = storage.save_provider_snapshots(&app.providers);
-                }
+                let providers_to_save = app.providers.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(storage) = token_monitor_core::storage::Storage::open_default() {
+                        let _ = storage.save_provider_snapshots(&providers_to_save);
+                        let _ = storage.auto_maintenance();
+                    }
+                });
                 app.refresh_active_modal();
                 changed = true;
             }
             if let Ok(result) = usage_rx.try_recv() {
                 usage_in_flight = false;
                 app.usage_busy = false;
-                if let Ok(report) = result {
-                    if let Ok(storage) = token_monitor_core::storage::Storage::open_default() {
-                        let _ = storage.save_usage_snapshot(
-                            &report.snapshot,
-                            chrono::Utc::now().timestamp_millis(),
-                        );
-                    }
-                    app.set_consumption(report);
+                if let Ok((report, cached)) = result {
+                    app.set_consumption_cached(report, cached);
                 }
                 changed = true;
             }
@@ -5787,26 +5895,25 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                     });
                     let result = usage::collect_local_usage(usage::UsageOptions {
                         clients: None,
-                        since,
+                        since: since.clone(),
                         ..usage::UsageOptions::default()
                     })
                     .map(|snapshot| {
-                        let legacy = legacy_totals_for_range(
-                            (days > 0)
-                                .then(|| {
-                                    (chrono::Utc::now() - chrono::Duration::days(days as i64))
-                                        .date_naive()
-                                        .to_string()
-                                 })
-                                .as_deref(),
-                            None,
-                        );
-                        usage::build_consumption_report_with_legacy(
+                        if let Ok(storage) = token_monitor_core::storage::Storage::open_default() {
+                            let _ = storage.save_usage_snapshot(
+                                &snapshot,
+                                chrono::Utc::now().timestamp_millis(),
+                            );
+                        }
+                        let legacy = legacy_totals_for_range(since.as_deref(), None);
+                        let report = usage::build_consumption_report_with_legacy(
                             snapshot,
                             &token_monitor_core::pricing::PricingEngine::load_cached(),
                             true,
                             legacy.as_ref(),
-                        )
+                        );
+                        let cached = CachedLedger::from_report(&report);
+                        (report, cached)
                     });
                     let _ = tx.send(result);
                 });
@@ -5817,7 +5924,7 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                 View::Consumption => app.usage_busy,
                 _ => app.limits_busy,
             };
-            if active_busy || app.last_refresh.elapsed() < Duration::from_millis(1600) {
+            if active_busy {
                 dirty = true;
             }
             if changed {
