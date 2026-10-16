@@ -2440,7 +2440,9 @@ fn reset_timestamp(value: Option<&Value>) -> Option<i64> {
 
 fn antigravity_group_name(value: &str) -> String {
     let lower = value.to_ascii_lowercase();
-    if lower.contains("gemini") {
+    if lower.contains("argon") || lower.contains("gemini 4") || lower.contains("gemini-4") {
+        "Gemini 4 Argon".into()
+    } else if lower.contains("gemini") {
         "Gemini".into()
     } else if lower.contains("claude") || lower.contains("gpt") {
         "Claude/GPT".into()
@@ -2540,10 +2542,12 @@ fn antigravity_windows(payload: &Value) -> Vec<LimitWindow> {
     }
     windows.sort_by_key(|window| {
         (
-            if window.label.starts_with("Gemini") {
+            if window.label.starts_with("Gemini 4") {
+                1
+            } else if window.label.starts_with("Gemini") {
                 0
             } else {
-                1
+                2
             },
             if window.kind == WindowKind::Session {
                 0

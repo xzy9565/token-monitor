@@ -4037,7 +4037,7 @@ fn find_burn_first_recommendation(providers: &[&ProviderSnapshot], now_ms: i64) 
         if pid == "antigravity" {
             let gemini_5h = p.windows.iter().find(|w| {
                 let l = w.label.to_ascii_lowercase();
-                l.contains("gemini") && (l.contains("5h") || w.kind == WindowKind::Session)
+                !l.contains("argon") && l.contains("gemini") && (l.contains("5h") || w.kind == WindowKind::Session)
             });
             let claude_5h = p.windows.iter().find(|w| {
                 let l = w.label.to_ascii_lowercase();
@@ -4369,11 +4369,19 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
             if pid == "antigravity" {
                 let gemini_5h = provider.windows.iter().find(|w| {
                     let l = w.label.to_ascii_lowercase();
-                    l.contains("gemini") && (l.contains("5h") || w.kind == WindowKind::Session)
+                    !l.contains("argon") && l.contains("gemini") && (l.contains("5h") || w.kind == WindowKind::Session)
                 });
                 let gemini_7d = provider.windows.iter().find(|w| {
                     let l = w.label.to_ascii_lowercase();
-                    l.contains("gemini") && (l.contains("7d") || w.kind == WindowKind::Weekly)
+                    !l.contains("argon") && l.contains("gemini") && (l.contains("7d") || w.kind == WindowKind::Weekly)
+                });
+                let argon_5h = provider.windows.iter().find(|w| {
+                    let l = w.label.to_ascii_lowercase();
+                    l.contains("argon") && (l.contains("5h") || w.kind == WindowKind::Session)
+                });
+                let argon_7d = provider.windows.iter().find(|w| {
+                    let l = w.label.to_ascii_lowercase();
+                    l.contains("argon") && (l.contains("7d") || w.kind == WindowKind::Weekly)
                 });
                 let claude_5h = provider.windows.iter().find(|w| {
                     let l = w.label.to_ascii_lowercase();
@@ -4395,11 +4403,17 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 let g_7d_capped = is_window_capped(gemini_7d);
                 let g_dim = g_5h_capped || g_7d_capped;
 
+                let has_argon = argon_7d.is_some() || argon_5h.is_some();
+                let a_5h_capped = is_window_capped(argon_5h);
+                let a_7d_capped = is_window_capped(argon_7d);
+                let a_dim = has_argon && (a_5h_capped || a_7d_capped);
+
                 let c_5h_capped = is_window_capped(claude_5h);
                 let c_7d_capped = is_window_capped(claude_7d);
                 let c_dim = c_5h_capped || c_7d_capped;
 
-                let all_dim = (g_dim && c_dim)
+                let is_all_capped = g_dim && c_dim && (!has_argon || a_dim);
+                let all_dim = is_all_capped
                     || provider.availability == Availability::AgentBlocked
                     || provider.source_health != SourceHealth::Connected;
 
@@ -4415,10 +4429,9 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 if is_sel {
                     title_style = title_style.bg(Color::Rgb(28, 42, 60));
                 }
-                let is_all_capped = g_dim && c_dim;
                 let (marker_char, marker_style) = if is_all_capped {
                     ('▲', Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
-                } else if c_dim || g_dim {
+                } else if c_dim || g_dim || a_dim {
                     ('▲', Style::default().fg(YELLOW))
                 } else if provider.availability == Availability::AgentBlocked {
                     ('▲', Style::default().fg(RED).add_modifier(Modifier::BOLD))
@@ -4438,10 +4451,13 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 } else {
                     "CLI"
                 };
-                let active_pools_count = (!g_dim as usize) + (!c_dim as usize);
-                let pools_tag = match active_pools_count {
-                    2 => "2 pools active",
-                    1 => "1 pool active",
+                let active_pools_count = (!g_dim as usize) + (!c_dim as usize) + (if has_argon { !a_dim as usize } else { 0 });
+                let total_pools = if has_argon { 3 } else { 2 };
+                let pools_tag = match (active_pools_count, total_pools) {
+                    (3, 3) => "3 pools active",
+                    (2, 3) => "2 pools active",
+                    (2, 2) => "2 pools active",
+                    (1, _) => "1 pool active",
                     _ => if cols.session >= 16 { "all pools capped" } else { "0 pools active" },
                 };
                 let mut parent_spans = vec![
@@ -4457,16 +4473,20 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                     Span::styled(fit(cli_tag, cols.cycle), Style::default().fg(DIM_GREY)),
                     Span::raw("  "),
                 ];
-                let best_5h = gemini_5h.or(claude_5h);
-                let best_7d = gemini_7d.or(claude_7d);
+                let best_5h = gemini_5h.or(claude_5h).or(argon_5h);
+                let best_7d = gemini_7d.or(claude_7d).or(argon_7d);
                 parent_spans.extend(format_dual_reset(best_5h, best_7d, cols.reset, now_ms, all_dim));
                 parent_spans.push(Span::raw("  "));
                 let parent_status = if is_all_capped {
                     ("all capped", DIM_GREY)
+                } else if c_dim && g_dim {
+                    if has_argon && !a_dim { ("Argon only", YELLOW) } else { ("all capped", DIM_GREY) }
                 } else if c_dim {
                     ("Claude capped", YELLOW)
                 } else if g_dim {
                     ("Gemini capped", YELLOW)
+                } else if has_argon && a_dim {
+                    ("Argon capped", YELLOW)
                 } else if provider.availability == Availability::AgentBlocked {
                     ("blocked", RED)
                 } else {
@@ -4508,7 +4528,44 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
                 g_spans.push(format_matrix_status(provider, Some(g_stat), cols.status, false, g_dim));
                 lines.push(Line::from(g_spans));
 
-                // Sub-row 2: Claude / GPT Pool
+                // Sub-row 2: Gemini 4 Argon (when active/present)
+                if has_argon {
+                    let argon_color = Color::Rgb(168, 85, 247);
+                    let a_title_style = if a_dim {
+                        Style::default().fg(DIM_GREY)
+                    } else {
+                        Style::default().fg(argon_color).add_modifier(Modifier::BOLD)
+                    };
+                    let a_pool_label = if cols.provider.saturating_sub(2) < 26 {
+                        "├─ Gemini 4 (Argon 1M)"
+                    } else {
+                        "├─ Gemini 4 (Argon 1M)"
+                    };
+                    let mut a_spans = vec![
+                        Span::raw("  "),
+                        Span::styled(fit(a_pool_label, cols.provider.saturating_sub(2)), a_title_style),
+                        Span::raw("  "),
+                    ];
+                    a_spans.extend(format_quota_cell(argon_5h, cols.bar_width, cols.session, argon_color, a_dim));
+                    a_spans.push(Span::raw("  "));
+                    a_spans.extend(format_quota_cell(argon_7d, cols.bar_width, cols.cycle, argon_color, a_dim));
+                    a_spans.push(Span::raw("  "));
+                    a_spans.extend(format_dual_reset(argon_5h, argon_7d, cols.reset, now_ms, a_dim));
+                    a_spans.push(Span::raw("  "));
+                    let a_stat = if a_7d_capped {
+                        ("weekly cap", DIM_GREY)
+                    } else if a_5h_capped {
+                        ("5h capped", DIM_GREY)
+                    } else if argon_7d.is_some_and(|w| w.remaining_percent == Some(100.0)) {
+                        ("READY (FULL)", GREEN)
+                    } else {
+                        ("ready", GREEN)
+                    };
+                    a_spans.push(format_matrix_status(provider, Some(a_stat), cols.status, false, a_dim));
+                    lines.push(Line::from(a_spans));
+                }
+
+                // Sub-row 3: Claude / GPT Pool
                 let claude_color = Color::Rgb(217, 119, 87);
                 let c_title_style = if c_dim {
                     Style::default().fg(DIM_GREY)
@@ -6840,6 +6897,86 @@ mod tests {
         assert!(text4.contains("CLI (cached)"));
         assert!(text4.contains("ready"));
         assert!(!text4.contains("all capped"));
+
+        // Case 5: 3 pools with Gemini 4 Argon present
+        app.providers = vec![
+            ProviderSnapshot {
+                account_key: "antigravity:argon".into(),
+                account_label: "xzy9565@gmail.com".into(),
+                availability: Availability::Available,
+                collected_at_ms: 1000,
+                diagnostics: vec![],
+                hue: 141,
+                plan: "Pro".into(),
+                provider_id: "antigravity".into(),
+                source: "rpc".into(),
+                source_health: SourceHealth::Connected,
+                windows: vec![
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Session,
+                        label: "Gemini 5h".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(100.0),
+                        reset_text: None,
+                        resets_at_ms: Some(18_000_000),
+                    },
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Weekly,
+                        label: "Gemini 7d".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(100.0),
+                        reset_text: None,
+                        resets_at_ms: Some(500_000_000),
+                    },
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Weekly,
+                        label: "Gemini 4 Argon 7d".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(100.0),
+                        reset_text: None,
+                        resets_at_ms: Some(500_000_000),
+                    },
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Session,
+                        label: "Claude/GPT 5h".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(100.0),
+                        reset_text: None,
+                        resets_at_ms: Some(18_000_000),
+                    },
+                    LimitWindow {
+                        currency: None,
+                        estimated: false,
+                        kind: WindowKind::Weekly,
+                        label: "Claude/GPT 7d".into(),
+                        metric: WindowMetric::Quota,
+                        remaining_amount: None,
+                        remaining_percent: Some(100.0),
+                        reset_text: None,
+                        resets_at_ms: Some(500_000_000),
+                    },
+                ],
+            },
+        ];
+
+        let lines5 = body_lines(&app, 120, 30);
+        let text5 = lines5.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text5.contains("3 pools active"));
+        assert!(text5.contains("Gemini 4 (Argon 1M)"));
+        assert!(text5.contains("Flash/Pro"));
+        assert!(text5.contains("Sonnet"));
     }
 
     #[test]
