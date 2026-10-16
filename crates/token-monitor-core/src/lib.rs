@@ -380,7 +380,10 @@ pub fn sort_burn_first(providers: &mut [ProviderSnapshot], now_ms: i64) {
 /// AGY's Claude/GPT pool is about a tenth of its Gemini pool (2026-09-25 meters), so
 /// burn-first ranks an AGY account on its Gemini windows alone. Display still sees both pools.
 pub fn burn_view(provider: &ProviderSnapshot) -> Cow<'_, ProviderSnapshot> {
-    let is_gemini = |w: &LimitWindow| w.label.to_ascii_lowercase().contains("gemini");
+    let is_gemini = |w: &LimitWindow| {
+        let l = w.label.to_ascii_lowercase();
+        l.contains("gemini") && !l.contains("argon")
+    };
     if !provider.provider_id.eq_ignore_ascii_case("antigravity")
         || !provider.windows.iter().any(is_gemini)
     {
