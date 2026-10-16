@@ -230,22 +230,32 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
     let mut records: Vec<UsageRecord> = parsed
         .messages
         .into_iter()
-        .map(|message| UsageRecord {
-            client: message.client,
-            model_id: message.model_id,
-            provider_id: message.provider_id,
-            session_id: message.session_id,
-            date: message.date,
-            timestamp: message.timestamp,
-            tokens: UsageTokens {
-                input: message.input.max(0),
-                output: message.output.max(0),
-                cache_read: message.cache_read.max(0),
-                cache_write: message.cache_write.max(0),
-                reasoning: message.reasoning.max(0),
-            },
-            message_count: message.message_count.max(0),
-            reported_cost_micros: None,
+        .map(|message| {
+            let is_commandcode = message.client == "commandcode";
+            UsageRecord {
+                client: message.client,
+                model_id: message.model_id,
+                provider_id: message.provider_id,
+                session_id: message.session_id,
+                date: message.date,
+                timestamp: message.timestamp,
+                tokens: {
+                    let input = if is_commandcode {
+                        message.input.saturating_sub(message.cache_read).max(0)
+                    } else {
+                        message.input.max(0)
+                    };
+                    UsageTokens {
+                        input,
+                        output: message.output.max(0),
+                        cache_read: message.cache_read.max(0),
+                        cache_write: message.cache_write.max(0),
+                        reasoning: message.reasoning.max(0),
+                    }
+                },
+                message_count: message.message_count.max(0),
+                reported_cost_micros: None,
+            }
         })
         .collect();
 
@@ -549,17 +559,24 @@ fn collect_commandcode_v3_records(records: &mut Vec<UsageRecord>, since: Option<
                 }
 
                 let tokens = if let Some(u) = usage {
+                    let raw_input = u.get("inputTokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let cache_read = u
+                        .get("cacheReadTokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let cache_write = u
+                        .get("cacheWriteTokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let output = u.get("outputTokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    // In Command Code, `inputTokens` is total prompt tokens, which subsumes `cacheReadTokens`.
+                    // We must deduct cached tokens so that only uncached tokens are billed at full input rates.
+                    let uncached_input = raw_input.saturating_sub(cache_read).max(0);
                     UsageTokens {
-                        input: u.get("inputTokens").and_then(|v| v.as_i64()).unwrap_or(0),
-                        output: u.get("outputTokens").and_then(|v| v.as_i64()).unwrap_or(0),
-                        cache_read: u
-                            .get("cacheReadTokens")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0),
-                        cache_write: u
-                            .get("cacheWriteTokens")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0),
+                        input: uncached_input,
+                        output,
+                        cache_read,
+                        cache_write,
                         reasoning: 0,
                     }
                 } else {
@@ -1593,6 +1610,33 @@ mod tests {
         parse_cursor_json(&sample, &mut filtered, Some("2026-01-01"));
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].model_id, "grok-4.7-xhigh");
+    }
+
+    #[test]
+    fn commandcode_prompt_tokens_deduct_cache_read() {
+        let raw = serde_json::json!({
+            "inputTokens": 23057,
+            "outputTokens": 209,
+            "cacheReadTokens": 6016,
+            "cacheWriteTokens": 0,
+            "costUsd": 0.002699598
+        });
+        let raw_input = raw.get("inputTokens").and_then(|v| v.as_i64()).unwrap_or(0);
+        let cache_read = raw.get("cacheReadTokens").and_then(|v| v.as_i64()).unwrap_or(0);
+        let cache_write = raw.get("cacheWriteTokens").and_then(|v| v.as_i64()).unwrap_or(0);
+        let output = raw.get("outputTokens").and_then(|v| v.as_i64()).unwrap_or(0);
+        let uncached_input = raw_input.saturating_sub(cache_read).max(0);
+        let tokens = UsageTokens {
+            input: uncached_input,
+            output,
+            cache_read,
+            cache_write,
+            reasoning: 0,
+        };
+        assert_eq!(tokens.input, 17041);
+        assert_eq!(tokens.cache_read, 6016);
+        assert_eq!(tokens.output, 209);
+        assert_eq!(tokens.reported_total_without_reasoning(), 23266);
     }
 
     #[test]
