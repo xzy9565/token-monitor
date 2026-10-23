@@ -1953,6 +1953,25 @@ fn mask_identifier(value: &str) -> String {
     value.to_owned()
 }
 
+fn compact_mask(s: &str) -> String {
+    let s = s.split('@').next().unwrap_or(s).trim();
+    let chars = s.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return String::new();
+    }
+    if chars.len() <= 3 {
+        return s.to_owned();
+    }
+    let digit_count = chars.iter().rev().take_while(|c| c.is_ascii_digit()).count();
+    let suffix_len = if digit_count >= 2 && digit_count <= 3 {
+        digit_count
+    } else {
+        2
+    };
+    let suffix = chars.iter().rev().take(suffix_len).rev().collect::<String>();
+    format!("{}…{suffix}", chars[0])
+}
+
 fn masked_account_label(provider: &ProviderSnapshot) -> String {
     let raw = provider.account_label.trim();
     if raw.is_empty() {
@@ -2027,6 +2046,7 @@ fn display_plan(plan: &str) -> String {
         "plus" => "Plus".into(),
         "pro" | "google ai pro" => "Pro".into(),
         "team" | "teams" => "Team".into(),
+        "starter" | "starter quota" | "antigravity starter quota" => "Starter".into(),
         "pay-as-you-go" | "pay as you go" | "payg" => "Pay-as-you-go".into(),
         _ => plan.to_owned(),
     }
@@ -2044,8 +2064,7 @@ fn provider_compact_identity(provider: &ProviderSnapshot, show_account: bool) ->
     if show_account {
         Some(candidate.to_owned())
     } else {
-        let first = candidate.chars().next().unwrap_or('*');
-        Some(format!("{first}***"))
+        Some(compact_mask(candidate))
     }
 }
 
@@ -2074,8 +2093,14 @@ fn provider_identity(provider: &ProviderSnapshot, show_account: bool) -> Option<
     {
         return None;
     }
+    let (local, is_email) = match candidate.split_once('@') {
+        Some((l, _)) => (l.trim(), true),
+        None => (candidate, false),
+    };
     let value = if show_account {
-        candidate.to_owned()
+        local.to_owned()
+    } else if is_email {
+        compact_mask(local)
     } else {
         mask_identifier(candidate)
     };
@@ -2099,11 +2124,27 @@ fn provider_titles_fitted(providers: &[&ProviderSnapshot], show_account: bool, m
                 let name = provider_name(&provider.provider_id);
                 if max_w < 30 {
                     if let Some(short_id) = provider_compact_identity(provider, show_account) {
-                        return format!("{name} ({short_id})");
+                        let full = format!("{name} ({short_id})");
+                        if str_width(&full) <= max_w {
+                            return full;
+                        }
+                        if provider.provider_id.eq_ignore_ascii_case("antigravity") {
+                            let mini = format!("AGY ({short_id})");
+                            if str_width(&mini) <= max_w {
+                                return mini;
+                            }
+                        }
+                        return full;
                     }
                 }
                 if let Some(identity) = provider_identity(provider, show_account) {
                     return format!("{base} · {identity}");
+                }
+            }
+            if provider.provider_id.eq_ignore_ascii_case("antigravity") && str_width(&base) > max_w {
+                let agy_base = base.replacen("Antigravity", "AGY", 1);
+                if str_width(&agy_base) <= max_w {
+                    return agy_base;
                 }
             }
             base
@@ -2861,13 +2902,14 @@ fn normalize_client_id(client: &str) -> String {
     }
 }
 
-/// `antigravity-cli (xzy9565@gmail.com)` → `antigravity-cli (x***)`, masked like the quota panel.
+/// `antigravity-cli (xzy9565@gmail.com)` → `antigravity-cli (x…65)`, masked cleanly.
 // ponytail: always masked, even with --show-account; thread `show_account` in if that's wanted.
 fn mask_client_email(client: &str) -> String {
     match (client.find('('), client.find('@')) {
         (Some(open), Some(at)) if open < at => {
-            let first = client[open + 1..].chars().next().unwrap_or('*');
-            format!("{}({first}***)", &client[..open])
+            let local = client[open + 1..at].trim();
+            let masked = compact_mask(local);
+            format!("{}({masked})", &client[..open])
         }
         _ => client.to_owned(),
     }
@@ -2884,20 +2926,20 @@ fn format_client_display(client: &str, max_w: usize) -> String {
             if open < close {
                 let inner = s[open + 1..close].trim();
                 let full = format!("Antigravity Cli ({inner})");
-                if full.len() <= max_w {
+                if str_width(&full) <= max_w {
                     return full;
                 }
                 let med = format!("Antigravity ({inner})");
-                if med.len() <= max_w {
+                if str_width(&med) <= max_w {
                     return med;
                 }
                 let short_acct = inner.replace("Account ", "Acct ");
                 let compact = format!("Antigravity ({short_acct})");
-                if compact.len() <= max_w {
+                if str_width(&compact) <= max_w {
                     return compact;
                 }
                 let mini = format!("AGY ({short_acct})");
-                if mini.len() <= max_w {
+                if str_width(&mini) <= max_w {
                     return mini;
                 }
                 return fit(&full, max_w);
@@ -6423,14 +6465,14 @@ mod tests {
             hue: 75,
         };
         let masked = provider_identity(&provider, false).unwrap();
-        assert_eq!(masked, "p***@example.com");
+        assert_eq!(masked, "p…on");
         assert_eq!(
             provider_identity(&provider, true).unwrap(),
-            "person@example.com"
+            "person"
         );
         assert_eq!(provider_title_base(&provider), "Cursor · Free");
         let duplicate = provider_titles(&[&provider, &provider], false);
-        assert_eq!(duplicate[0], "Cursor · Free · p***@example.com");
+        assert_eq!(duplicate[0], "Cursor · Free · p…on");
         let value = public_snapshot(&provider, false);
         assert_eq!(value["accountKey"], "redacted");
         assert_eq!(value["accountLabel"], "p***@example.com");
@@ -6617,10 +6659,23 @@ mod tests {
         assert_eq!(format_client_display("Antigravity Cli", 12), "Antigravity");
         assert_eq!(format_client_display("Antigravity Cli", 8), "AGY");
         let email = normalize_client_id("antigravity-cli (xzy9565@gmail.com)");
-        assert_eq!(format_client_display(&email, 30), "Antigravity Cli (x***)");
-        assert_eq!(format_client_display(&email, 10), "AGY (x***)");
-        assert_eq!(consumption_label(&ConsumptionRow::new(&email, "google")), "Antigravity Cli (x***)");
-        assert_eq!(mask_client_email("antigravity-cli (xzy9565@gmail.com)"), "antigravity-cli (x***)");
+        assert_eq!(format_client_display(&email, 30), "Antigravity Cli (x…65)");
+        assert_eq!(format_client_display(&email, 10), "AGY (x…65)");
+        assert_eq!(consumption_label(&ConsumptionRow::new(&email, "google")), "Antigravity Cli (x…65)");
+        assert_eq!(mask_client_email("antigravity-cli (xzy9565@gmail.com)"), "antigravity-cli (x…65)");
+        assert_eq!(mask_client_email("antigravity-cli (youngxia21@gmail.com)"), "antigravity-cli (y…21)");
+        assert_eq!(mask_client_email("antigravity-cli (youngxia22@gmail.com)"), "antigravity-cli (y…22)");
+        assert_eq!(mask_client_email("antigravity-cli (brandon.xia255@gmail.com)"), "antigravity-cli (b…255)");
+    }
+
+    #[test]
+    fn compact_mask_handles_emails_and_usernames_distinctly() {
+        assert_eq!(compact_mask("youngxia21@gmail.com"), "y…21");
+        assert_eq!(compact_mask("youngxia22@gmail.com"), "y…22");
+        assert_eq!(compact_mask("xzy9565@gmail.com"), "x…65");
+        assert_eq!(compact_mask("brandon.xia255@gmail.com"), "b…255");
+        assert_eq!(compact_mask("person@example.com"), "p…on");
+        assert_eq!(compact_mask("dev"), "dev");
     }
 
     #[test]
