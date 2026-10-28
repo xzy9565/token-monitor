@@ -123,7 +123,7 @@ pub fn build_consumption_report_with_legacy(
         priced_tokens = priced_tokens.saturating_add(quote.priced_tokens);
         unpriced_tokens = unpriced_tokens.saturating_add(quote.unpriced_tokens);
         match quote.status {
-            PricingStatus::Exact => exact_rows += 1,
+            PricingStatus::Exact | PricingStatus::ProviderReported => exact_rows += 1,
             PricingStatus::Partial => partial_rows += 1,
             PricingStatus::Unknown => unknown_rows += 1,
         }
@@ -385,9 +385,20 @@ fn parse_cursor_json(content: &str, records: &mut Vec<UsageRecord>, since: Optio
         let is_grok_bot = model.starts_with("grok-bot")
             || (!raw_cid.is_empty() && grok_bot_sessions.contains(raw_cid));
 
-        let reported_cost_micros = model
-            .starts_with("grok-bot")
-            .then(|| event.get("chargedCents").and_then(|v| v.as_f64()))
+        let reported_cost_micros = (model.starts_with("grok-bot") || model == "default")
+            .then(|| {
+                event
+                    .get("chargedCents")
+                    .and_then(|v| v.as_f64())
+                    .filter(|&c| c > 0.0)
+                    .or_else(|| {
+                        event
+                            .get("tokenUsage")
+                            .and_then(|tu| tu.get("totalCents"))
+                            .and_then(|v| v.as_f64())
+                            .filter(|&c| c > 0.0)
+                    })
+            })
             .flatten()
             .map(|cents| (cents * 10_000.0).round() as i64);
 

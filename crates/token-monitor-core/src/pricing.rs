@@ -16,6 +16,7 @@ use std::sync::Mutex;
 pub enum PricingStatus {
     Exact,
     Partial,
+    ProviderReported,
     Unknown,
 }
 
@@ -86,20 +87,22 @@ impl PricingEngine {
             .saturating_add(tokens.cache_write)
             .saturating_add(tokens.output)
             .saturating_add(tokens.reasoning);
-        if let Some(micros) = record.reported_cost_micros {
-            return PriceQuote {
-                value_usd: Some(micros as f64 / 1e6),
-                status: PricingStatus::Exact,
-                source: Some("provider-reported".into()),
-                priced_tokens: total_tokens,
-                unpriced_tokens: 0,
-                warnings: vec![],
-                ..unknown_quote(record, tokens, total_tokens, "")
-            };
-        }
+
         let Some(service) = &self.service else {
+            if let Some(micros) = record.reported_cost_micros {
+                return PriceQuote {
+                    value_usd: Some(micros as f64 / 1e6),
+                    status: PricingStatus::ProviderReported,
+                    source: Some("provider-reported".into()),
+                    priced_tokens: total_tokens,
+                    unpriced_tokens: 0,
+                    warnings: vec![],
+                    ..unknown_quote(record, tokens, total_tokens, "")
+                };
+            }
             return unknown_quote(record, tokens, total_tokens, "pricing dataset unavailable");
         };
+
         let key = (record.provider_id.clone(), record.model_id.clone());
         let result = {
             let mut cache = self
@@ -109,54 +112,58 @@ impl PricingEngine {
             cache
                 .entry(key)
                 .or_insert_with(|| {
-                    // Custom overrides first, then LiteLLM, which carries vendor list prices.
-                    // OpenRouter's author endpoint can be a discounted tier (Gemini and GPT
-                    // "flex" at 50%, seen 2026-09-25), so the default lookup only fills gaps.
-                    // Each source goes hinted with canonical provider aliases, then unhinted:
-                    // a provider hint can land on an indirect reseller key (e.g. Bedrock/Perplexity)
-                    // or miss a vendor namespace (e.g. xiaomi -> xiaomi_mimo).
                     let hints = canonical_provider_hints(&record.provider_id);
+                    let candidates = canonical_model_candidates(&record.model_id, &record.provider_id);
                     let mut fallback = None;
 
-                    let found =
-                        service.lookup_with_source_and_provider(&record.model_id, Some("custom"), None);
-                    if found.as_ref().is_some_and(is_strict) {
-                        return found;
-                    }
-
-                    for &hint in &hints {
+                    for cand in &candidates {
+                        // 1. Custom dataset overrides
                         let found =
-                            service.lookup_with_source_and_provider(&record.model_id, Some("litellm"), hint);
+                            service.lookup_with_source_and_provider(cand, Some("custom"), None);
                         if found.as_ref().is_some_and(is_strict) {
                             return found;
                         }
-                    }
 
-                    for &hint in &hints {
-                        let found =
-                            service.lookup_with_source_and_provider(&record.model_id, None, hint);
-                        if found.as_ref().is_some_and(is_strict) {
-                            return found;
+                        // 2. LiteLLM vendor list prices
+                        for &hint in &hints {
+                            let found =
+                                service.lookup_with_source_and_provider(cand, Some("litellm"), hint);
+                            if found.as_ref().is_some_and(is_strict) {
+                                return found;
+                            }
                         }
-                        if fallback.is_none() {
-                            fallback = found;
+
+                        // 3. OpenRouter / reseller fallback
+                        for &hint in &hints {
+                            let found =
+                                service.lookup_with_source_and_provider(cand, None, hint);
+                            if found.as_ref().is_some_and(is_strict) {
+                                return found;
+                            }
+                            if fallback.is_none() && cand == &record.model_id {
+                                fallback = found;
+                            }
                         }
                     }
                     fallback
                 })
                 .clone()
         };
-        let Some(result) = result else {
-            return unknown_quote(record, tokens, total_tokens, "model price unavailable");
-        };
 
-        let resolution = result.evidence.kind.as_str().to_owned();
-        if !is_strict(&result) {
+        // Tier 1 & Tier 2: Strict match from canonical lookup pipeline
+        if let Some(result) = result.as_ref().filter(|r| is_strict(r)) {
+            let resolution = result.evidence.kind.as_str().to_owned();
+            let (value, priced_tokens, mut warnings) = calculate_components(&result.pricing, &tokens);
+            let complete = priced_tokens == total_tokens && warnings.is_empty();
             return PriceQuote {
                 model_id: record.model_id.clone(),
                 provider_id: record.provider_id.clone(),
-                value_usd: None,
-                status: PricingStatus::Unknown,
+                value_usd: (priced_tokens > 0).then_some(value),
+                status: if complete {
+                    PricingStatus::Exact
+                } else {
+                    PricingStatus::Partial
+                },
                 source: Some(result.source.clone()),
                 matched_key: Some(result.matched_key.clone()),
                 resolution: Some(resolution),
@@ -165,45 +172,256 @@ impl PricingEngine {
                 cache_write_tokens: tokens.cache_write,
                 output_tokens: tokens.output,
                 reasoning_tokens: tokens.reasoning,
-                priced_tokens: 0,
-                unpriced_tokens: total_tokens,
-                warnings: vec!["model/provider match is not exact".into()],
+                priced_tokens,
+                unpriced_tokens: total_tokens.saturating_sub(priced_tokens),
+                warnings: {
+                    if !complete && warnings.is_empty() {
+                        warnings.push("one or more token component rates unavailable".into());
+                    }
+                    warnings
+                },
             };
         }
 
-        let (value, priced_tokens, mut warnings) = calculate_components(&result.pricing, &tokens);
-        let complete = priced_tokens == total_tokens && warnings.is_empty();
+        // Tier 3: Client/Provider-reported cost fallback
+        if let Some(micros) = record.reported_cost_micros {
+            return PriceQuote {
+                value_usd: Some(micros as f64 / 1e6),
+                status: PricingStatus::ProviderReported,
+                source: Some("provider-reported".into()),
+                priced_tokens: total_tokens,
+                unpriced_tokens: 0,
+                warnings: vec![],
+                ..unknown_quote(record, tokens, total_tokens, "")
+            };
+        }
+
+        // Tier 4: Fail closed as Unknown
+        let (source, matched_key, resolution, warning) = if let Some(res) = result {
+            (
+                Some(res.source.clone()),
+                Some(res.matched_key.clone()),
+                Some(res.evidence.kind.as_str().to_owned()),
+                "model/provider match is not exact",
+            )
+        } else {
+            (None, None, None, "model price unavailable")
+        };
+
         PriceQuote {
             model_id: record.model_id.clone(),
             provider_id: record.provider_id.clone(),
-            value_usd: (priced_tokens > 0).then_some(value),
-            status: if complete {
-                PricingStatus::Exact
-            } else {
-                PricingStatus::Partial
-            },
-            source: Some(result.source),
-            matched_key: Some(result.matched_key),
-            resolution: Some(resolution),
+            value_usd: None,
+            status: PricingStatus::Unknown,
+            source,
+            matched_key,
+            resolution,
             input_tokens: tokens.input,
             cache_read_tokens: tokens.cache_read,
             cache_write_tokens: tokens.cache_write,
             output_tokens: tokens.output,
             reasoning_tokens: tokens.reasoning,
-            priced_tokens,
-            unpriced_tokens: total_tokens.saturating_sub(priced_tokens),
-            warnings: {
-                if !complete && warnings.is_empty() {
-                    warnings.push("one or more token component rates unavailable".into());
-                }
-                warnings
-            },
+            priced_tokens: 0,
+            unpriced_tokens: total_tokens,
+            warnings: vec![warning.into()],
         }
     }
 }
 
 mod tok_scale_resolution {
     pub use tokscale_core::pricing::lookup::ResolutionKind;
+}
+
+const FLAVOR_SUFFIXES: &[&str] = &[
+    "-max",
+    "-thinking",
+    "-abliterated",
+    "-preview",
+    "-latest",
+    "-fast",
+    "-turbo",
+    "-xhigh",
+    "-high",
+    "-medium",
+    "-low",
+    ":free",
+];
+
+fn is_valid_calendar_date_suffix(s: &str) -> bool {
+    if !s.starts_with('-') {
+        return false;
+    }
+    let digits = &s[1..];
+    if digits.len() == 8 && digits.chars().all(|c| c.is_ascii_digit()) {
+        let year: u32 = digits[0..4].parse().unwrap_or(0);
+        let month: u32 = digits[4..6].parse().unwrap_or(0);
+        let day: u32 = digits[6..8].parse().unwrap_or(0);
+        (2020..=2035).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day)
+    } else if digits.len() == 4 && digits.chars().all(|c| c.is_ascii_digit()) {
+        let month: u32 = digits[0..2].parse().unwrap_or(0);
+        let day: u32 = digits[2..4].parse().unwrap_or(0);
+        (1..=12).contains(&month) && (1..=31).contains(&day)
+    } else {
+        false
+    }
+}
+
+/// Uncollapse version punctuation: e.g. "v41" -> "v4.1", "v32" -> "v3.2"
+fn uncollapse_version_punct(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut res = String::with_capacity(s.len() + 2);
+    let mut changed = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'v'
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2].is_ascii_digit()
+            && (i + 3 == bytes.len() || !bytes[i + 3].is_ascii_alphanumeric())
+        {
+            res.push('v');
+            res.push(bytes[i + 1] as char);
+            res.push('.');
+            res.push(bytes[i + 2] as char);
+            changed = true;
+            i += 3;
+        } else {
+            res.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    if changed {
+        Some(res)
+    } else {
+        None
+    }
+}
+
+/// Swap dot and hyphen in version numbers (e.g. "3.5" <-> "3-5")
+fn swap_version_dot_hyphen(s: &str) -> Vec<String> {
+    let mut variants = Vec::new();
+    let bytes = s.as_bytes();
+    let mut s1 = String::with_capacity(s.len());
+    let mut changed1 = false;
+    for i in 0..bytes.len() {
+        if bytes[i] == b'.' && i > 0 && i + 1 < bytes.len() && bytes[i - 1].is_ascii_digit() && bytes[i + 1].is_ascii_digit() {
+            s1.push('-');
+            changed1 = true;
+        } else {
+            s1.push(bytes[i] as char);
+        }
+    }
+    if changed1 {
+        variants.push(s1);
+    }
+    let mut s2 = String::with_capacity(s.len());
+    let mut changed2 = false;
+    for i in 0..bytes.len() {
+        if bytes[i] == b'-' && i > 0 && i + 1 < bytes.len() && bytes[i - 1].is_ascii_digit() && bytes[i + 1].is_ascii_digit() {
+            s2.push('.');
+            changed2 = true;
+        } else {
+            s2.push(bytes[i] as char);
+        }
+    }
+    if changed2 {
+        variants.push(s2);
+    }
+    variants
+}
+
+fn add_candidate(c: String, candidates: &mut Vec<String>, seen: &mut std::collections::HashSet<String>) {
+    let trimmed = c.trim().to_string();
+    if !trimmed.is_empty() && seen.insert(trimmed.clone()) {
+        candidates.push(trimmed);
+    }
+}
+
+fn expand_base_model(s: &str) -> Vec<String> {
+    let mut list = vec![s.to_string()];
+    if let Some(stripped) = s.strip_prefix("cursor-") {
+        list.push(stripped.to_string());
+    }
+    let mut punct_variants = Vec::new();
+    for v in &list {
+        if let Some(uncollapsed) = uncollapse_version_punct(v) {
+            punct_variants.push(uncollapsed);
+        }
+        punct_variants.extend(swap_version_dot_hyphen(v));
+    }
+    list.extend(punct_variants);
+    list
+}
+
+pub fn canonical_model_candidates(model: &str, provider: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // 1. Tier 1: Original unaltered model
+    add_candidate(model.to_string(), &mut candidates, &mut seen);
+
+    // 2. Lowercase
+    let model_lower = model.to_ascii_lowercase();
+    add_candidate(model_lower.clone(), &mut candidates, &mut seen);
+
+    for v in expand_base_model(&model_lower) {
+        add_candidate(v, &mut candidates, &mut seen);
+    }
+
+    // 3. Strip flavor / effort / execution modifiers
+    let current_snapshot = candidates.clone();
+    for v in current_snapshot {
+        let mut curr = v.clone();
+        loop {
+            let mut stripped = false;
+            for &suf in FLAVOR_SUFFIXES {
+                if curr.ends_with(suf) {
+                    curr.truncate(curr.len() - suf.len());
+                    for exp in expand_base_model(&curr) {
+                        add_candidate(exp, &mut candidates, &mut seen);
+                    }
+                    stripped = true;
+                    break;
+                }
+            }
+            if !stripped || curr.is_empty() {
+                break;
+            }
+        }
+    }
+
+    // 4. Strip date suffixes (-YYYYMMDD, -MMDD)
+    let current_snapshot = candidates.clone();
+    for v in current_snapshot {
+        if let Some(idx) = v.rfind('-') {
+            let suffix = &v[idx..];
+            if is_valid_calendar_date_suffix(suffix) {
+                let base = &v[..idx];
+                for exp in expand_base_model(base) {
+                    add_candidate(exp, &mut candidates, &mut seen);
+                }
+            }
+        }
+    }
+
+    // 5. Vendor defaults
+    let prov = provider.to_ascii_lowercase();
+    if prov == "google" || prov == "gemini" {
+        for v in candidates.clone() {
+            if !v.ends_with("-preview") {
+                add_candidate(format!("{v}-preview"), &mut candidates, &mut seen);
+            }
+        }
+    } else if prov == "anthropic" || prov == "claude" {
+        for v in candidates.clone() {
+            if !v.ends_with("-latest") {
+                add_candidate(format!("{v}-latest"), &mut candidates, &mut seen);
+            }
+        }
+    }
+
+    candidates
 }
 
 fn canonical_provider_hints<'a>(provider: &'a str) -> Vec<Option<&'a str>> {
@@ -232,6 +450,22 @@ fn canonical_provider_hints<'a>(provider: &'a str) -> Vec<Option<&'a str>> {
         "moonshot" | "kimi" => {
             hints.push(Some("moonshot"));
             hints.push(Some("kimi"));
+        }
+        "qwen" | "alibaba" | "dashscope" => {
+            hints.push(Some("dashscope"));
+            hints.push(Some("alibaba"));
+            hints.push(Some("qwen"));
+        }
+        "deepseek" => {
+            hints.push(Some("deepseek"));
+        }
+        "xai" | "grok" => {
+            hints.push(Some("xai"));
+            hints.push(Some("grok"));
+        }
+        "meta" | "llama" => {
+            hints.push(Some("meta"));
+            hints.push(Some("llama"));
         }
         _ => {
             hints.push(Some(provider));
@@ -390,7 +624,7 @@ mod tests {
         let mut rec = record("grokbot", "grok-bot-default");
         rec.reported_cost_micros = Some(197_022);
         let quote = engine().quote(&rec);
-        assert_eq!(quote.status, PricingStatus::Exact);
+        assert_eq!(quote.status, PricingStatus::ProviderReported);
         assert!((quote.value_usd.unwrap() - 0.197022).abs() < 1e-12);
         assert_eq!(quote.unpriced_tokens, 0);
     }
@@ -527,6 +761,39 @@ mod tests {
         assert_eq!(quote.status, PricingStatus::Exact);
         assert_eq!(quote.priced_tokens, 100);
         assert!(quote.value_usd.is_some());
+    }
+
+    #[test]
+    fn deepseek_v41_flash_1017_max_normalizes_and_resolves_exact_pricing() {
+        let engine = PricingEngine::load_cached();
+        if !engine.has_pricing_data() {
+            return;
+        }
+        let rec = UsageRecord {
+            client: "cursor".into(),
+            model_id: "deepseek-v41-flash-1017-max".into(),
+            provider_id: "deepseek".into(),
+            session_id: "s".into(),
+            date: "2026-10-28".into(),
+            timestamp: 0,
+            tokens: UsageTokens {
+                input: 130764,
+                output: 56246,
+                cache_read: 697344,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            message_count: 1,
+            reported_cost_micros: None,
+        };
+        let quote = engine.quote(&rec);
+        assert_eq!(quote.status, PricingStatus::Exact);
+        assert_eq!(quote.matched_key.as_deref(), Some("deepseek/deepseek-v4.1-flash-1017"));
+        assert_eq!(quote.priced_tokens, 884354);
+        assert_eq!(quote.unpriced_tokens, 0);
+        assert!(quote.value_usd.is_some());
+        let val = quote.value_usd.unwrap();
+        assert!((val - 0.055454232).abs() < 1e-6);
     }
 
     #[test]

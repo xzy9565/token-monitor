@@ -3145,7 +3145,8 @@ fn consumption_rows(
             row.priced_tokens = row.priced_tokens.saturating_add(quote.priced_tokens);
             row.unpriced_tokens = row.unpriced_tokens.saturating_add(quote.unpriced_tokens);
             match quote.status {
-                token_monitor_core::pricing::PricingStatus::Exact => {}
+                token_monitor_core::pricing::PricingStatus::Exact
+                | token_monitor_core::pricing::PricingStatus::ProviderReported => {}
                 token_monitor_core::pricing::PricingStatus::Partial => row.partial_rows += 1,
                 token_monitor_core::pricing::PricingStatus::Unknown => row.unknown_rows += 1,
             }
@@ -3154,7 +3155,8 @@ fn consumption_rows(
             row.priced_tokens = row.priced_tokens.saturating_add(quote.priced_tokens);
             row.unpriced_tokens = row.unpriced_tokens.saturating_add(quote.unpriced_tokens);
             match quote.status {
-                token_monitor_core::pricing::PricingStatus::Exact => {}
+                token_monitor_core::pricing::PricingStatus::Exact
+                | token_monitor_core::pricing::PricingStatus::ProviderReported => {}
                 token_monitor_core::pricing::PricingStatus::Partial => row.partial_rows += 1,
                 token_monitor_core::pricing::PricingStatus::Unknown => row.unknown_rows += 1,
             }
