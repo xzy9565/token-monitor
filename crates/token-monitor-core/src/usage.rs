@@ -6,7 +6,7 @@
 //! subscription ledger.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::pricing::{PriceQuote, PricingEngine, PricingStatus};
@@ -261,7 +261,8 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
 
     collect_commandcode_v3_records(&mut records, options.since.as_deref());
     collect_cursor_cache_records(&mut records, options.since.as_deref());
-    enrich_antigravity_records(&mut records);
+    let inherited = rebuild_forked_antigravity_sessions(&mut records);
+    enrich_antigravity_records(&mut records, &inherited);
     tag_antigravity_account_records(&mut records);
     // Same string comparison tokscale applies to `date`.
     records.retain(|r| {
@@ -1019,9 +1020,179 @@ fn fallback_timestamp(timestamps: impl Iterator<Item = i64>) -> Option<i64> {
         .map(|(ts, _)| ts)
 }
 
+/// A record for one AGY generation as tokscale parsed it from a single database file.
+fn agy_record(
+    m: tokscale_core::sessions::UnifiedMessage,
+    client: &str,
+    session_id: &str,
+) -> UsageRecord {
+    UsageRecord {
+        client: client.to_owned(),
+        model_id: m.model_id,
+        provider_id: m.provider_id,
+        session_id: session_id.to_owned(),
+        date: m.date,
+        timestamp: m.timestamp,
+        tokens: UsageTokens {
+            input: m.tokens.input.max(0),
+            output: m.tokens.output.max(0),
+            cache_read: m.tokens.cache_read.max(0),
+            cache_write: m.tokens.cache_write.max(0),
+            reasoning: m.tokens.reasoning.max(0),
+        },
+        message_count: m.message_count.max(0),
+        reported_cost_micros: None,
+    }
+}
+
+/// The conversation a `parent_references` row's trajectory segment came from (field 6).
+fn parent_reference_conversation(blob: &[u8]) -> Option<&str> {
+    let mut reader = ProtoWireReader::new(blob);
+    while let Some((field, wire)) = reader.next_field() {
+        if let (6, ProtoWire::Len(id)) = (field, wire) {
+            return std::str::from_utf8(id).ok();
+        }
+    }
+    None
+}
+
+/// The conversations a `/fork` copied this one's history from. `parent_references` lists the
+/// trajectory segments a conversation is made of; a fork's first segments name its parent.
+fn agy_ancestors(db: &std::path::Path, session_id: &str) -> Vec<String> {
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    ) else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT data FROM parent_references ORDER BY idx") else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0)) else {
+        return Vec::new();
+    };
+    let mut ancestors: Vec<String> = Vec::new();
+    for blob in rows.flatten() {
+        if let Some(id) = parent_reference_conversation(&blob) {
+            if id != session_id && !ancestors.iter().any(|a| a == id) {
+                ancestors.push(id.to_owned());
+            }
+        }
+    }
+    ancestors
+}
+
+/// Per fork, the generations its ancestors also hold: the history it copied, which belongs to the
+/// ancestor that made it.
+fn agy_inherited_keys(
+    lineage: &HashMap<String, Vec<String>>,
+    held: &HashMap<String, HashSet<Vec<u8>>>,
+) -> HashMap<String, HashSet<Vec<u8>>> {
+    lineage
+        .iter()
+        .map(|(fork, ancestors)| {
+            let inherited = ancestors
+                .iter()
+                .filter_map(|a| held.get(a))
+                .flatten()
+                .cloned()
+                .collect();
+            (fork.clone(), inherited)
+        })
+        .collect()
+}
+
+/// AGY's `/fork` copies the parent's history (steps and `gen_metadata` rows, response ids included)
+/// into the new conversation, and tokscale keeps the first copy of a response id in file-path order.
+/// A fork whose id sorts first so took over its parent's whole history, dated at the fork and driven
+/// by no process (2026-10-27: 3,131 rows of [Immigration] showed up as 442M untagged tokens on the
+/// day its fork [Job Hunting] was made), while the parent, left with only exactly-dated rows, had no
+/// fallback to date its archive by and lost 775 archived rows outright. Rebuilds every fork and its
+/// ancestors from their own
+/// databases so each generation stays with the conversation that made it. Returns each fork's
+/// inherited keys, which its own rows skip.
+fn rebuild_forked_antigravity_sessions(
+    records: &mut Vec<UsageRecord>,
+) -> HashMap<String, HashSet<Vec<u8>>> {
+    use rayon::prelude::*;
+
+    let Some(home) = dirs::home_dir() else {
+        return HashMap::new();
+    };
+    // ponytail: the desktop app and IDE extension share response ids with the CLI, and tokscale's
+    // cross-surface dedup can't be redone from here; their users keep tokscale's attribution.
+    if records
+        .iter()
+        .any(|r| r.client == "antigravity" || r.client == "antigravity-extension")
+    {
+        return HashMap::new();
+    }
+    let conv_dir = home.join(".gemini/antigravity-cli/conversations");
+    let archive_dir = home.join(".gemini/antigravity-cli/archive");
+    let db = |id: &str| conv_dir.join(format!("{id}.db"));
+
+    let sessions: HashSet<&str> = records
+        .iter()
+        .filter(|r| r.client == "antigravity-cli")
+        .map(|r| r.session_id.as_str())
+        .collect();
+    let lineage: HashMap<String, Vec<String>> = sessions
+        .par_iter()
+        .filter_map(|&id| {
+            let ancestors: Vec<String> = agy_ancestors(&db(id), id)
+                .into_iter()
+                .filter(|a| db(a).exists())
+                .collect();
+            (!ancestors.is_empty()).then(|| (id.to_owned(), ancestors))
+        })
+        .collect();
+    if lineage.is_empty() {
+        return HashMap::new();
+    }
+
+    // Each member's rows straight from its own file: tokscale's per-file parse lines up 1:1 with
+    // `read_gen_turns`.
+    let members: BTreeSet<String> = lineage
+        .iter()
+        .flat_map(|(fork, ancestors)| std::iter::once(fork).chain(ancestors))
+        .cloned()
+        .collect();
+    let mut parsed = BTreeMap::new();
+    let mut held: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
+    for id in &members {
+        let path = db(id);
+        let messages = tokscale_core::sessions::antigravity_cli::parse_antigravity_cli_file(&path);
+        let Some(turns) = read_gen_turns(&path).filter(|t| t.len() == messages.len()) else {
+            return HashMap::new(); // can't line them up: leave tokscale's records as they are
+        };
+        let archived = read_gen_turns(&archive_dir.join(format!("{id}.cold.db")));
+        let keys: Vec<Vec<u8>> = turns.into_iter().map(|(key, _)| key).collect();
+        let mut all_keys: HashSet<Vec<u8>> = keys.iter().cloned().collect();
+        all_keys.extend(archived.unwrap_or_default().into_iter().map(|(key, _)| key));
+        held.insert(id.clone(), all_keys);
+        let rows: Vec<_> = keys.into_iter().zip(messages).collect();
+        parsed.insert(id.clone(), rows);
+    }
+    let inherited = agy_inherited_keys(&lineage, &held);
+
+    records.retain(|r| !(r.client == "antigravity-cli" && members.contains(&r.session_id)));
+    for (id, rows) in parsed {
+        let skip = inherited.get(&id);
+        records.extend(
+            rows.into_iter()
+                .filter(|(key, _)| skip.is_none_or(|s| !s.contains(key)))
+                .map(|(_, m)| agy_record(m, "antigravity-cli", &id)),
+        );
+    }
+    inherited
+}
+
 /// Dates AGY records from AGY's transcript, and adds the usage that only `agy-dehydrate`'s archive
-/// still holds.
-fn enrich_antigravity_records(records: &mut Vec<UsageRecord>) {
+/// still holds. A fork's records skip the `inherited` history, which stays with its ancestor.
+fn enrich_antigravity_records(
+    records: &mut Vec<UsageRecord>,
+    inherited: &HashMap<String, HashSet<Vec<u8>>>,
+) {
     use rayon::prelude::*;
 
     let home = match dirs::home_dir() {
@@ -1118,10 +1289,15 @@ fn enrich_antigravity_records(records: &mut Vec<UsageRecord>) {
             }
 
             let hot = read_gen_turns(&db_path)?;
+            let skip = inherited.get(&session_id);
+            let own: Vec<&GenTurn> = hot
+                .iter()
+                .filter(|(key, _)| skip.is_none_or(|s| !s.contains(key)))
+                .collect();
             let mut time_updates = Vec::new();
 
             let Some(lines) = &transcript else {
-                for (&r_idx, (_, steps)) in record_indices.iter().zip(&hot) {
+                for (&r_idx, (_, steps)) in record_indices.iter().zip(own.iter().copied()) {
                     if records_ref[r_idx].timestamp != first_ts {
                         continue;
                     }
@@ -1145,7 +1321,7 @@ fn enrich_antigravity_records(records: &mut Vec<UsageRecord>) {
                 .filter_map(|((key, _), ts)| Some((key.as_slice(), ts?)))
                 .collect();
 
-            for (&r_idx, (key, _)) in record_indices.iter().zip(&hot) {
+            for (&r_idx, (key, _)) in record_indices.iter().zip(own.iter().copied()) {
                 if records_ref[r_idx].timestamp != first_ts {
                     continue;
                 }
@@ -1164,26 +1340,12 @@ fn enrich_antigravity_records(records: &mut Vec<UsageRecord>) {
                 let parsed =
                     tokscale_core::sessions::antigravity_cli::parse_antigravity_cli_file(&archive_path);
                 for ((key, _), m) in archived.iter().zip(parsed) {
-                    if in_hot.contains(key.as_slice()) {
+                    if in_hot.contains(key.as_slice()) || skip.is_some_and(|s| s.contains(key)) {
                         continue;
                     }
-                    let mut record = UsageRecord {
-                        client: client.clone(),
-                        model_id: m.model_id,
-                        provider_id: m.provider_id,
-                        session_id: session_id.clone(),
-                        date: first_date.clone(),
-                        timestamp: first_ts,
-                        tokens: UsageTokens {
-                            input: m.tokens.input.max(0),
-                            output: m.tokens.output.max(0),
-                            cache_read: m.tokens.cache_read.max(0),
-                            cache_write: m.tokens.cache_write.max(0),
-                            reasoning: m.tokens.reasoning.max(0),
-                        },
-                        message_count: m.message_count.max(0),
-                        reported_cost_micros: None,
-                    };
+                    let mut record = agy_record(m, &client, &session_id);
+                    record.date = first_date.clone();
+                    record.timestamp = first_ts;
                     if let Some(&ts) = dated.get(key.as_slice()) {
                         set_record_time(&mut record, ts);
                     }
@@ -1454,6 +1616,38 @@ mod tests {
                 "antigravity-cli", // both processes long gone: unknown, not guessed
             ]
         );
+    }
+
+    #[test]
+    fn forked_antigravity_history_stays_with_its_ancestor() {
+        // A `parent_references` row: field 1 the trajectory, field 6 the conversation it came from.
+        let row = |conversation: &str| {
+            let mut blob = vec![0x0a, 4];
+            blob.extend(b"traj");
+            blob.extend([0x32, conversation.len() as u8]);
+            blob.extend(conversation.as_bytes());
+            blob
+        };
+        let parent = row("parent");
+        assert_eq!(parent_reference_conversation(&parent), Some("parent"));
+
+        let keys = |ids: &[&str]| -> HashSet<Vec<u8>> {
+            ids.iter().map(|id| id.as_bytes().to_vec()).collect()
+        };
+        let ids = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        let lineage = HashMap::from([
+            ("fork".to_owned(), ids(&["parent"])),
+            ("fork-of-fork".to_owned(), ids(&["parent", "fork"])),
+        ]);
+        let held = HashMap::from([
+            ("parent".to_owned(), keys(&["a", "b"])),
+            ("fork".to_owned(), keys(&["a", "b", "f"])),
+            ("fork-of-fork".to_owned(), keys(&["a", "b", "f", "g"])),
+        ]);
+        let inherited = agy_inherited_keys(&lineage, &held);
+        assert_eq!(inherited["fork"], keys(&["a", "b"])); // the parent's history, not its own "f"
+        assert_eq!(inherited["fork-of-fork"], keys(&["a", "b", "f"]));
+        assert!(!inherited.contains_key("parent")); // an ancestor keeps all of its rows
     }
 
     #[test]
