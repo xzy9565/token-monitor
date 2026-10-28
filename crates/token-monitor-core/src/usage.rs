@@ -1223,19 +1223,21 @@ fn enrich_antigravity_records(
     let results: Vec<SessionEnrichment> = session_map
         .into_par_iter()
         .filter_map(|(session_id, record_indices)| {
-            if record_indices.len() <= 1 {
-                return None;
-            }
             // Only the records tokscale could not date get re-dated: those all sit on the session's
             // start. A session that spans an AGY upgrade also has rows dated by their own
             // generation time (agy <= 1.1.17 wrote one), and skipping it whole left 6baa4b1b's
-            // October usage on 08-30.
+            // October usage on 08-30. A session with none still gets its archive: gating that on
+            // them lost [Immigration]'s 775 archived rows once a fork took its undated ones.
             let first_ts =
-                fallback_timestamp(record_indices.iter().map(|&i| records_ref[i].timestamp))?;
+                fallback_timestamp(record_indices.iter().map(|&i| records_ref[i].timestamp));
+            let archive_path = archive_dir.join(format!("{session_id}.cold.db"));
+            if first_ts.is_none() && !archive_path.exists() {
+                return None;
+            }
             let first_date = record_indices
                 .iter()
                 .map(|&i| &records_ref[i])
-                .find(|r| r.timestamp == first_ts)
+                .find(|r| Some(r.timestamp) == first_ts)
                 .map(|r| r.date.clone())
                 .unwrap_or_default();
 
@@ -1298,7 +1300,7 @@ fn enrich_antigravity_records(
 
             let Some(lines) = &transcript else {
                 for (&r_idx, (_, steps)) in record_indices.iter().zip(own.iter().copied()) {
-                    if records_ref[r_idx].timestamp != first_ts {
+                    if Some(records_ref[r_idx].timestamp) != first_ts {
                         continue;
                     }
                     if let Some(ts) = steps.iter().find_map(|s| step_timestamps.get(s).copied()) {
@@ -1311,7 +1313,6 @@ fn enrich_antigravity_records(
                 });
             };
 
-            let archive_path = archive_dir.join(format!("{session_id}.cold.db"));
             let archived = read_gen_turns(&archive_path).unwrap_or_default();
             let history = gen_history(&archived, &hot);
             let steps: Vec<Vec<i64>> = history.iter().map(|(_, s)| s.clone()).collect();
@@ -1322,7 +1323,7 @@ fn enrich_antigravity_records(
                 .collect();
 
             for (&r_idx, (key, _)) in record_indices.iter().zip(own.iter().copied()) {
-                if records_ref[r_idx].timestamp != first_ts {
+                if Some(records_ref[r_idx].timestamp) != first_ts {
                     continue;
                 }
                 if let Some(&ts) = dated.get(key.as_slice()) {
@@ -1343,9 +1344,14 @@ fn enrich_antigravity_records(
                     if in_hot.contains(key.as_slice()) || skip.is_some_and(|s| s.contains(key)) {
                         continue;
                     }
+                    // ponytail: with no session start, a row the transcript can't date (1 of 3,910
+                    // on 2026-10-28) keeps tokscale's reading of the archive, whose fallback is
+                    // the file's mtime; date it by its dated neighbours if that ever matters.
                     let mut record = agy_record(m, &client, &session_id);
-                    record.date = first_date.clone();
-                    record.timestamp = first_ts;
+                    if let Some(ts) = first_ts {
+                        record.date = first_date.clone();
+                        record.timestamp = ts;
+                    }
                     if let Some(&ts) = dated.get(key.as_slice()) {
                         set_record_time(&mut record, ts);
                     }
