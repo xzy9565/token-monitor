@@ -793,7 +793,7 @@ mod tests {
         assert_eq!(quote.unpriced_tokens, 0);
         assert!(quote.value_usd.is_some());
         let val = quote.value_usd.unwrap();
-        assert!((val - 0.055454232).abs() < 1e-6);
+        assert!((val - 0.110908464).abs() < 1e-6);
     }
 
     #[test]

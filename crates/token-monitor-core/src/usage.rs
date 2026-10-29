@@ -773,24 +773,29 @@ fn tag_antigravity_records_from_logs(
         events.sort_unstable();
     }
     for record in records.iter_mut().filter(|r| r.client == "antigravity-cli") {
+        let ts = record.timestamp;
         let mut conversation = record.session_id.as_str();
+        let mut email = None;
+
         for _ in 0..8 {
+            if let Some(events) = drivers.get(conversation) {
+                let before = events.partition_point(|&(ms, _)| ms <= ts);
+                email = events[..before]
+                    .iter()
+                    .rev()
+                    .map(|&(_, i)| &logs[i])
+                    .find(|log| ts <= log.last_ms + AGY_LOG_SLACK_MS)
+                    .and_then(|log| log.email.as_deref());
+                if email.is_some() {
+                    break;
+                }
+            }
             match parents.get(conversation) {
-                Some(parent) if !drivers.contains_key(conversation) => conversation = parent,
-                _ => break,
+                Some(parent) => conversation = parent.as_str(),
+                None => break,
             }
         }
-        let Some(events) = drivers.get(conversation) else {
-            continue;
-        };
-        let ts = record.timestamp;
-        let before = events.partition_point(|&(ms, _)| ms <= ts);
-        let email = events[..before]
-            .iter()
-            .rev()
-            .map(|&(_, i)| &logs[i])
-            .find(|log| ts <= log.last_ms + AGY_LOG_SLACK_MS)
-            .and_then(|log| log.email.as_deref());
+
         if let Some(email) = email {
             record.client = format!("antigravity-cli ({email})");
         }
@@ -1631,6 +1636,53 @@ mod tests {
                 "antigravity-cli (three@example.com)", // pane 3 took over
                 "antigravity-cli (three@example.com)", // subagent follows its parent
                 "antigravity-cli", // both processes long gone: unknown, not guessed
+            ]
+        );
+    }
+
+    #[test]
+    fn subagent_with_late_tool_confirmation_inherits_parent_account_for_early_turns() {
+        let parent_conv = "parent-conv-uuid";
+        let subagent_conv = "subagent-conv-uuid";
+
+        let logs = vec![AgyProcessLog {
+            email: Some("parent@example.com".into()),
+            last_ms: 1_000_000,
+            // Parent drove parent_conv at t=100.
+            // Later at t=500, a tool confirmation event was logged under subagent_conv.
+            events: vec![
+                (100, parent_conv.into()),
+                (500, subagent_conv.into()),
+            ],
+        }];
+        let parents = HashMap::from([(subagent_conv.to_owned(), parent_conv.to_owned())]);
+
+        let mut records: Vec<UsageRecord> = [
+            (subagent_conv, 200), // Turn before tool confirmation at t=500
+            (subagent_conv, 600), // Turn after tool confirmation at t=500
+        ]
+        .into_iter()
+        .map(|(session, timestamp)| UsageRecord {
+            client: "antigravity-cli".into(),
+            model_id: "gemini-3.8-flash".into(),
+            provider_id: "google".into(),
+            session_id: session.into(),
+            date: "2026-10-28".into(),
+            timestamp,
+            tokens: UsageTokens::default(),
+            message_count: 1,
+            reported_cost_micros: None,
+        })
+        .collect();
+
+        tag_antigravity_records_from_logs(&mut records, &logs, &parents);
+
+        let clients: Vec<&str> = records.iter().map(|r| r.client.as_str()).collect();
+        assert_eq!(
+            clients,
+            [
+                "antigravity-cli (parent@example.com)", // inherited from parent before subagent's own event
+                "antigravity-cli (parent@example.com)", // matched subagent's own event at t=500
             ]
         );
     }
