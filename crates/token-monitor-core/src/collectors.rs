@@ -5154,6 +5154,253 @@ pub async fn collect_ollama(options: &CollectorOptions) -> Vec<ProviderSnapshot>
     )]
 }
 
+fn opencode_db_credentials() -> Vec<(String, String)> {
+    let mut creds = Vec::new();
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let opencode_dir = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local").join("share"))
+        .join("opencode");
+    let db_path = opencode_dir.join("opencode.db");
+    if db_path.exists() {
+        if let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT integration_id, label, value FROM credential WHERE active = 1 ORDER BY CASE WHEN integration_id = 'opencode-go' THEN 0 ELSE 1 END"
+            ) {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    let integration_id: String = row.get(0)?;
+                    let label: String = row.get(1)?;
+                    let value: String = row.get(2)?;
+                    Ok((integration_id, label, value))
+                }) {
+                    for row in rows.flatten() {
+                        if let Ok(val) = serde_json::from_str::<Value>(&row.2) {
+                            let key = val
+                                .get("key")
+                                .or_else(|| val.get("apiKey"))
+                                .or_else(|| val.get("access"))
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_owned);
+                            if let Some(k) = key {
+                                let label = if row.0 == "opencode-go" {
+                                    "OpenCode Go".to_string()
+                                } else if !row.1.is_empty() {
+                                    row.1
+                                } else {
+                                    "OpenCode".to_string()
+                                };
+                                creds.push((k, label));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    creds
+}
+
+fn opencode_auth_json_credentials() -> Option<(String, String)> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let opencode_dir = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local").join("share"))
+        .join("opencode");
+    let auth_path = opencode_dir.join("auth.json");
+    let content = std::fs::read_to_string(auth_path).ok()?;
+    let val: Value = serde_json::from_str(&content).ok()?;
+    let key = val
+        .get("opencode-go")
+        .and_then(|e| e.get("key"))
+        .or_else(|| val.get("opencode").and_then(|e| e.get("key")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    Some((key.to_owned(), "OpenCode Go".to_string()))
+}
+
+fn opencode_credentials() -> Vec<(String, String)> {
+    let mut creds = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(key) = env_secret(&["TOKEN_MONITOR_OPENCODE_API_KEY", "OPENCODE_API_KEY"]) {
+        seen.insert(key.clone());
+        creds.push((key, "OpenCode Go".to_string()));
+    }
+
+    for (key, label) in opencode_db_credentials() {
+        if seen.insert(key.clone()) {
+            creds.push((key, label));
+            break;
+        }
+    }
+
+    if creds.is_empty() {
+        if let Some((key, label)) = opencode_auth_json_credentials() {
+            if seen.insert(key.clone()) {
+                creds.push((key, label));
+            }
+        }
+    }
+
+    creds
+}
+
+fn opencode_windows(status: &Value) -> Vec<LimitWindow> {
+    let Some(usage) = status.get("usage") else {
+        return vec![];
+    };
+    let mut windows = vec![];
+
+    if let Some(rolling) = usage.get("rolling") {
+        let used = number(rolling.get("percent")).unwrap_or(0.0).clamp(0.0, 100.0);
+        let resets_at = rolling.get("resetsAt").and_then(Value::as_str);
+        let resets_at_ms = resets_at
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| dt.timestamp_millis());
+        windows.push(LimitWindow {
+            label: "Rolling".into(),
+            kind: WindowKind::Session,
+            metric: WindowMetric::Quota,
+            remaining_percent: Some((100.0 - used).clamp(0.0, 100.0)),
+            remaining_amount: None,
+            currency: None,
+            resets_at_ms,
+            reset_text: None,
+            estimated: false,
+        });
+    }
+
+    if let Some(weekly) = usage.get("weekly") {
+        let used = number(weekly.get("percent")).unwrap_or(0.0).clamp(0.0, 100.0);
+        let resets_at = weekly.get("resetsAt").and_then(Value::as_str);
+        let resets_at_ms = resets_at
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| dt.timestamp_millis());
+        windows.push(LimitWindow {
+            label: "Weekly".into(),
+            kind: WindowKind::Weekly,
+            metric: WindowMetric::Quota,
+            remaining_percent: Some((100.0 - used).clamp(0.0, 100.0)),
+            remaining_amount: None,
+            currency: None,
+            resets_at_ms,
+            reset_text: None,
+            estimated: false,
+        });
+    }
+
+    if let Some(monthly) = usage.get("monthly") {
+        let used = number(monthly.get("percent")).unwrap_or(0.0).clamp(0.0, 100.0);
+        let resets_at = monthly.get("resetsAt").and_then(Value::as_str);
+        let resets_at_ms = resets_at
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| dt.timestamp_millis());
+        windows.push(LimitWindow {
+            label: "Monthly".into(),
+            kind: WindowKind::Monthly,
+            metric: WindowMetric::Quota,
+            remaining_percent: Some((100.0 - used).clamp(0.0, 100.0)),
+            remaining_amount: None,
+            currency: None,
+            resets_at_ms,
+            reset_text: None,
+            estimated: false,
+        });
+    }
+
+    windows
+}
+
+pub async fn collect_opencode(options: &CollectorOptions) -> Vec<ProviderSnapshot> {
+    if !options.includes("opencode") {
+        return vec![];
+    }
+    let credentials = opencode_credentials();
+    if credentials.is_empty() {
+        return vec![unavailable_snapshot(
+            "opencode",
+            "".into(),
+            "OpenCode Go".into(),
+            "api",
+            SourceHealth::Unavailable,
+            "OpenCode Go credentials not found",
+            200,
+        )];
+    }
+    let Ok(client) = http_client(options.timeout()) else {
+        return vec![];
+    };
+    let mut snapshots = vec![];
+    for (token, label) in credentials {
+        let key = account_key("opencode", &token);
+        let status = match request_bearer_json(
+            &client,
+            "https://opencode.ai/zen/go/v1/usage",
+            &token,
+            &[],
+        )
+        .await
+        {
+            Ok(status) => status,
+            Err((health, detail)) => {
+                snapshots.push(unavailable_snapshot(
+                    "opencode",
+                    key,
+                    label,
+                    "api",
+                    health,
+                    &detail,
+                    200,
+                ));
+                continue;
+            }
+        };
+        let windows = opencode_windows(&status);
+        if windows.is_empty() {
+            snapshots.push(unavailable_snapshot(
+                "opencode",
+                key,
+                label,
+                "api",
+                SourceHealth::Unavailable,
+                "OpenCode Go usage response contained no quota windows",
+                200,
+            ));
+            continue;
+        }
+        let is_rate_limited = status
+            .get("usage")
+            .and_then(|u| u.get("rolling").or_else(|| u.get("weekly")))
+            .and_then(|w| w.get("status"))
+            .and_then(Value::as_str)
+            == Some("rate-limited");
+
+        let mut snapshot = connected_snapshot(
+            "opencode",
+            key,
+            label,
+            "Go".into(),
+            "api",
+            windows,
+            200,
+        );
+        if is_rate_limited {
+            snapshot.availability = Availability::Exhausted;
+            snapshot.diagnostics.push("OpenCode Go is currently rate-limited".into());
+        }
+        snapshots.push(snapshot);
+    }
+    snapshots
+}
+
 pub async fn collect_live_limits(options: &CollectorOptions) -> Vec<ProviderSnapshot> {
     let explicit_selection = options.providers.is_some();
     let (
@@ -5176,6 +5423,7 @@ pub async fn collect_live_limits(options: &CollectorOptions) -> Vec<ProviderSnap
         trae,
         kiro,
         ollama,
+        opencode,
     ) = tokio::join!(
         collect_openrouter(options),
         collect_deepseek(options),
@@ -5196,6 +5444,7 @@ pub async fn collect_live_limits(options: &CollectorOptions) -> Vec<ProviderSnap
         collect_trae(options),
         collect_kiro(options),
         collect_ollama(options),
+        collect_opencode(options),
     );
     let mut rows = [
         openrouter,
@@ -5217,6 +5466,7 @@ pub async fn collect_live_limits(options: &CollectorOptions) -> Vec<ProviderSnap
         trae,
         kiro,
         ollama,
+        opencode,
     ]
     .into_iter()
     .flatten()
@@ -5292,6 +5542,44 @@ mod tests {
         assert!((window.remaining_percent.unwrap() - 99.783652).abs() < 1e-9);
         assert_eq!(window.resets_at_ms, Some(1_792_103_978_307));
         assert!(grok_bot_window(&serde_json::json!({"usagePercent": 5.0})).is_none());
+    }
+
+    #[test]
+    fn opencode_windows_parses_rolling_weekly_and_monthly() {
+        let status = serde_json::json!({
+            "usage": {
+                "rolling": {
+                    "status": "ok",
+                    "percent": 15.5,
+                    "resetsAt": "2026-10-31T23:54:45.000Z"
+                },
+                "weekly": {
+                    "status": "ok",
+                    "percent": 42.0,
+                    "resetsAt": "2026-11-02T00:00:00.000Z"
+                },
+                "monthly": {
+                    "status": "ok",
+                    "percent": 0.0,
+                    "resetsAt": "2026-11-30T18:47:40.000Z"
+                }
+            }
+        });
+        let windows = opencode_windows(&status);
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[0].label, "Rolling");
+        assert_eq!(windows[0].kind, WindowKind::Session);
+        assert!((windows[0].remaining_percent.unwrap() - 84.5).abs() < 1e-9);
+        assert_eq!(windows[0].resets_at_ms, Some(1_793_490_885_000));
+
+        assert_eq!(windows[1].label, "Weekly");
+        assert_eq!(windows[1].kind, WindowKind::Weekly);
+        assert!((windows[1].remaining_percent.unwrap() - 58.0).abs() < 1e-9);
+        assert_eq!(windows[1].resets_at_ms, Some(1_793_577_600_000));
+
+        assert_eq!(windows[2].label, "Monthly");
+        assert_eq!(windows[2].kind, WindowKind::Monthly);
+        assert!((windows[2].remaining_percent.unwrap() - 100.0).abs() < 1e-9);
     }
 
     #[test]

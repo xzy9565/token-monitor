@@ -48,6 +48,7 @@ pub const NATIVE_PROVIDER_IDS: &[&str] = &[
     "openrouter",
     "modal",
     "vast",
+    "opencode",
 ];
 
 pub fn display_name(id: &str) -> &str {

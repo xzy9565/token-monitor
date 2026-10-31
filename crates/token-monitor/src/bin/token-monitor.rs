@@ -249,7 +249,7 @@ const CREDENTIAL_SPECS: &[CredentialSpec] = &[
         kind: CredentialKind::ApiKey,
         url: "opencode.ai",
         prefix: "",
-        instruction: "Paste the OpenCode credential. Adapter parity is still pending.",
+        instruction: "Paste the OpenCode API key (or auto-discovered from ~/.local/share/opencode/opencode.db).",
     },
     CredentialSpec {
         provider_id: "workbuddy",
@@ -2045,6 +2045,7 @@ fn display_plan(plan: &str) -> String {
         "free" => "Free".into(),
         "plus" => "Plus".into(),
         "pro" | "google ai pro" => "Pro".into(),
+        "go" => "Go".into(),
         "team" | "teams" => "Team".into(),
         "starter" | "starter quota" | "antigravity starter quota" => "Starter".into(),
         "pay-as-you-go" | "pay as you go" | "payg" => "Pay-as-you-go".into(),
@@ -2970,7 +2971,9 @@ fn client_brand_color(client: &str) -> Color {
         Color::Rgb(0, 180, 216)  // Cursor Cyan #00B4D8
     } else if s.contains("grok") || s.contains("xai") {
         Color::Rgb(210, 215, 225) // xAI Silver #D2D7E1
-    } else if s.contains("opencode") || s.contains("vast") {
+    } else if s.contains("opencode") {
+        Color::Rgb(118, 153, 254) // OpenCode v2 Periwinkle Blue #7699FE
+    } else if s.contains("vast") {
         Color::Rgb(255, 140, 50)  // Vast Sunset Orange #FF8C32
     } else {
         Color::Rgb(125, 207, 255) // Default Cyan
@@ -3921,7 +3924,8 @@ fn provider_brand_color(provider_id: &str) -> Color {
         "grok" | "grokbot" | "xai" => Color::Rgb(210, 215, 225),            // xAI Silver #D2D7E1
         "modal" => Color::Rgb(0, 210, 106),                     // Modal Emerald #00D26A
         "openrouter" => Color::Rgb(140, 100, 255),              // OpenRouter Royal Violet #7624F4
-        "vast" | "vastai" => Color::Rgb(255, 140, 50),          // Vast.ai Sunset Orange #FF8C32
+        "vast" | "vastai" => Color::Rgb(255, 140, 50),         // Vast Sunset Orange #FF8C32
+        "opencode" => Color::Rgb(118, 153, 254),               // OpenCode v2 Periwinkle Blue #7699FE
         "deepseek" => Color::Rgb(77, 107, 254),                 // DeepSeek Royal Blue #4D6BFE
         "copilot" | "github" => Color::Rgb(46, 160, 67),        // GitHub Copilot Mint #2EA043
         "kimi" => Color::Rgb(255, 110, 180),                    // Kimi Pink #FF6EB4
@@ -4782,7 +4786,11 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
 
             let is_burn_first = burn_rec.as_ref().is_some_and(|b| b.provider_title.as_str() == display_name.as_str());
             let status_override = if is_session_capped && provider.availability == Availability::Available {
-                Some(("5h capped", DIM_GREY))
+                if session_w.is_some_and(|w| w.label.to_ascii_lowercase().contains("rolling")) {
+                    Some(("rolling cap", DIM_GREY))
+                } else {
+                    Some(("5h capped", DIM_GREY))
+                }
             } else if is_cycle_capped && provider.availability == Availability::Available {
                 Some(("weekly cap", DIM_GREY))
             } else {
