@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use crate::pricing::{PriceQuote, PricingEngine, PricingStatus};
 
-pub const TOKSCALE_REVISION: &str = "d4d1c751856e25913bce97bfbd7b254308863239";
+pub const TOKSCALE_REVISION: &str = "b26c433d03f23a2255ad9f212512ce83ede83da3";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
