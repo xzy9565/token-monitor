@@ -775,6 +775,7 @@ mod tests {
             },
             message_count: 5,
             reported_cost_micros: None,
+            dedup_id: None,
         };
         let snapshot = UsageSnapshot {
             records: vec![sample_record; 500], // 500 records

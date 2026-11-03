@@ -1414,6 +1414,7 @@ fn mock_consumption_report() -> usage::ConsumptionReport {
             },
             message_count: 42,
             reported_cost_micros: None,
+            dedup_id: None,
         },
         usage::UsageRecord {
             client: "Claude".into(),
@@ -1431,6 +1432,7 @@ fn mock_consumption_report() -> usage::ConsumptionReport {
             },
             message_count: 35,
             reported_cost_micros: None,
+            dedup_id: None,
         },
         usage::UsageRecord {
             client: "Antigravity Cli".into(),
@@ -1448,6 +1450,7 @@ fn mock_consumption_report() -> usage::ConsumptionReport {
             },
             message_count: 58,
             reported_cost_micros: None,
+            dedup_id: None,
         },
         usage::UsageRecord {
             client: "Cursor".into(),
@@ -1465,6 +1468,7 @@ fn mock_consumption_report() -> usage::ConsumptionReport {
             },
             message_count: 80,
             reported_cost_micros: None,
+            dedup_id: None,
         },
         usage::UsageRecord {
             client: "Codex".into(),
@@ -1482,6 +1486,7 @@ fn mock_consumption_report() -> usage::ConsumptionReport {
             },
             message_count: 150,
             reported_cost_micros: None,
+            dedup_id: None,
         },
         usage::UsageRecord {
             client: "Claude".into(),
@@ -1499,6 +1504,7 @@ fn mock_consumption_report() -> usage::ConsumptionReport {
             },
             message_count: 420,
             reported_cost_micros: None,
+            dedup_id: None,
         },
     ];
 
@@ -6342,6 +6348,7 @@ mod tests {
                 },
                 message_count: 1,
                 reported_cost_micros: None,
+                dedup_id: None,
             },
         ];
         let snapshot = usage::UsageSnapshot {

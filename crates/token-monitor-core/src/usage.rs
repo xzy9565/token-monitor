@@ -58,6 +58,8 @@ pub struct UsageRecord {
     /// price can exist (Cursor's Grok Bot rows name a task type, not a model); priced as-is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_cost_micros: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,6 +257,7 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
                 },
                 message_count: message.message_count.max(0),
                 reported_cost_micros: None,
+                dedup_id: None,
             }
         })
         .collect();
@@ -412,6 +415,7 @@ fn parse_cursor_json(content: &str, records: &mut Vec<UsageRecord>, since: Optio
             tokens,
             message_count: 1,
             reported_cost_micros,
+            dedup_id: None,
         });
     }
 }
@@ -479,6 +483,7 @@ fn collect_cursor_cache_records(records: &mut Vec<UsageRecord>, since: Option<&s
                 },
                 message_count: m.message_count.max(0),
                 reported_cost_micros: None,
+                dedup_id: None,
             });
         }
     }
@@ -605,6 +610,7 @@ fn collect_commandcode_v3_records(records: &mut Vec<UsageRecord>, since: Option<
                     tokens,
                     message_count: 1,
                     reported_cost_micros: None,
+                    dedup_id: None,
                 });
             }
         }
@@ -1058,6 +1064,7 @@ fn agy_record(
         },
         message_count: m.message_count.max(0),
         reported_cost_micros: None,
+        dedup_id: m.dedup_key,
     }
 }
 
@@ -1135,14 +1142,6 @@ fn rebuild_forked_antigravity_sessions(
     let Some(home) = dirs::home_dir() else {
         return HashMap::new();
     };
-    // ponytail: the desktop app and IDE extension share response ids with the CLI, and tokscale's
-    // cross-surface dedup can't be redone from here; their users keep tokscale's attribution.
-    if records
-        .iter()
-        .any(|r| r.client == "antigravity" || r.client == "antigravity-extension")
-    {
-        return HashMap::new();
-    }
     let conv_dir = home.join(".gemini/antigravity-cli/conversations");
     let archive_dir = home.join(".gemini/antigravity-cli/archive");
     let db = |id: &str| conv_dir.join(format!("{id}.db"));
@@ -1231,6 +1230,7 @@ fn enrich_antigravity_records(
 
     struct SessionEnrichment {
         time_updates: Vec<(usize, i64)>,
+        dedup_id_updates: Vec<(usize, String)>,
         archived_records: Vec<UsageRecord>,
     }
 
@@ -1313,18 +1313,40 @@ fn enrich_antigravity_records(
                 .filter(|(key, _)| skip.is_none_or(|s| !s.contains(key)))
                 .collect();
             let mut time_updates = Vec::new();
+            let mut dedup_id_updates = Vec::new();
+            let key_to_steps: HashMap<&[u8], &[i64]> = own
+                .iter()
+                .map(|(k, s)| (k.as_slice(), s.as_slice()))
+                .collect();
 
             let Some(lines) = &transcript else {
-                for (&r_idx, (_, steps)) in record_indices.iter().zip(own.iter().copied()) {
-                    if Some(records_ref[r_idx].timestamp) != first_ts {
+                for (i, &r_idx) in record_indices.iter().enumerate() {
+                    let rec = &records_ref[r_idx];
+                    let key = if let Some(ref id) = rec.dedup_id {
+                        Some(id.as_bytes())
+                    } else if record_indices.len() == own.len() {
+                        let k = own[i].0.as_slice();
+                        if let Ok(s) = std::str::from_utf8(k) {
+                            dedup_id_updates.push((r_idx, s.to_string()));
+                        }
+                        Some(k)
+                    } else {
+                        None
+                    };
+                    if Some(rec.timestamp) != first_ts {
                         continue;
                     }
-                    if let Some(ts) = steps.iter().find_map(|s| step_timestamps.get(s).copied()) {
-                        time_updates.push((r_idx, ts));
+                    if let Some(k) = key {
+                        if let Some(steps) = key_to_steps.get(k) {
+                            if let Some(ts) = steps.iter().find_map(|s| step_timestamps.get(s).copied()) {
+                                time_updates.push((r_idx, ts));
+                            }
+                        }
                     }
                 }
                 return Some(SessionEnrichment {
                     time_updates,
+                    dedup_id_updates,
                     archived_records: Vec::new(),
                 });
             };
@@ -1338,12 +1360,26 @@ fn enrich_antigravity_records(
                 .filter_map(|((key, _), ts)| Some((key.as_slice(), ts?)))
                 .collect();
 
-            for (&r_idx, (key, _)) in record_indices.iter().zip(own.iter().copied()) {
-                if Some(records_ref[r_idx].timestamp) != first_ts {
+            for (i, &r_idx) in record_indices.iter().enumerate() {
+                let rec = &records_ref[r_idx];
+                let key = if let Some(ref id) = rec.dedup_id {
+                    Some(id.as_bytes())
+                } else if record_indices.len() == own.len() {
+                    let k = own[i].0.as_slice();
+                    if let Ok(s) = std::str::from_utf8(k) {
+                        dedup_id_updates.push((r_idx, s.to_string()));
+                    }
+                    Some(k)
+                } else {
+                    None
+                };
+                if Some(rec.timestamp) != first_ts {
                     continue;
                 }
-                if let Some(&ts) = dated.get(key.as_slice()) {
-                    time_updates.push((r_idx, ts));
+                if let Some(k) = key {
+                    if let Some(&ts) = dated.get(k) {
+                        time_updates.push((r_idx, ts));
+                    }
                 }
             }
 
@@ -1377,6 +1413,7 @@ fn enrich_antigravity_records(
 
             Some(SessionEnrichment {
                 time_updates,
+                dedup_id_updates,
                 archived_records: session_archived,
             })
         })
@@ -1385,6 +1422,9 @@ fn enrich_antigravity_records(
     for res in results {
         for (r_idx, ts) in res.time_updates {
             set_record_time(&mut records[r_idx], ts);
+        }
+        for (r_idx, id) in res.dedup_id_updates {
+            records[r_idx].dedup_id = Some(id);
         }
         records.extend(res.archived_records);
     }
@@ -1482,6 +1522,7 @@ mod tests {
                     tokens: UsageTokens::default(),
                     message_count: 1,
                     reported_cost_micros: None,
+                    dedup_id: None,
                 },
                 UsageRecord {
                     client: "codex".into(),
@@ -1493,6 +1534,7 @@ mod tests {
                     tokens: UsageTokens::default(),
                     message_count: 1,
                     reported_cost_micros: None,
+                    dedup_id: None,
                 },
             ],
             processing_time_ms: 1,
@@ -1521,6 +1563,7 @@ mod tests {
                 },
                 message_count: 1,
                 reported_cost_micros: None,
+                dedup_id: None,
             }],
             processing_time_ms: 1,
             tokscale_revision: TOKSCALE_REVISION.into(),
@@ -1622,6 +1665,7 @@ mod tests {
             tokens: UsageTokens::default(),
             message_count: 1,
             reported_cost_micros: None,
+            dedup_id: None,
         })
         .collect();
 
@@ -1672,6 +1716,7 @@ mod tests {
             tokens: UsageTokens::default(),
             message_count: 1,
             reported_cost_micros: None,
+            dedup_id: None,
         })
         .collect();
 
@@ -1774,6 +1819,59 @@ mod tests {
             date_turns_from_transcript(&turns, &lines),
             [Some(118), Some(300), Some(301)]
         );
+    }
+
+    #[test]
+    fn antigravity_enrichment_aligns_by_dedup_id_when_lengths_differ() {
+        let dated: HashMap<&[u8], i64> = HashMap::from([
+            (b"resp-1".as_slice(), 1000),
+            (b"resp-2".as_slice(), 2000),
+            (b"resp-3".as_slice(), 3000),
+        ]);
+        let own = vec![
+            (b"resp-1".to_vec(), vec![1]),
+            (b"resp-2".to_vec(), vec![2]),
+            (b"resp-3".to_vec(), vec![3]),
+        ];
+        // records only contains resp-2 and resp-3 (length 2 != own.len() 3)
+        let make_rec = |dedup: Option<&str>| UsageRecord {
+            client: "antigravity-cli".into(),
+            model_id: "m".into(),
+            provider_id: "google".into(),
+            session_id: "s".into(),
+            date: "2026-11-01".into(),
+            timestamp: 0,
+            tokens: UsageTokens::default(),
+            message_count: 1,
+            reported_cost_micros: None,
+            dedup_id: dedup.map(|s| s.to_string()),
+        };
+        let records = vec![make_rec(Some("resp-2")), make_rec(Some("resp-3"))];
+        let record_indices = vec![0, 1];
+        let first_ts = Some(0);
+
+        let mut time_updates = Vec::new();
+        for (i, &r_idx) in record_indices.iter().enumerate() {
+            let rec = &records[r_idx];
+            let key = if let Some(ref id) = rec.dedup_id {
+                Some(id.as_bytes())
+            } else if record_indices.len() == own.len() {
+                Some(own[i].0.as_slice())
+            } else {
+                None
+            };
+            if Some(rec.timestamp) != first_ts {
+                continue;
+            }
+            if let Some(k) = key {
+                if let Some(&ts) = dated.get(k) {
+                    time_updates.push((r_idx, ts));
+                }
+            }
+        }
+
+        // resp-2 gets its own timestamp (2000), NOT resp-1's timestamp (1000) from index 0!
+        assert_eq!(time_updates, vec![(0, 2000), (1, 3000)]);
     }
 
     #[test]

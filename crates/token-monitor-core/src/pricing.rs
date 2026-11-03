@@ -595,6 +595,7 @@ mod tests {
             },
             message_count: 1,
             reported_cost_micros: None,
+            dedup_id: None,
         }
     }
 
@@ -700,6 +701,7 @@ mod tests {
                 },
                 message_count: 1,
                 reported_cost_micros: None,
+                dedup_id: None,
             };
             let quote = engine.quote(&rec);
             assert_eq!(
@@ -755,6 +757,7 @@ mod tests {
             },
             message_count: 1,
             reported_cost_micros: None,
+            dedup_id: None,
         };
 
         let quote = engine.quote(&rec);
@@ -785,6 +788,7 @@ mod tests {
             },
             message_count: 1,
             reported_cost_micros: None,
+            dedup_id: None,
         };
         let quote = engine.quote(&rec);
         assert_eq!(quote.status, PricingStatus::Exact);
@@ -819,6 +823,7 @@ mod tests {
             },
             message_count: 1,
             reported_cost_micros: None,
+            dedup_id: None,
         };
 
         let quote = engine.quote(&rec);
