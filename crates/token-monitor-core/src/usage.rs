@@ -267,6 +267,7 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
     let inherited = rebuild_forked_antigravity_sessions(&mut records);
     enrich_antigravity_records(&mut records, &inherited);
     tag_antigravity_account_records(&mut records);
+    reattribute_opencode_provider_records(&mut records);
     // Same string comparison tokscale applies to `date`.
     records.retain(|r| {
         options.since.as_deref().is_none_or(|s| r.date.as_str() >= s)
@@ -804,6 +805,35 @@ fn tag_antigravity_records_from_logs(
 
         if let Some(email) = email {
             record.client = format!("antigravity-cli ({email})");
+        }
+    }
+}
+
+/// Re-attribute OpenCode records to their underlying model providers or subscriptions
+/// based on the native `provider_id` stored in OpenCode's message store (e.g. `opencode.db`).
+///
+/// Calls using external API keys (Command Code, Modal, Vast.ai, DeepSeek, Google) are
+/// routed to their respective client IDs, while native OpenCode Go subscription calls
+/// remain tagged as "opencode".
+fn reattribute_opencode_provider_records(records: &mut [UsageRecord]) {
+    for r in records.iter_mut() {
+        if r.client == "opencode" {
+            let p = r.provider_id.trim().to_ascii_lowercase();
+            if p == "commandcode"
+                || p.starts_with("commandcode")
+                || p.starts_with("command-code")
+                || p.starts_with("command_code")
+            {
+                r.client = "commandcode".to_string();
+            } else if p.starts_with("modal") {
+                r.client = "modal".to_string();
+            } else if p.starts_with("vast") {
+                r.client = "vast".to_string();
+            } else if p == "deepseek" || p.starts_with("deepseek") {
+                r.client = "deepseek".to_string();
+            } else if p == "google" || p.starts_with("google") {
+                r.client = "google".to_string();
+            }
         }
     }
 }
@@ -2001,6 +2031,93 @@ mod tests {
     }
 
     #[test]
+    fn test_reattribute_opencode_provider_records() {
+        let mut records = vec![
+            UsageRecord {
+                client: "opencode".into(),
+                model_id: "deepseek/deepseek-v4.1-flash".into(),
+                provider_id: "commandcode".into(),
+                session_id: "sess1".into(),
+                date: "2026-11-07".into(),
+                timestamp: 1000,
+                tokens: UsageTokens::default(),
+                message_count: 1,
+                reported_cost_micros: None,
+                dedup_id: None,
+            },
+            UsageRecord {
+                client: "opencode".into(),
+                model_id: "deepseek-v4.1-flash".into(),
+                provider_id: "opencode_go".into(),
+                session_id: "sess2".into(),
+                date: "2026-11-07".into(),
+                timestamp: 2000,
+                tokens: UsageTokens::default(),
+                message_count: 1,
+                reported_cost_micros: None,
+                dedup_id: None,
+            },
+            UsageRecord {
+                client: "opencode".into(),
+                model_id: "qwen-2.5-coder".into(),
+                provider_id: "modal-rtx6000-acc2".into(),
+                session_id: "sess3".into(),
+                date: "2026-11-07".into(),
+                timestamp: 3000,
+                tokens: UsageTokens::default(),
+                message_count: 1,
+                reported_cost_micros: None,
+                dedup_id: None,
+            },
+            UsageRecord {
+                client: "opencode".into(),
+                model_id: "deepseek-r1".into(),
+                provider_id: "vast_vllm".into(),
+                session_id: "sess4".into(),
+                date: "2026-11-07".into(),
+                timestamp: 4000,
+                tokens: UsageTokens::default(),
+                message_count: 1,
+                reported_cost_micros: None,
+                dedup_id: None,
+            },
+            UsageRecord {
+                client: "opencode".into(),
+                model_id: "deepseek-chat".into(),
+                provider_id: "deepseek".into(),
+                session_id: "sess5".into(),
+                date: "2026-11-07".into(),
+                timestamp: 5000,
+                tokens: UsageTokens::default(),
+                message_count: 1,
+                reported_cost_micros: None,
+                dedup_id: None,
+            },
+            UsageRecord {
+                client: "opencode".into(),
+                model_id: "gemini-2.5-flash".into(),
+                provider_id: "google_gemini".into(),
+                session_id: "sess6".into(),
+                date: "2026-11-07".into(),
+                timestamp: 6000,
+                tokens: UsageTokens::default(),
+                message_count: 1,
+                reported_cost_micros: None,
+                dedup_id: None,
+            },
+        ];
+
+        reattribute_opencode_provider_records(&mut records);
+
+        assert_eq!(records[0].client, "commandcode");
+        assert_eq!(records[1].client, "opencode");
+        assert_eq!(records[2].client, "modal");
+        assert_eq!(records[3].client, "vast");
+        assert_eq!(records[4].client, "deepseek");
+        assert_eq!(records[5].client, "google");
+    }
+
+    #[test]
     #[ignore = "live local database audit"]
     fn audit_live_antigravity_attributions() {
         let snapshot = match collect_local_usage(UsageOptions::default()) {
@@ -2031,6 +2148,37 @@ mod tests {
             let cnt = counts.get(&c).copied().unwrap_or(0);
             let toks = tokens_map.get(&c).copied().unwrap_or(0);
             println!("{:<30} | turns: {:<6} | tokens: {:>12} ({:.2}M)", c, cnt, toks, toks as f64 / 1_000_000.0);
+        }
+    }
+
+    #[test]
+    #[ignore = "live local database audit"]
+    fn audit_live_opencode_attributions() {
+        let snapshot = match collect_local_usage(UsageOptions::default()) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("Skipping live audit: {}", e);
+                return;
+            }
+        };
+
+        let mut counts = std::collections::HashMap::new();
+        let mut tokens_map = std::collections::HashMap::new();
+
+        for r in snapshot.records.iter() {
+            if r.client == "opencode" {
+                *counts.entry(r.provider_id.clone()).or_insert(0) += 1;
+                *tokens_map.entry(r.provider_id.clone()).or_insert(0i64) += r.tokens.reported_total_without_reasoning();
+            }
+        }
+
+        println!("=== LIVE OPENCODE PROVIDER_ID BREAKDOWN ===");
+        let mut providers: Vec<_> = counts.keys().cloned().collect();
+        providers.sort();
+        for p in providers {
+            let cnt = counts.get(&p).copied().unwrap_or(0);
+            let toks = tokens_map.get(&p).copied().unwrap_or(0);
+            println!("{:<30} | turns: {:<6} | tokens: {:>12} ({:.2}M)", p, cnt, toks, toks as f64 / 1_000_000.0);
         }
     }
 }

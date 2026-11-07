@@ -2889,6 +2889,8 @@ fn normalize_client_id(client: &str) -> String {
         "Antigravity Cli".to_owned()
     } else if lower.contains("antigravity") || lower.contains("google") {
         "Antigravity".to_owned()
+    } else if lower.contains("commandcode") || lower.contains("command-code") || lower.contains("command_code") || lower.contains("command code") {
+        "Command Code".to_owned()
     } else if lower.contains("opencode") {
         "OpenCode".to_owned()
     } else if lower == "grokbot" {
@@ -2898,6 +2900,12 @@ fn normalize_client_id(client: &str) -> String {
         "Grok".to_owned()
     } else if lower.contains("cursor") {
         "Cursor".to_owned()
+    } else if lower.contains("modal") {
+        "Modal".to_owned()
+    } else if lower.contains("vast") {
+        "Vast".to_owned()
+    } else if lower.contains("deepseek") {
+        "DeepSeek".to_owned()
     } else if lower.is_empty() {
         "Unknown".to_owned()
     } else {
@@ -2977,10 +2985,16 @@ fn client_brand_color(client: &str) -> Color {
         Color::Rgb(0, 180, 216)  // Cursor Cyan #00B4D8
     } else if s.contains("grok") || s.contains("xai") {
         Color::Rgb(210, 215, 225) // xAI Silver #D2D7E1
+    } else if s.contains("commandcode") || s.contains("command-code") || s.contains("command_code") || s.contains("command code") {
+        Color::Rgb(245, 175, 45)  // Command Code Gold #F5AF2D
     } else if s.contains("opencode") {
         Color::Rgb(118, 153, 254) // OpenCode v2 Periwinkle Blue #7699FE
+    } else if s.contains("modal") {
+        Color::Rgb(0, 210, 106)   // Modal Green #00D26A
     } else if s.contains("vast") {
         Color::Rgb(255, 140, 50)  // Vast Sunset Orange #FF8C32
+    } else if s.contains("deepseek") {
+        Color::Rgb(77, 107, 254)  // DeepSeek Blue #4D6BFE
     } else {
         Color::Rgb(125, 207, 255) // Default Cyan
     }
@@ -6684,6 +6698,10 @@ mod tests {
     fn normalize_client_id_handles_multi_account_antigravity() {
         assert_eq!(normalize_client_id("antigravity-cli"), "Antigravity Cli");
         assert_eq!(normalize_client_id("grokbot"), "Grok Bot");
+        assert_eq!(normalize_client_id("commandcode"), "Command Code");
+        assert_eq!(normalize_client_id("modal"), "Modal");
+        assert_eq!(normalize_client_id("vast"), "Vast");
+        assert_eq!(normalize_client_id("deepseek"), "DeepSeek");
         assert_eq!(
             normalize_client_id("antigravity-cli (Account 1)"),
             "Antigravity Cli (Account 1)"
