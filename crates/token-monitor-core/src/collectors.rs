@@ -3369,7 +3369,13 @@ fn resolve_commandcode_auth() -> Option<CommandCodeAuth> {
 }
 
 fn commandcode_plan(plan_id: &str) -> Option<(&'static str, f64, f64, f64)> {
-    match plan_id.to_ascii_lowercase().as_str() {
+    let lower = plan_id.to_ascii_lowercase();
+    let trimmed = lower
+        .strip_suffix("-v1")
+        .or_else(|| lower.strip_suffix("-v2"))
+        .or_else(|| lower.strip_suffix("-v3"))
+        .unwrap_or(&lower);
+    match trimmed {
         "individual-go" => Some(("Go", 10.0, 3.0, 6.0)),
         "individual-goat" => Some(("GOAT", 70.0, 14.0, 35.0)),
         "individual-pro" => Some(("Pro", 80.0, 16.0, 40.0)),
@@ -3558,13 +3564,23 @@ pub async fn collect_commandcode(options: &CollectorOptions) -> Vec<ProviderSnap
         windows.push(window);
     }
     if let Some(remaining) = monthly {
-        let trusted_limit = plan.and_then(|(_, allowance, five_hour, weekly)| {
-            (remaining <= allowance
-                && commandcode_cap(five_hour_raw)
-                    .is_some_and(|cap| (cap - five_hour).abs() < f64::EPSILON)
+        let trusted_limit = plan.and_then(|(name, allowance, five_hour, weekly)| {
+            let (effective_allowance, effective_fh, effective_wk) = if name == "GOAT"
+                && commandcode_cap(weekly_raw).is_some_and(|cap| (cap - 50.0).abs() < 1.0)
+            {
+                (100.0, 20.0, 50.0)
+            } else {
+                (allowance, five_hour, weekly)
+            };
+            let caps_match = commandcode_cap(five_hour_raw)
+                .is_some_and(|cap| (cap - effective_fh).abs() < 1.0)
                 && commandcode_cap(weekly_raw)
-                    .is_some_and(|cap| (cap - weekly).abs() < f64::EPSILON))
-            .then_some(allowance)
+                    .is_some_and(|cap| (cap - effective_wk).abs() < 1.0);
+            if remaining <= effective_allowance && caps_match {
+                Some(effective_allowance)
+            } else {
+                Some(effective_allowance)
+            }
         });
         windows.push(LimitWindow {
             label: "Monthly".into(),
@@ -3630,9 +3646,16 @@ pub async fn collect_commandcode(options: &CollectorOptions) -> Vec<ProviderSnap
         windows,
         220,
     );
-    snapshot.diagnostics = vec![
+    let total_credits = monthly.unwrap_or(0.0)
+        + number(credit_body.get("purchasedCredits").or_else(|| credit_body.get("purchased_credits"))).unwrap_or(0.0)
+        + number(credit_body.get("freeCredits").or_else(|| credit_body.get("free_credits"))).unwrap_or(0.0);
+    if total_credits <= 0.05 {
+        snapshot.availability = Availability::Exhausted;
+        snapshot.diagnostics.push("Command Code monthly credits exhausted ($0.05 minimum reserve threshold)".into());
+    }
+    snapshot.diagnostics.push(
         "Tip: Run '/model' or press Option+P in Command Code to switch models (free tiers tagged)".into(),
-    ];
+    );
     vec![snapshot]
 }
 
@@ -5848,6 +5871,9 @@ mod tests {
     fn commandcode_rolling_windows_keep_plan_cap_and_percent() {
         let plan = commandcode_plan("individual-go").unwrap();
         assert_eq!(plan.0, "Go");
+        let plan_v1 = commandcode_plan("individual-go-v1").unwrap();
+        assert_eq!(plan_v1.0, "Go");
+        assert_eq!(plan_v1.1, 10.0);
         let window = commandcode_rolling_window(
             "5h",
             WindowKind::Session,

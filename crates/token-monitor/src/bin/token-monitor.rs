@@ -4737,25 +4737,51 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
             let session_w = provider.windows.iter().find(|w| {
                 !w.metric.is_credit() && (w.kind == WindowKind::Session || w.label.to_ascii_lowercase().contains("5h") || w.label.to_ascii_lowercase().contains("session"))
             });
-            let cycle_w = provider.windows.iter().find(|w| {
-                !w.metric.is_credit() && (
-                    w.kind == WindowKind::Weekly
-                        || w.kind == WindowKind::Monthly
-                        || w.kind == WindowKind::Daily
-                        || w.kind == WindowKind::Billing
-                        || w.label.to_ascii_lowercase().contains("7d")
-                        || w.label.to_ascii_lowercase().contains("weekly")
-                        || w.label.to_ascii_lowercase().contains("monthly")
-                        || w.label.to_ascii_lowercase().contains("daily")
-                        || w.label.to_ascii_lowercase().contains("billing")
-                )
+            let monthly_w = provider.windows.iter().find(|w| {
+                w.kind == WindowKind::Monthly || w.label.to_ascii_lowercase().contains("monthly")
             });
+            let is_monthly_capped = monthly_w.is_some_and(|w| {
+                w.effectively_exhausted()
+                    || w.remaining_percent.is_some_and(|p| p <= EFFECTIVE_EXHAUSTION_PERCENT || p.round() <= 0.0)
+                    || (w.metric.is_credit() && w.remaining_amount.is_some_and(|a| a <= 0.05))
+            });
+            let cycle_w = if is_monthly_capped {
+                monthly_w.or_else(|| {
+                    provider.windows.iter().find(|w| {
+                        !w.metric.is_credit() && (
+                            w.kind == WindowKind::Weekly
+                                || w.kind == WindowKind::Monthly
+                                || w.kind == WindowKind::Daily
+                                || w.kind == WindowKind::Billing
+                                || w.label.to_ascii_lowercase().contains("7d")
+                                || w.label.to_ascii_lowercase().contains("weekly")
+                                || w.label.to_ascii_lowercase().contains("monthly")
+                                || w.label.to_ascii_lowercase().contains("daily")
+                                || w.label.to_ascii_lowercase().contains("billing")
+                        )
+                    })
+                })
+            } else {
+                provider.windows.iter().find(|w| {
+                    !w.metric.is_credit() && (
+                        w.kind == WindowKind::Weekly
+                            || w.kind == WindowKind::Monthly
+                            || w.kind == WindowKind::Daily
+                            || w.kind == WindowKind::Billing
+                            || w.label.to_ascii_lowercase().contains("7d")
+                            || w.label.to_ascii_lowercase().contains("weekly")
+                            || w.label.to_ascii_lowercase().contains("monthly")
+                            || w.label.to_ascii_lowercase().contains("daily")
+                            || w.label.to_ascii_lowercase().contains("billing")
+                    )
+                })
+            };
 
             let is_sel = app.limits_selected == s_idx;
             let display_name = &titles[s_idx];
             let brand = provider_brand_color(&provider.provider_id);
             let is_session_capped = session_w.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent.is_some_and(|p| p <= EFFECTIVE_EXHAUSTION_PERCENT || p.round() <= 0.0));
-            let is_cycle_capped = cycle_w.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent.is_some_and(|p| p <= EFFECTIVE_EXHAUSTION_PERCENT || p.round() <= 0.0));
+            let is_cycle_capped = is_monthly_capped || cycle_w.is_some_and(|w| w.effectively_exhausted() || w.remaining_percent.is_some_and(|p| p <= EFFECTIVE_EXHAUSTION_PERCENT || p.round() <= 0.0));
             let is_dimmed = provider.availability.dimmed() || is_session_capped || is_cycle_capped || provider.source_health != SourceHealth::Connected;
             let cursor_mark = if is_sel { "▶ " } else { "  " };
             let mut title_style = if is_dimmed {
@@ -4766,7 +4792,9 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
             if is_sel {
                 title_style = title_style.bg(Color::Rgb(28, 42, 60));
             }
-            let (marker_char, marker_style) = if is_session_capped && provider.availability == Availability::Available {
+            let (marker_char, marker_style) = if is_monthly_capped && provider.availability == Availability::Available {
+                ('✕', Style::default().fg(RED).add_modifier(Modifier::BOLD))
+            } else if is_session_capped && provider.availability == Availability::Available {
                 ('▲', Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
             } else if provider.availability == Availability::Available {
                 ('●', Style::default().fg(brand))
@@ -4791,7 +4819,9 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
             row.push(Span::raw("  "));
 
             let is_burn_first = burn_rec.as_ref().is_some_and(|b| b.provider_title.as_str() == display_name.as_str());
-            let status_override = if is_session_capped && provider.availability == Availability::Available {
+            let status_override = if is_monthly_capped && provider.availability == Availability::Available {
+                Some(("monthly cap", RED))
+            } else if is_session_capped && provider.availability == Availability::Available {
                 if session_w.is_some_and(|w| w.label.to_ascii_lowercase().contains("rolling")) {
                     Some(("rolling cap", DIM_GREY))
                 } else {
