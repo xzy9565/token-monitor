@@ -987,9 +987,12 @@ fn claude_web_plan(account: &Value) -> String {
         "Enterprise".into()
     } else if tiers.iter().any(|tier| tier.contains("team")) {
         "Team".into()
+    } else if tiers.iter().any(|tier| tier.contains("ultra")) {
+        "Ultra".into()
+    } else if tiers.iter().any(|tier| tier.contains("max")) {
+        "Max".into()
     } else if tiers.iter().any(|tier| {
-        tier.contains("max")
-            || tier.contains("pro")
+        tier.contains("pro")
             || tier.contains("claude_ai")
             || tier.contains("trust_tier")
     }) {
@@ -5707,6 +5710,10 @@ mod tests {
             "memberships": [{"organization": {"rate_limit_tier": "default_claude_ai"}}]
         });
         assert_eq!(claude_web_plan(&account), "Pro");
+        let account_max = serde_json::json!({
+            "memberships": [{"organization": {"rate_limit_tier": "claude_max_5x"}}]
+        });
+        assert_eq!(claude_web_plan(&account_max), "Max");
     }
 
     #[test]
