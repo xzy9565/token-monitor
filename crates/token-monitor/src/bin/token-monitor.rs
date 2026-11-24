@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -499,7 +500,7 @@ impl CachedLedger {
 
 struct App {
     providers: Vec<ProviderSnapshot>,
-    consumption: Option<usage::ConsumptionReport>,
+    consumption: Option<Arc<usage::ConsumptionReport>>,
     cached_ledger: Option<CachedLedger>,
     usage_busy: bool,
     limits_busy: bool,
@@ -527,11 +528,15 @@ struct App {
 impl App {
     fn set_consumption(&mut self, report: usage::ConsumptionReport) {
         self.cached_ledger = Some(CachedLedger::from_report(&report));
-        self.consumption = Some(report);
+        self.consumption = Some(Arc::new(report));
         self.refresh_active_modal();
     }
 
-    fn set_consumption_cached(&mut self, report: usage::ConsumptionReport, cached: CachedLedger) {
+    fn set_consumption_cached(
+        &mut self,
+        report: Arc<usage::ConsumptionReport>,
+        cached: CachedLedger,
+    ) {
         self.cached_ledger = Some(cached);
         self.consumption = Some(report);
         self.refresh_active_modal();
@@ -5970,7 +5975,7 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
     let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<Vec<ProviderSnapshot>>();
     let (usage_tx, usage_rx) =
-        std::sync::mpsc::channel::<Result<(usage::ConsumptionReport, CachedLedger), String>>();
+        std::sync::mpsc::channel::<Result<(Arc<usage::ConsumptionReport>, CachedLedger), String>>();
     let mut refresh_in_flight = false;
     let mut usage_in_flight = false;
     let mut next_refresh = Instant::now();
@@ -6058,23 +6063,28 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                         ..usage::UsageOptions::default()
                     })
                     .map(|snapshot| {
-                        if let Ok(storage) = token_monitor_core::storage::Storage::open_default() {
-                            let _ = storage.save_usage_snapshot(
-                                &snapshot,
-                                chrono::Utc::now().timestamp_millis(),
-                            );
-                        }
                         let legacy = legacy_totals_for_range(since.as_deref(), None);
-                        let report = usage::build_consumption_report_with_legacy(
+                        let report = Arc::new(usage::build_consumption_report_with_legacy(
                             snapshot,
                             &token_monitor_core::pricing::PricingEngine::load_cached(),
                             true,
                             legacy.as_ref(),
-                        );
+                        ));
                         let cached = CachedLedger::from_report(&report);
                         (report, cached)
                     });
+                    // Hand the ledger to the UI before saving it: the snapshot only seeds the next
+                    // launch's first paint, and encoding and writing it takes most of a second.
+                    let saved = result.as_ref().ok().map(|(report, _)| Arc::clone(report));
                     let _ = tx.send(result);
+                    if let Some(report) = saved {
+                        if let Ok(storage) = token_monitor_core::storage::Storage::open_default() {
+                            let _ = storage.save_usage_snapshot(
+                                &report.snapshot,
+                                chrono::Utc::now().timestamp_millis(),
+                            );
+                        }
+                    }
                 });
                 next_usage_refresh = Instant::now() + Duration::from_secs(300);
                 changed = true;

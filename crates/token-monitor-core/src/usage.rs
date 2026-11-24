@@ -205,56 +205,72 @@ pub struct UsageOptions {
 /// This function is synchronous by design: the caller must run it in a
 /// blocking worker when the interactive TUI is active.
 pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, String> {
-    let clients = options.clients.or_else(|| {
-        let mut list: Vec<String> = tokscale_core::ClientId::iter()
-            .map(|c| c.as_str().to_string())
-            .collect();
-        list.push("cursor".to_string());
-        list.push("synthetic".to_string());
-        Some(list)
-    });
+    // Cursor's usage events are read by `collect_cursor_cache_records` below; tokscale would
+    // count them a second time.
+    let clients: Vec<String> = options
+        .clients
+        .unwrap_or_else(|| {
+            let mut list: Vec<String> = tokscale_core::ClientId::iter()
+                .map(|c| c.as_str().to_string())
+                .collect();
+            list.push("synthetic".to_string());
+            list
+        })
+        .into_iter()
+        .filter(|client| client != "cursor")
+        .collect();
 
     // The date window is applied after enrichment below: until then an AGY turn may still carry
     // its session's start date, and filtering here would drop a long-running session whole.
-    let parsed = tokscale_core::parse_local_clients(tokscale_core::LocalParseOptions {
-        home_dir: options
-            .home_dir
-            .map(|path| path.to_string_lossy().into_owned()),
-        use_env_roots: true,
-        clients,
-        since: None,
-        until: None,
-        year: options.year,
-        scanner_settings: tokscale_core::scanner::ScannerSettings::default(),
-    })
-    .map_err(|error| format!("tokscale local parse failed: {error}"))?;
+    // tokscale's persistent source cache re-parses only the files that changed since the last
+    // call; `parse_local_clients` re-reads every session file each time. The lane is doc-hidden
+    // upstream, so the weekly tokscale-update build is what flags a change to it.
+    let started = std::time::Instant::now();
+    let messages = if clients.is_empty() {
+        Vec::new() // tokscale reads an empty list as "every client"
+    } else {
+        futures::executor::block_on(tokscale_core::parse_local_unified_messages_with_pricing(
+            tokscale_core::LocalParseOptions {
+                home_dir: options
+                    .home_dir
+                    .map(|path| path.to_string_lossy().into_owned()),
+                use_env_roots: true,
+                clients: Some(clients),
+                since: None,
+                until: None,
+                year: options.year,
+                scanner_settings: tokscale_core::scanner::ScannerSettings::default(),
+            },
+            None,
+        ))
+        .map_err(|error| format!("tokscale local parse failed: {error}"))?
+    };
+    let processing_time_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
 
-    let mut records: Vec<UsageRecord> = parsed
-        .messages
+    let mut records: Vec<UsageRecord> = messages
         .into_iter()
         .map(|message| {
             let is_commandcode = message.client == "commandcode";
+            let tokens = &message.tokens;
+            let input = if is_commandcode {
+                tokens.input.saturating_sub(tokens.cache_read).max(0)
+            } else {
+                tokens.input.max(0)
+            };
             UsageRecord {
+                tokens: UsageTokens {
+                    input,
+                    output: tokens.output.max(0),
+                    cache_read: tokens.cache_read.max(0),
+                    cache_write: tokens.cache_write.max(0),
+                    reasoning: tokens.reasoning.max(0),
+                },
                 client: message.client.into(),
                 model_id: message.model_id.into(),
                 provider_id: message.provider_id.into(),
                 session_id: message.session_id.into(),
                 date: message.date.into(),
                 timestamp: message.timestamp,
-                tokens: {
-                    let input = if is_commandcode {
-                        message.input.saturating_sub(message.cache_read).max(0)
-                    } else {
-                        message.input.max(0)
-                    };
-                    UsageTokens {
-                        input,
-                        output: message.output.max(0),
-                        cache_read: message.cache_read.max(0),
-                        cache_write: message.cache_write.max(0),
-                        reasoning: message.reasoning.max(0),
-                    }
-                },
                 message_count: message.message_count.max(0),
                 reported_cost_micros: None,
                 dedup_id: None,
@@ -276,7 +292,7 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
 
     Ok(UsageSnapshot {
         records,
-        processing_time_ms: parsed.processing_time_ms,
+        processing_time_ms,
         tokscale_revision: TOKSCALE_REVISION.to_owned(),
     })
 }
