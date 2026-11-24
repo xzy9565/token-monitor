@@ -5979,6 +5979,7 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    usage::set_tui_active(true);
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<Vec<ProviderSnapshot>>();
@@ -6156,6 +6157,7 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
+    usage::set_tui_active(false);
     result
 }
 

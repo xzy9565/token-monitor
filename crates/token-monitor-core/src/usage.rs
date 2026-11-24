@@ -11,6 +11,10 @@ use std::path::PathBuf;
 
 use crate::pricing::{PriceQuote, PricingEngine, PricingStatus};
 
+/// tokscale writes scan diagnostics to stderr. While this is on it holds them back, so they can't
+/// scroll a full-screen TUI, and turning it off prints them.
+pub use tokscale_core::tui_signal::set_tui_active;
+
 pub const TOKSCALE_REVISION: &str = "b265e836c58f085f50a836525aa60b8d45bd8d57";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
