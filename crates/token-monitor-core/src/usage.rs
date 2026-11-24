@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use crate::pricing::{PriceQuote, PricingEngine, PricingStatus};
 
-pub const TOKSCALE_REVISION: &str = "d4d1c751856e25913bce97bfbd7b254308863239";
+pub const TOKSCALE_REVISION: &str = "b265e836c58f085f50a836525aa60b8d45bd8d57";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -235,11 +235,11 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
         .map(|message| {
             let is_commandcode = message.client == "commandcode";
             UsageRecord {
-                client: message.client,
-                model_id: message.model_id,
-                provider_id: message.provider_id,
-                session_id: message.session_id,
-                date: message.date,
+                client: message.client.into(),
+                model_id: message.model_id.into(),
+                provider_id: message.provider_id.into(),
+                session_id: message.session_id.into(),
+                date: message.date.into(),
                 timestamp: message.timestamp,
                 tokens: {
                     let input = if is_commandcode {
@@ -465,15 +465,15 @@ fn collect_cursor_cache_records(records: &mut Vec<UsageRecord>, since: Option<&s
                     continue;
                 }
             }
-            if !seen.insert((m.timestamp, m.model_id.clone())) {
+            if !seen.insert((m.timestamp, m.model_id.to_string())) {
                 continue;
             }
             cursor_records.push(UsageRecord {
                 client: "cursor".into(),
-                model_id: m.model_id,
-                provider_id: m.provider_id,
-                session_id: m.session_id,
-                date: m.date,
+                model_id: m.model_id.into(),
+                provider_id: m.provider_id.into(),
+                session_id: m.session_id.into(),
+                date: m.date.into(),
                 timestamp: m.timestamp,
                 tokens: UsageTokens {
                     input: m.tokens.input.max(0),
@@ -961,19 +961,21 @@ fn parse_gen_metadata_turn(blob: &[u8]) -> Option<(Option<String>, Vec<u8>, Vec<
     }
     let u = usage_bytes?;
     let mut u_reader = ProtoWireReader::new(u);
-    let mut inp1 = 0u64;
-    let mut inp2 = 0u64;
-    let mut out = 0u64;
-    let mut cch = 0u64;
-    let mut rea = 0u64;
+    let mut input = 0u64;
+    let mut total_output = 0u64;
+    let mut cache_write = 0u64;
+    let mut cache_read = 0u64;
+    let mut thinking = 0u64;
+    let mut response_output = 0u64;
     let mut dedup_id = None;
     while let Some((field, wire)) = u_reader.next_field() {
         match (field, wire) {
-            (1, ProtoWire::Varint(v)) => inp1 = v,
-            (2, ProtoWire::Varint(v)) => inp2 = v,
-            (5, ProtoWire::Varint(v)) => cch = v,
-            (9, ProtoWire::Varint(v)) => out = v,
-            (10, ProtoWire::Varint(v)) => rea = v,
+            (2, ProtoWire::Varint(v)) => input = v,
+            (3, ProtoWire::Varint(v)) => total_output = v,
+            (4, ProtoWire::Varint(v)) => cache_write = v,
+            (5, ProtoWire::Varint(v)) => cache_read = v,
+            (9, ProtoWire::Varint(v)) => thinking = v,
+            (10, ProtoWire::Varint(v)) => response_output = v,
             (11, ProtoWire::Len(b)) => {
                 if let Ok(s) = std::str::from_utf8(b) {
                     let trimmed = s.trim();
@@ -985,7 +987,16 @@ fn parse_gen_metadata_turn(blob: &[u8]) -> Option<(Option<String>, Vec<u8>, Vec<
             _ => {}
         }
     }
-    if inp1 == 0 && inp2 == 0 && out == 0 && cch == 0 && rea == 0 {
+    // Skip exactly the generations tokscale skips, so the rest line up 1:1 with its records for
+    // the same file. Field #1 is a model enum, not tokens (tokscale #1611).
+    // ponytail: mirrors tokscale's rule, so a change there breaks the alignment again; match by
+    // response id once records carry tokscale's dedup key (its cached parse lane returns it).
+    let output = if response_output > 0 {
+        response_output
+    } else {
+        total_output.saturating_sub(thinking)
+    };
+    if input == 0 && output == 0 && cache_read == 0 && cache_write == 0 && thinking == 0 {
         return None;
     }
     let mut step_indices = Vec::new();
@@ -1080,10 +1091,10 @@ fn agy_record(
 ) -> UsageRecord {
     UsageRecord {
         client: client.to_owned(),
-        model_id: m.model_id,
-        provider_id: m.provider_id,
+        model_id: m.model_id.into(),
+        provider_id: m.provider_id.into(),
         session_id: session_id.to_owned(),
-        date: m.date,
+        date: m.date.into(),
         timestamp: m.timestamp,
         tokens: UsageTokens {
             input: m.tokens.input.max(0),
@@ -1902,6 +1913,77 @@ mod tests {
 
         // resp-2 gets its own timestamp (2000), NOT resp-1's timestamp (1000) from index 0!
         assert_eq!(time_updates, vec![(0, 2000), (1, 3000)]);
+    }
+
+    #[test]
+    fn gen_turns_line_up_with_tokscales_records_for_the_same_file() {
+        fn varint(mut value: u64, out: &mut Vec<u8>) {
+            while value >= 0x80 {
+                out.push(value as u8 | 0x80);
+                value >>= 7;
+            }
+            out.push(value as u8);
+        }
+        fn len_field(field: u64, bytes: &[u8], out: &mut Vec<u8>) {
+            varint(field << 3 | 2, out);
+            varint(bytes.len() as u64, out);
+            out.extend_from_slice(bytes);
+        }
+        // gen_metadata { 1: chatModel { 4: usage { …, 11: response id }, 19: model } }
+        let generation = |usage: &[(u64, u64)], id: &str| {
+            let mut u = Vec::new();
+            for &(field, value) in usage {
+                varint(field << 3, &mut u);
+                varint(value, &mut u);
+            }
+            len_field(11, id.as_bytes(), &mut u);
+            let mut chat_model = Vec::new();
+            len_field(4, &u, &mut chat_model);
+            len_field(19, b"gemini-3-pro", &mut chat_model);
+            let mut blob = Vec::new();
+            len_field(1, &chat_model, &mut blob);
+            blob
+        };
+        let blobs = [
+            generation(&[(1, 1132), (2, 500), (10, 40)], "r1"),
+            generation(&[(1, 1132)], "r2"), // a failed turn: only the model enum
+            generation(&[(3, 70), (9, 20)], "r3"), // output only as the #3 total
+            generation(&[(4, 900)], "r4"),  // cache write only
+        ];
+        let path = std::env::temp_dir().join(format!("tm-agy-align-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE gen_metadata (idx integer, data blob, size integer);")
+                .unwrap();
+            for (idx, blob) in blobs.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO gen_metadata (idx, data, size) VALUES (?1, ?2, 0)",
+                    rusqlite::params![idx as i64, blob],
+                )
+                .unwrap();
+            }
+        }
+        let ours: Vec<Vec<u8>> = read_gen_turns(&path)
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        let theirs: Vec<Vec<u8>> =
+            tokscale_core::sessions::antigravity_cli::parse_antigravity_cli_file(&path)
+                .into_iter()
+                .map(|m| m.dedup_key.unwrap_or_default().into_bytes())
+                .collect();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            ours, theirs,
+            "enrichment aligns turns with tokscale's records by position"
+        );
+        assert_eq!(
+            ours.len(),
+            3,
+            "the turn with only the model enum is not a record"
+        );
     }
 
     #[test]

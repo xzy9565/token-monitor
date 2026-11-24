@@ -12,7 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 # Pinned for reproducible local usage parsing. This is intentionally a library
 # dependency: the final binary must not spawn a Tokscale Node/CLI sidecar.
-tokscale-core = { git = "https://github.com/junhoyeo/tokscale.git", rev = "d4d1c751856e25913bce97bfbd7b254308863239", package = "tokscale-core" }
+tokscale-core = { git = "https://github.com/junhoyeo/tokscale.git", rev = "b265e836c58f085f50a836525aa60b8d45bd8d57", package = "tokscale-core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dirs = "5.0"
