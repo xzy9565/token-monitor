@@ -523,6 +523,7 @@ struct App {
     consumption_metric: ConsumptionMetric,
     settings: SettingsState,
     refresh_requested: bool,
+    usage_refresh_requested: bool,
 }
 
 impl App {
@@ -882,6 +883,7 @@ impl App {
             consumption_metric: ConsumptionMetric::Tokens,
             settings: SettingsState::new(),
             refresh_requested: false,
+            usage_refresh_requested: false,
             limits_selected: 0,
             consumption_selected: 0,
             modal_scroll: 0,
@@ -919,6 +921,7 @@ impl App {
             consumption_metric: ConsumptionMetric::Tokens,
             settings: SettingsState::new(),
             refresh_requested: false,
+            usage_refresh_requested: false,
             limits_selected: 0,
             consumption_selected: 0,
             modal_scroll: 0,
@@ -951,6 +954,7 @@ impl App {
                     self.last_refresh = Instant::now();
                     if self.view == View::Consumption {
                         self.usage_busy = true;
+                        self.usage_refresh_requested = true;
                     } else {
                         self.limits_busy = true;
                         self.refresh_requested = true;
@@ -1044,6 +1048,9 @@ impl App {
                     View::Settings => View::Limits,
                 };
                 self.scroll = 0;
+                if self.view == View::Consumption {
+                    self.usage_refresh_requested = true;
+                }
             }
             KeyCode::Char('w') if self.view == View::Consumption => {
                 self.ledger_window = self.ledger_window.next();
@@ -1062,6 +1069,7 @@ impl App {
                 self.last_refresh = Instant::now();
                 if self.view == View::Consumption {
                     self.usage_busy = true;
+                    self.usage_refresh_requested = true;
                 } else {
                     self.limits_busy = true;
                     self.refresh_requested = true;
@@ -6109,22 +6117,9 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
             if event::poll(Duration::from_millis(100))? {
                 match event::read()? {
                     Event::Key(key) => {
-                        let immediate_refresh = matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'));
+                        // `handle_key` decides what a key means in the current mode (a typed `r`
+                        // or `t` in search is text) and raises the refresh requests handled below.
                         app.handle_key(key);
-                        if immediate_refresh {
-                            app.last_refresh = Instant::now();
-                            app.refreshes = app.refreshes.saturating_add(1);
-                            if app.view == View::Consumption {
-                                next_usage_refresh = Instant::now();
-                                app.usage_busy = true;
-                            } else {
-                                next_refresh = Instant::now();
-                                app.limits_busy = true;
-                            }
-                        }
-                        if key.code == KeyCode::Char('t') && app.view == View::Consumption {
-                            next_usage_refresh = Instant::now();
-                        }
                         dirty = true;
                     }
                     Event::Paste(text) => {
@@ -6142,6 +6137,14 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
             if app.refresh_requested {
                 app.refresh_requested = false;
                 next_refresh = Instant::now();
+                dirty = true;
+            }
+            if app.usage_refresh_requested {
+                app.usage_refresh_requested = false;
+                // A scan already running brings fresh data; queueing another doubles the wait.
+                if !usage_in_flight {
+                    next_usage_refresh = Instant::now();
+                }
                 dirty = true;
             }
         }
@@ -6244,6 +6247,31 @@ mod tests {
         assert_eq!(app.view, View::Consumption);
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         assert_eq!(app.view, View::Limits);
+    }
+
+    #[test]
+    fn refresh_keys_typed_into_search_stay_text() {
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let mut app = App::new(true, false);
+        app.view = View::Consumption;
+        app.handle_key(key('/'));
+        for c in "art".chars() {
+            app.handle_key(key(c));
+        }
+        assert_eq!(app.search_query, "art");
+        assert!(!app.usage_refresh_requested && !app.refresh_requested);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(key('r'));
+        assert!(app.usage_refresh_requested, "r in the ledger rescans it");
+        app.usage_refresh_requested = false;
+        app.handle_key(key('t'));
+        assert!(
+            !app.usage_refresh_requested,
+            "leaving the ledger does not rescan"
+        );
+        app.handle_key(key('t'));
+        assert!(app.usage_refresh_requested, "t into the ledger rescans it");
     }
 
     #[test]
