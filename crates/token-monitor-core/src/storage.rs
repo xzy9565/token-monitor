@@ -13,6 +13,21 @@ use std::path::{Path, PathBuf};
 
 pub const SCHEMA_VERSION: i64 = 1;
 
+/// Rebuilding the table must start from this schema: `CREATE TABLE … AS SELECT` drops the primary
+/// key and UNIQUE constraint, and every row inserted afterwards then gets a NULL id.
+const PROVIDER_SNAPSHOTS_DDL: &str = "CREATE TABLE IF NOT EXISTS provider_snapshots (
+   id INTEGER PRIMARY KEY AUTOINCREMENT,
+   collected_at_ms INTEGER NOT NULL,
+   provider_id TEXT NOT NULL,
+   account_key TEXT NOT NULL,
+   source_health TEXT NOT NULL,
+   availability TEXT NOT NULL,
+   payload_json TEXT NOT NULL,
+   payload_sha256 TEXT NOT NULL UNIQUE
+ );
+ CREATE INDEX IF NOT EXISTS provider_snapshots_lookup
+   ON provider_snapshots(provider_id, account_key, collected_at_ms DESC);";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoragePaths {
     pub config_dir: PathBuf,
@@ -115,24 +130,13 @@ impl Storage {
 
     fn migrate(&self) -> Result<(), String> {
         self.connection
-            .execute_batch(
+            .execute_batch(&format!(
                 "BEGIN;
                  CREATE TABLE IF NOT EXISTS schema_meta (
                    key TEXT PRIMARY KEY NOT NULL,
                    value TEXT NOT NULL
                  );
-                 CREATE TABLE IF NOT EXISTS provider_snapshots (
-                   id INTEGER PRIMARY KEY AUTOINCREMENT,
-                   collected_at_ms INTEGER NOT NULL,
-                   provider_id TEXT NOT NULL,
-                   account_key TEXT NOT NULL,
-                   source_health TEXT NOT NULL,
-                   availability TEXT NOT NULL,
-                   payload_json TEXT NOT NULL,
-                   payload_sha256 TEXT NOT NULL UNIQUE
-                 );
-                 CREATE INDEX IF NOT EXISTS provider_snapshots_lookup
-                   ON provider_snapshots(provider_id, account_key, collected_at_ms DESC);
+                 {PROVIDER_SNAPSHOTS_DDL}
                  CREATE TABLE IF NOT EXISTS usage_snapshots (
                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                    collected_at_ms INTEGER NOT NULL,
@@ -149,9 +153,43 @@ impl Storage {
                  INSERT INTO schema_meta(key, value)
                    VALUES ('schema_version', '1')
                    ON CONFLICT(key) DO UPDATE SET value=excluded.value;
-                 COMMIT;",
+                 COMMIT;"
+            ))
+            .map_err(|error| format!("migrate SQLite: {error}"))?;
+        self.repair_provider_snapshots()
+    }
+
+    /// Restores the schema of a `provider_snapshots` that an older downsample rebuilt with
+    /// `CREATE TABLE … AS SELECT`. Its later rows have NULL ids, which `max(id)` (the startup
+    /// cache) never picks and the next downsample deleted. Ids are reassigned in insertion order.
+    fn repair_provider_snapshots(&self) -> Result<(), String> {
+        let has_primary_key = self
+            .connection
+            .query_row(
+                "SELECT pk FROM pragma_table_info('provider_snapshots') WHERE name = 'id'",
+                [],
+                |row| row.get::<_, i64>(0),
             )
-            .map_err(|error| format!("migrate SQLite: {error}"))
+            .map_err(|error| format!("inspect provider_snapshots: {error}"))?
+            > 0;
+        if has_primary_key {
+            return Ok(());
+        }
+        // The rename carries the index along, so drop it before recreating it on the new table.
+        self.connection
+            .execute_batch(&format!(
+                "BEGIN;
+                 ALTER TABLE provider_snapshots RENAME TO provider_snapshots_broken;
+                 DROP INDEX IF EXISTS provider_snapshots_lookup;
+                 {PROVIDER_SNAPSHOTS_DDL}
+                 INSERT OR IGNORE INTO provider_snapshots
+                   (collected_at_ms, provider_id, account_key, source_health, availability, payload_json, payload_sha256)
+                   SELECT collected_at_ms, provider_id, account_key, source_health, availability, payload_json, payload_sha256
+                   FROM provider_snapshots_broken ORDER BY rowid;
+                 DROP TABLE provider_snapshots_broken;
+                 COMMIT;"
+            ))
+            .map_err(|error| format!("repair provider_snapshots: {error}"))
     }
 
     pub fn save_provider_snapshots(&self, snapshots: &[ProviderSnapshot]) -> Result<usize, String> {
@@ -253,7 +291,7 @@ impl Storage {
             .map_err(|error| format!("prepare select provider rows: {error}"))?;
 
         for (provider_id, account_key) in &pairs {
-            let mut rows = select_stmt
+            let rows = select_stmt
                 .query_map(params![provider_id, account_key], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
                 })
@@ -263,7 +301,11 @@ impl Storage {
             let mut last_heartbeat_ms = 0i64;
             let mut last_id = None;
 
-            while let Some(Ok((id, ms, payload))) = rows.next() {
+            for row in rows {
+                // A row that cannot be read must abort, not end the scan: every row after it
+                // would be missing from `ids_to_keep` and so get deleted.
+                let (id, ms, payload) =
+                    row.map_err(|error| format!("read provider row: {error}"))?;
                 last_id = Some(id);
                 let snap = match serde_json::from_str::<ProviderSnapshot>(&payload) {
                     Ok(s) => s,
@@ -327,19 +369,15 @@ impl Storage {
                 .map_err(|error| format!("commit temp insert: {error}"))?;
         }
 
+        // Delete in place: rebuilding the table would lose its schema (see PROVIDER_SNAPSHOTS_DDL).
         self.connection
             .execute_batch(
                 "BEGIN;
-                 CREATE TABLE provider_snapshots_compact AS
-                   SELECT * FROM provider_snapshots WHERE id IN (SELECT id FROM keep_ids);
-                 DROP TABLE provider_snapshots;
-                 ALTER TABLE provider_snapshots_compact RENAME TO provider_snapshots;
-                 CREATE INDEX IF NOT EXISTS provider_snapshots_lookup
-                   ON provider_snapshots(provider_id, account_key, collected_at_ms DESC);
+                 DELETE FROM provider_snapshots WHERE id NOT IN (SELECT id FROM keep_ids);
                  DROP TABLE keep_ids;
                  COMMIT;",
             )
-            .map_err(|error| format!("swap compacted table: {error}"))?;
+            .map_err(|error| format!("delete downsampled rows: {error}"))?;
 
         let _ = self.connection.execute("VACUUM;", []);
 
@@ -827,5 +865,97 @@ mod tests {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
         let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    fn insert_raw(storage: &Storage, collected_at_ms: i64, remaining_percent: f64) {
+        let mut row = snapshot();
+        row.collected_at_ms = collected_at_ms;
+        row.windows[0].remaining_percent = Some(remaining_percent);
+        let payload = serde_json::to_string(&row).unwrap();
+        storage
+            .connection
+            .execute(
+                "INSERT INTO provider_snapshots
+                 (collected_at_ms, provider_id, account_key, source_health, availability, payload_json, payload_sha256)
+                 VALUES (?1, ?2, ?3, 'Connected', 'Available', ?4, ?5)",
+                params![row.collected_at_ms, row.provider_id, row.account_key, payload, sha256(payload.as_bytes())],
+            )
+            .unwrap();
+    }
+
+    fn remove_db(path: &Path) {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn rows_saved_after_a_downsample_survive_the_next_one() {
+        let path = temp_db("downsample_twice");
+        let storage = Storage::open_at(&path).unwrap();
+        for i in 0..5 {
+            insert_raw(&storage, 1_000_000 + i * 60_000, 75.0);
+        }
+        storage.downsample_provider_snapshots().unwrap();
+
+        let mut later = snapshot();
+        later.collected_at_ms = 5_000_000;
+        later.windows[0].remaining_percent = Some(10.0);
+        assert_eq!(
+            storage.save_provider_snapshots(&[later.clone()]).unwrap(),
+            1
+        );
+        let null_ids: i64 = storage
+            .connection
+            .query_row(
+                "SELECT count(*) FROM provider_snapshots WHERE id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_ids, 0, "downsample must keep the id primary key");
+        assert_eq!(
+            storage.latest_provider_snapshots().unwrap(),
+            vec![later.clone()]
+        );
+
+        storage.downsample_provider_snapshots().unwrap();
+        assert_eq!(storage.latest_provider_snapshots().unwrap(), vec![later]);
+        remove_db(&path);
+    }
+
+    #[test]
+    fn open_repairs_a_table_rebuilt_without_its_primary_key() {
+        let path = temp_db("repair");
+        {
+            let storage = Storage::open_at(&path).unwrap();
+            insert_raw(&storage, 1_000_000, 75.0);
+            // What the old downsample did: the copy has no primary key, so the next row's id is NULL.
+            storage
+                .connection
+                .execute_batch(
+                    "CREATE TABLE compact AS SELECT * FROM provider_snapshots;
+                     DROP TABLE provider_snapshots;
+                     ALTER TABLE compact RENAME TO provider_snapshots;",
+                )
+                .unwrap();
+            insert_raw(&storage, 2_000_000, 40.0);
+        }
+
+        let storage = Storage::open_at(&path).unwrap();
+        let (rows, null_ids, pk): (i64, i64, i64) = storage
+            .connection
+            .query_row(
+                "SELECT count(*), count(*) - count(id),
+                        (SELECT pk FROM pragma_table_info('provider_snapshots') WHERE name = 'id')
+                 FROM provider_snapshots",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((rows, null_ids, pk), (2, 0, 1));
+        let latest = storage.latest_provider_snapshots().unwrap();
+        assert_eq!(latest[0].windows[0].remaining_percent, Some(40.0));
+        remove_db(&path);
     }
 }
