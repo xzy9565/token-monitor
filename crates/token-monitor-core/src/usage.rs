@@ -26,6 +26,10 @@ pub struct UsageTokens {
     pub cache_read: i64,
     pub cache_write: i64,
     pub reasoning: i64,
+    /// The part of `cache_write` kept for Anthropic's 1-hour TTL, billed at 2× input instead of
+    /// 1.25×. Already counted in `cache_write`.
+    #[serde(default)]
+    pub cache_write_1h: i64,
 }
 
 impl UsageTokens {
@@ -35,11 +39,10 @@ impl UsageTokens {
         self.cache_read = self.cache_read.saturating_add(other.cache_read);
         self.cache_write = self.cache_write.saturating_add(other.cache_write);
         self.reasoning = self.reasoning.saturating_add(other.reasoning);
+        self.cache_write_1h = self.cache_write_1h.saturating_add(other.cache_write_1h);
     }
 
-    /// The total that is safe to present before client-specific reasoning
-    /// semantics are resolved. Some clients report reasoning as a subset of
-    /// output, so callers must not blindly add `reasoning` a second time.
+    /// Every bucket but `reasoning`, which tokscale logs apart from output.
     pub fn reported_total_without_reasoning(&self) -> i64 {
         self.input
             .saturating_add(self.output)
@@ -269,6 +272,7 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
                     cache_read: tokens.cache_read.max(0),
                     cache_write: tokens.cache_write.max(0),
                     reasoning: tokens.reasoning.max(0),
+                    cache_write_1h: tokens.cache_write_1h.clamp(0, tokens.cache_write.max(0)),
                 },
                 client: message.client.into(),
                 model_id: message.model_id.into(),
@@ -400,6 +404,7 @@ fn parse_cursor_json(content: &str, records: &mut Vec<UsageRecord>, since: Optio
                 cache_read: tu.get("cacheReadTokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0),
                 cache_write: tu.get("cacheWriteTokens").and_then(|v| v.as_i64()).unwrap_or(0).max(0),
                 reasoning: 0,
+                cache_write_1h: 0,
             }
         } else {
             UsageTokens::default()
@@ -502,6 +507,10 @@ fn collect_cursor_cache_records(records: &mut Vec<UsageRecord>, since: Option<&s
                     cache_read: m.tokens.cache_read.max(0),
                     cache_write: m.tokens.cache_write.max(0),
                     reasoning: m.tokens.reasoning.max(0),
+                    cache_write_1h: m
+                        .tokens
+                        .cache_write_1h
+                        .clamp(0, m.tokens.cache_write.max(0)),
                 },
                 message_count: m.message_count.max(0),
                 reported_cost_micros: None,
@@ -617,6 +626,7 @@ fn collect_commandcode_v3_records(records: &mut Vec<UsageRecord>, since: Option<
                         cache_read,
                         cache_write,
                         reasoning: 0,
+                        cache_write_1h: 0,
                     }
                 } else {
                     UsageTokens::default()
@@ -1167,6 +1177,10 @@ fn agy_record(
             cache_read: m.tokens.cache_read.max(0),
             cache_write: m.tokens.cache_write.max(0),
             reasoning: m.tokens.reasoning.max(0),
+            cache_write_1h: m
+                .tokens
+                .cache_write_1h
+                .clamp(0, m.tokens.cache_write.max(0)),
         },
         message_count: m.message_count.max(0),
         reported_cost_micros: None,
@@ -1661,6 +1675,7 @@ mod tests {
             cache_read: 30,
             cache_write: 40,
             reasoning: 20,
+            cache_write_1h: 0,
         };
         assert_eq!(tokens.reported_total_without_reasoning(), 100);
     }
@@ -1717,6 +1732,7 @@ mod tests {
                     cache_read: 0,
                     cache_write: 0,
                     reasoning: 5,
+                    cache_write_1h: 0,
                 },
                 message_count: 1,
                 reported_cost_micros: None,
@@ -1726,8 +1742,9 @@ mod tests {
             tokscale_revision: TOKSCALE_REVISION.into(),
         };
         let report = build_consumption_report(snapshot, &PricingEngine::unavailable(), false);
-        assert_eq!(report.summary.total_tokens, 30);
-        assert_eq!(report.summary.unpriced_tokens, 30);
+        // tokscale logs reasoning apart from output, so its 5 tokens count too.
+        assert_eq!(report.summary.total_tokens, 35);
+        assert_eq!(report.summary.unpriced_tokens, 35);
         assert_eq!(report.summary.unknown_rows, 1);
         assert!(report.summary.api_equivalent_usd.is_none());
     }
@@ -2221,6 +2238,7 @@ mod tests {
             cache_read,
             cache_write,
             reasoning: 0,
+            cache_write_1h: 0,
         };
         assert_eq!(tokens.input, 17041);
         assert_eq!(tokens.cache_read, 6016);

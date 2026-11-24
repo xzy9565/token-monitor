@@ -808,6 +808,7 @@ mod tests {
                 input: 5000,
                 output: 200,
                 reasoning: 0,
+                cache_write_1h: 0,
                 cache_write: 1000,
                 cache_read: 4000,
             },

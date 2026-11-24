@@ -3,8 +3,8 @@
 //! Tokscale supplies maintained pricing datasets and model lookup. This module
 //! owns the acceptance policy and ledger contract: fuzzy/ambiguous matches do
 //! not become confident dollar amounts, list prices (LiteLLM) outrank reseller
-//! tiers (OpenRouter), and reasoning is charged only where it is logged apart
-//! from output.
+//! tiers (OpenRouter), and a price borrowed from another model name is never
+//! labelled Exact. The arithmetic is tokscale's own `compute_cost`.
 
 use crate::usage::{UsageRecord, UsageTokens};
 use serde::{Deserialize, Serialize};
@@ -42,8 +42,10 @@ pub struct PriceQuote {
 
 pub struct PricingEngine {
     service: Option<tokscale_core::pricing::PricingService>,
-    resolutions:
-        Mutex<HashMap<(String, String), Option<tokscale_core::pricing::lookup::LookupResult>>>,
+    /// Each (provider, model)'s match, and whether its price belongs to another model name.
+    resolutions: Mutex<
+        HashMap<(String, String), Option<(tokscale_core::pricing::lookup::LookupResult, bool)>>,
+    >,
 }
 
 impl PricingEngine {
@@ -119,7 +121,7 @@ impl PricingEngine {
     }
 
     pub fn quote(&self, record: &UsageRecord) -> PriceQuote {
-        let tokens = safe_tokens(record);
+        let tokens = record.tokens.clone();
         let total_tokens = tokens
             .input
             .saturating_add(tokens.cache_read)
@@ -160,7 +162,7 @@ impl PricingEngine {
                         let found =
                             service.lookup_with_source_and_provider(cand, Some("custom"), None);
                         if found.as_ref().is_some_and(is_strict) {
-                            return found;
+                            return found.map(|r| mark_borrowed(r, &record.model_id));
                         }
 
                         // 2. LiteLLM vendor list prices
@@ -168,7 +170,7 @@ impl PricingEngine {
                             let found =
                                 service.lookup_with_source_and_provider(cand, Some("litellm"), hint);
                             if found.as_ref().is_some_and(is_strict) {
-                                return found;
+                                return found.map(|r| mark_borrowed(r, &record.model_id));
                             }
                         }
 
@@ -177,22 +179,32 @@ impl PricingEngine {
                             let found =
                                 service.lookup_with_source_and_provider(cand, None, hint);
                             if found.as_ref().is_some_and(is_strict) {
-                                return found;
+                                return found.map(|r| mark_borrowed(r, &record.model_id));
                             }
                             if fallback.is_none() && cand == &record.model_id {
                                 fallback = found;
                             }
                         }
                     }
-                    fallback
+                    fallback.map(|r| mark_borrowed(r, &record.model_id))
                 })
                 .clone()
         };
 
         // Tier 1 & Tier 2: Strict match from canonical lookup pipeline
-        if let Some(result) = result.as_ref().filter(|r| is_strict(r)) {
+        if let Some((result, borrowed)) = result.as_ref().filter(|(r, _)| is_strict(r)) {
             let resolution = result.evidence.kind.as_str().to_owned();
-            let (value, priced_tokens, mut warnings) = calculate_components(&result.pricing, &tokens);
+            // Cursor logs a whole agent loop as one request (rows reach 29M tokens), so its rows
+            // are sums of requests too.
+            let single_request = record.message_count <= 1 && record.client != "cursor";
+            let (value, priced_tokens, mut warnings) =
+                calculate_components(&result.pricing, &tokens, single_request);
+            if *borrowed {
+                warnings.push(format!(
+                    "priced as {}: no published price for {}",
+                    result.matched_key, record.model_id
+                ));
+            }
             let complete = priced_tokens == total_tokens && warnings.is_empty();
             return PriceQuote {
                 model_id: record.model_id.clone(),
@@ -236,7 +248,7 @@ impl PricingEngine {
         }
 
         // Tier 4: Fail closed as Unknown
-        let (source, matched_key, resolution, warning) = if let Some(res) = result {
+        let (source, matched_key, resolution, warning) = if let Some((res, _)) = result {
             (
                 Some(res.source.clone()),
                 Some(res.matched_key.clone()),
@@ -526,11 +538,145 @@ fn is_strict(result: &tokscale_core::pricing::lookup::LookupResult) -> bool {
         )
 }
 
+/// Suffixes that name the same model at the same price: a reasoning effort, or an alias.
+const NEUTRAL_SUFFIXES: &[&str] = &["-thinking", "-latest", "-xhigh", "-high", "-medium", "-low"];
+
+/// Whether two model ids differ only in provider prefix, case, version punctuation, or a neutral
+/// suffix. Any other difference (`-fast`, `-max`, a dropped date, an eroded `-n`) means one model is
+/// priced at another's rates.
+fn same_model(a: &str, b: &str) -> bool {
+    let spellings = |id: &str| {
+        let mut id = id.rsplit('/').next().unwrap_or(id).to_ascii_lowercase();
+        let mut forms = expand_base_model(&id);
+        while let Some(base) = NEUTRAL_SUFFIXES.iter().find_map(|s| id.strip_suffix(s)) {
+            id = base.to_owned();
+            forms.extend(expand_base_model(&id));
+        }
+        forms
+    };
+    let a = spellings(a);
+    spellings(b).iter().any(|form| a.contains(form))
+}
+
+/// The match, and whether its price was borrowed from another model name. tokscale's own aliases
+/// are curated, so they count as the same model unless it also eroded the id.
+fn mark_borrowed(
+    result: tokscale_core::pricing::lookup::LookupResult,
+    model: &str,
+) -> (tokscale_core::pricing::lookup::LookupResult, bool) {
+    let curated_alias = result.evidence.alias_applied && !result.evidence.stripped;
+    let borrowed = !curated_alias && !same_model(&result.matched_key, model);
+    (result, borrowed)
+}
+
+/// The long-context card a single request falls under: the highest threshold its prompt passes
+/// that publishes an input rate. Vendors bill such a request whole at that card (OpenAI past 272k,
+/// Google and Anthropic past 200k, Haiku 5.5 past 100k), not only the tokens past the threshold.
+/// A bucket the card leaves out follows the input rate's multiplier, as tokscale prices OpenAI's
+/// cache writes; output keeps its base rate.
+fn long_context_card(
+    p: &tokscale_core::pricing::ModelPricing,
+    prompt_tokens: i64,
+) -> Option<tokscale_core::pricing::ModelPricing> {
+    let cards = [
+        (
+            272_000,
+            p.input_cost_per_token_above_272k_tokens,
+            p.output_cost_per_token_above_272k_tokens,
+            p.cache_read_input_token_cost_above_272k_tokens,
+            None,
+            None,
+        ),
+        (
+            256_000,
+            p.input_cost_per_token_above_256k_tokens,
+            p.output_cost_per_token_above_256k_tokens,
+            None,
+            None,
+            None,
+        ),
+        (
+            200_000,
+            p.input_cost_per_token_above_200k_tokens,
+            p.output_cost_per_token_above_200k_tokens,
+            p.cache_read_input_token_cost_above_200k_tokens,
+            p.cache_creation_input_token_cost_above_200k_tokens,
+            p.cache_creation_input_token_cost_above_1hr_above_200k_tokens,
+        ),
+        (
+            128_000,
+            p.input_cost_per_token_above_128k_tokens,
+            p.output_cost_per_token_above_128k_tokens,
+            None,
+            None,
+            None,
+        ),
+        (
+            100_000,
+            p.input_cost_per_token_above_100k_tokens,
+            p.output_cost_per_token_above_100k_tokens,
+            p.cache_read_input_token_cost_above_100k_tokens,
+            p.cache_creation_input_token_cost_above_100k_tokens,
+            p.cache_creation_input_token_cost_above_1hr_above_100k_tokens,
+        ),
+    ];
+    let (_, input, output, cache_read, cache_write, cache_write_1h) = cards
+        .into_iter()
+        .find(|&(threshold, input, ..)| prompt_tokens > threshold && input.is_some())?;
+    let scaled =
+        |base: Option<f64>| Some(base? * input? / p.input_cost_per_token.filter(|b| *b > 0.0)?);
+    Some(tokscale_core::pricing::ModelPricing {
+        input_cost_per_token: input,
+        output_cost_per_token: output.or(p.output_cost_per_token),
+        cache_read_input_token_cost: cache_read.or_else(|| scaled(p.cache_read_input_token_cost)),
+        cache_creation_input_token_cost: cache_write
+            .or_else(|| scaled(p.cache_creation_input_token_cost)),
+        cache_creation_input_token_cost_above_1hr: cache_write_1h
+            .or_else(|| scaled(p.cache_creation_input_token_cost_above_1hr)),
+        ..Default::default()
+    })
+}
+
 fn calculate_components(
     pricing: &tokscale_core::pricing::ModelPricing,
     tokens: &UsageTokens,
+    single_request: bool,
 ) -> (f64, i64, Vec<String>) {
-    let components = [
+    // A row summing several requests can't tell whether any of them crossed a long-context
+    // threshold, so it stays on the base rates, as tokscale prices its multi-call rows.
+    let prompt_tokens = tokens
+        .input
+        .saturating_add(tokens.cache_read)
+        .saturating_add(tokens.cache_write);
+    let adjusted = if single_request {
+        long_context_card(pricing, prompt_tokens)
+    } else {
+        Some(tokscale_core::pricing::ModelPricing {
+            input_cost_per_token: pricing.input_cost_per_token,
+            output_cost_per_token: pricing.output_cost_per_token,
+            cache_read_input_token_cost: pricing.cache_read_input_token_cost,
+            cache_creation_input_token_cost: pricing.cache_creation_input_token_cost,
+            cache_creation_input_token_cost_above_1hr: pricing
+                .cache_creation_input_token_cost_above_1hr,
+            ..Default::default()
+        })
+    };
+    let pricing = adjusted.as_ref().unwrap_or(pricing);
+    // tokscale's arithmetic: 1-hour cache writes at their own rate, and reasoning (which tokscale
+    // logs apart from output) at the output rate.
+    let value = tokscale_core::pricing::lookup::compute_cost(
+        pricing,
+        tokens.input,
+        tokens.output,
+        tokens.cache_read,
+        tokens.cache_write,
+        tokens.cache_write_1h,
+        tokens.reasoning,
+    );
+    // compute_cost charges a missing rate $0; those tokens are unpriced, not free.
+    let mut priced_tokens = 0i64;
+    let mut warnings = Vec::new();
+    for (amount, rate, label) in [
         (tokens.input, pricing.input_cost_per_token, "input"),
         (
             tokens.cache_read,
@@ -544,48 +690,20 @@ fn calculate_components(
         ),
         (tokens.output, pricing.output_cost_per_token, "output"),
         (tokens.reasoning, pricing.output_cost_per_token, "reasoning"),
-    ];
-    let mut value = 0.0;
-    let mut priced_tokens = 0i64;
-    let mut warnings = Vec::new();
-    for (amount, rate, label) in components {
+    ] {
         if amount <= 0 {
             continue;
         }
-        if let Some(rate) = rate.filter(|rate| rate.is_finite() && *rate >= 0.0) {
-            value += amount as f64 * rate;
+        if rate.is_some_and(|rate| rate.is_finite() && rate >= 0.0) {
             priced_tokens = priced_tokens.saturating_add(amount);
         } else {
             warnings.push(format!("{label} rate unavailable"));
         }
     }
-    let has_long_context_tiers = pricing.input_cost_per_token_above_128k_tokens.is_some()
-        || pricing.input_cost_per_token_above_200k_tokens.is_some()
-        || pricing.input_cost_per_token_above_256k_tokens.is_some()
-        || pricing.input_cost_per_token_above_272k_tokens.is_some()
-        || pricing.output_cost_per_token_above_128k_tokens.is_some()
-        || pricing.output_cost_per_token_above_200k_tokens.is_some()
-        || pricing.output_cost_per_token_above_256k_tokens.is_some()
-        || pricing.output_cost_per_token_above_272k_tokens.is_some();
-    if has_long_context_tiers {
-        warnings.push("long-context tier unavailable".into());
+    if tokens.cache_write_1h > 0 && pricing.cache_creation_input_token_cost_above_1hr.is_none() {
+        warnings.push("1-hour cache write rate unavailable, billed at the 5-minute rate".into());
     }
-    // Tokscale's ModelPricing fields are USD per token. The display layer may
-    // format rates as USD per million, but conversion happens only when loading
-    // human-facing price sheets.
     (value, priced_tokens, warnings)
-}
-
-fn safe_tokens(record: &UsageRecord) -> UsageTokens {
-    let mut tokens = record.tokens.clone();
-    // AGY logs thinking apart from output (Gemini `thoughtsTokenCount`; its Claude rows put all
-    // output there), and both vendors bill thinking at the output rate. Codex reports reasoning
-    // as a subset of output, so it is never charged twice.
-    // ponytail: Grok and OpenCode rows also show reasoning > output at times; verify, then bill.
-    if !record.client.to_ascii_lowercase().starts_with("antigravity") {
-        tokens.reasoning = 0;
-    }
-    tokens
 }
 
 fn unknown_quote(
@@ -631,6 +749,7 @@ mod tests {
                 cache_read: 30,
                 cache_write: 40,
                 reasoning: 20,
+                cache_write_1h: 0,
             },
             message_count: 1,
             reported_cost_micros: None,
@@ -638,17 +757,24 @@ mod tests {
         }
     }
 
-    fn engine() -> PricingEngine {
-        let pricing = tokscale_core::pricing::ModelPricing {
+    fn test_pricing() -> tokscale_core::pricing::ModelPricing {
+        tokscale_core::pricing::ModelPricing {
             input_cost_per_token: Some(1e-6),
             output_cost_per_token: Some(2e-6),
             cache_read_input_token_cost: Some(0.5e-6),
             cache_creation_input_token_cost: Some(1.5e-6),
             ..Default::default()
-        };
+        }
+    }
+
+    fn engine_with(pricing: tokscale_core::pricing::ModelPricing) -> PricingEngine {
         let mut litellm = HashMap::new();
         litellm.insert("openai/test-model".into(), pricing);
         PricingEngine::from_datasets(litellm, HashMap::new())
+    }
+
+    fn engine() -> PricingEngine {
+        engine_with(test_pricing())
     }
 
     #[test]
@@ -656,7 +782,7 @@ mod tests {
         let quote = engine().quote(&record("claude", "openai/does-not-exist"));
         assert_eq!(quote.status, PricingStatus::Unknown);
         assert_eq!(quote.value_usd, None);
-        assert_eq!(quote.unpriced_tokens, 100);
+        assert_eq!(quote.unpriced_tokens, 120);
     }
 
     #[test]
@@ -670,21 +796,73 @@ mod tests {
     }
 
     #[test]
-    fn codex_reasoning_is_not_added_to_priced_token_total() {
-        let quote = engine().quote(&record("codex", "openai/test-model"));
-        assert_eq!(quote.reasoning_tokens, 0);
-        assert_eq!(quote.priced_tokens, 100);
-        assert!((quote.value_usd.unwrap() - 0.000125).abs() < 1e-12);
+    fn reasoning_is_billed_at_the_output_rate_for_every_client() {
+        for client in ["codex", "antigravity-cli (a@b.c)"] {
+            let quote = engine().quote(&record(client, "openai/test-model"));
+            assert_eq!(quote.status, PricingStatus::Exact);
+            assert_eq!(quote.priced_tokens, 120);
+            // 10 input, 30 cache-read, 40 cache-write, 20 output and 20 reasoning tokens at
+            // $1, $0.5, $1.5, $2 and $2 per million.
+            assert!(
+                (quote.value_usd.unwrap() - 0.000165).abs() < 1e-12,
+                "{client}"
+            );
+        }
     }
 
     #[test]
-    fn antigravity_thinking_is_billed_at_output_rate() {
-        let quote = engine().quote(&record("antigravity-cli (a@b.c)", "openai/test-model"));
+    fn one_hour_cache_writes_are_billed_at_their_own_rate() {
+        let mut rec = record("claude", "openai/test-model");
+        rec.tokens.cache_write_1h = 30;
+        let quote = engine_with(tokscale_core::pricing::ModelPricing {
+            cache_creation_input_token_cost_above_1hr: Some(2e-6),
+            ..test_pricing()
+        })
+        .quote(&rec);
         assert_eq!(quote.status, PricingStatus::Exact);
-        assert_eq!(quote.reasoning_tokens, 20);
-        assert_eq!(quote.priced_tokens, 120);
-        // The codex case above prices 100 tokens at $0.000125; 20 thinking tokens add 20 × $2/M.
-        assert!((quote.value_usd.unwrap() - 0.000165).abs() < 1e-12);
+        // 30 of the 40 cache-write tokens move from the 5-minute $1.5/M to the 1-hour $2/M.
+        assert!((quote.value_usd.unwrap() - 0.00018).abs() < 1e-12);
+        let without_hourly_rate = engine().quote(&rec);
+        assert_eq!(without_hourly_rate.status, PricingStatus::Partial);
+    }
+
+    #[test]
+    fn long_context_tiers_apply_past_their_threshold_only() {
+        let engine = engine_with(tokscale_core::pricing::ModelPricing {
+            input_cost_per_token_above_200k_tokens: Some(2e-6),
+            ..test_pricing()
+        });
+        let short = engine.quote(&record("codex", "openai/test-model"));
+        assert_eq!(short.status, PricingStatus::Exact);
+        assert!((short.value_usd.unwrap() - 0.000165).abs() < 1e-12);
+
+        let mut long = record("codex", "openai/test-model");
+        long.tokens.input = 300_000;
+        let quote = engine.quote(&long);
+        assert_eq!(quote.status, PricingStatus::Exact);
+        // Past 200k the whole request moves to the long-context card: all 300k input tokens at
+        // $2/M, cache reads and writes at twice their rates, output on its base rate.
+        assert!((quote.value_usd.unwrap() - 0.60023).abs() < 1e-9);
+        long.message_count = 3;
+        // A row summing several requests stays on the base rates: 300k at $1/M.
+        assert!((engine.quote(&long).value_usd.unwrap() - 0.300155).abs() < 1e-9);
+        long.message_count = 1;
+        long.client = "cursor".into();
+        assert!((engine.quote(&long).value_usd.unwrap() - 0.300155).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_price_borrowed_from_another_model_name_is_not_exact() {
+        let borrowed = engine().quote(&record("codex", "openai/test-model-fast"));
+        assert_eq!(borrowed.matched_key.as_deref(), Some("openai/test-model"));
+        assert_eq!(borrowed.status, PricingStatus::Partial);
+        assert!(borrowed.value_usd.is_some());
+        let effort = engine().quote(&record("codex", "openai/test-model-high"));
+        assert_eq!(
+            effort.status,
+            PricingStatus::Exact,
+            "a reasoning effort is the same model"
+        );
     }
 
     #[test]
@@ -708,6 +886,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             reasoning: 0,
+            cache_write_1h: 0,
         };
         let quote = engine.quote(&rec);
         assert_eq!(quote.source.as_deref(), Some("LiteLLM"));
@@ -737,6 +916,7 @@ mod tests {
                     cache_read: 0,
                     cache_write: 199678,
                     reasoning: 0,
+                    cache_write_1h: 0,
                 },
                 message_count: 1,
                 reported_cost_micros: None,
@@ -793,6 +973,7 @@ mod tests {
                 cache_read: 30,
                 cache_write: 40,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             message_count: 1,
             reported_cost_micros: None,
@@ -824,13 +1005,15 @@ mod tests {
                 cache_read: 697344,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             message_count: 1,
             reported_cost_micros: None,
             dedup_id: None,
         };
         let quote = engine.quote(&rec);
-        assert_eq!(quote.status, PricingStatus::Exact);
+        // Finding it took dropping `-max`, so the price is borrowed, not Exact.
+        assert_eq!(quote.status, PricingStatus::Partial);
         assert_eq!(quote.matched_key.as_deref(), Some("deepseek/deepseek-v4.1-flash-1017"));
         assert_eq!(quote.priced_tokens, 884354);
         assert_eq!(quote.unpriced_tokens, 0);
@@ -859,6 +1042,7 @@ mod tests {
                 cache_read: 2_000_000,
                 cache_write: 0,
                 reasoning: 0,
+                cache_write_1h: 0,
             },
             message_count: 1,
             reported_cost_micros: None,
