@@ -670,8 +670,8 @@ struct AgyProcessLog {
     events: Vec<(i64, String)>,
 }
 
-fn parse_agy_process_log(year: i32, content: &str) -> AgyProcessLog {
-    let stamp = |line: &str| glog_timestamp_ms(year, line);
+fn parse_agy_process_log(started: chrono::NaiveDate, content: &str) -> AgyProcessLog {
+    let stamp = |line: &str| glog_timestamp_ms(started, line);
     let mut log = AgyProcessLog {
         last_ms: content.lines().rev().find_map(stamp).unwrap_or_default(),
         ..AgyProcessLog::default()
@@ -716,14 +716,18 @@ fn lines_containing<'a>(content: &'a str, needle: &'a str) -> impl Iterator<Item
     })
 }
 
-/// glog prefix `I0924 18:08:14.490117`, local time; the year comes from the log file name.
-// ponytail: a process log that spans New Year gets January lines in the old year.
-fn glog_timestamp_ms(year: i32, line: &str) -> Option<i64> {
+/// glog prefix `I0924 18:08:14.490117`, local time. glog leaves the year out: it is the year the log
+/// started (from its file name), or the next one for a line dated before that start, which only a
+/// process still running after New Year's Eve writes.
+fn glog_timestamp_ms(started: chrono::NaiveDate, line: &str) -> Option<i64> {
+    use chrono::Datelike;
     if !matches!(line.as_bytes().first(), Some(b'I' | b'W' | b'E' | b'F')) {
         return None;
     }
     let num = |range: std::ops::Range<usize>| -> Option<u32> { line.get(range)?.parse().ok() };
-    let time = chrono::NaiveDate::from_ymd_opt(year, num(1..3)?, num(3..5)?)?.and_hms_micro_opt(
+    let (month, day) = (num(1..3)?, num(3..5)?);
+    let year = started.year() + i32::from((month, day) < (started.month(), started.day()));
+    let time = chrono::NaiveDate::from_ymd_opt(year, month, day)?.and_hms_micro_opt(
         num(6..8)?,
         num(9..11)?,
         num(12..14)?,
@@ -775,16 +779,16 @@ fn tag_antigravity_account_records(records: &mut [UsageRecord]) {
         .flatten()
     {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(year) = name
+        let Some(started) = name
             .strip_prefix("cli-")
-            .and_then(|rest| rest.get(..4))
-            .and_then(|y| y.parse().ok())
+            .and_then(|rest| rest.get(..8))
+            .and_then(|date| chrono::NaiveDate::parse_from_str(date, "%Y%m%d").ok())
         else {
             continue;
         };
         if let Ok(bytes) = std::fs::read(entry.path()) {
             logs.push(parse_agy_process_log(
-                year,
+                started,
                 &String::from_utf8_lossy(&bytes),
             ));
         }
@@ -1784,10 +1788,23 @@ mod tests {
     }
 
     #[test]
+    fn a_process_log_running_past_new_years_eve_puts_january_in_the_new_year() {
+        let started = chrono::NaiveDate::from_ymd_opt(2026, 12, 28).unwrap();
+        let log = parse_agy_process_log(
+            started,
+            "I1231 23:00:00.000000 1 a.go:1] x\nI0102 09:00:00.000000 1 a.go:1] y\n",
+        );
+        let december_call = glog_timestamp_ms(started, "I1231 23:30:00.000000").unwrap();
+        // The process outlived its December call, so that call keeps the process's account.
+        assert_eq!(log.last_ms - december_call, (33 * 60 + 30) * 60 * 1000);
+    }
+
+    #[test]
     fn antigravity_account_tagging_follows_agy_process_logs() {
         let conv = "aaaaaaaa-0000-4000-8000-000000000001";
+        let started = chrono::NaiveDate::from_ymd_opt(2026, 9, 24).unwrap();
         let log = parse_agy_process_log(
-            2026,
+            started,
             &format!(
                 "I0924 18:08:14.490117       1 common.go:391] Resuming conversation {conv}\n\
                  I0924 18:08:14.532061     315 server_oauth.go:196] applyAuthResult: email=two@example.com, authMethod=consumer, quotaProject=\n\
@@ -1795,7 +1812,7 @@ mod tests {
             ),
         );
         assert_eq!(log.email.as_deref(), Some("two@example.com"));
-        let stamp = |line| glog_timestamp_ms(2026, line).unwrap();
+        let stamp = |line| glog_timestamp_ms(started, line).unwrap();
         assert_eq!(
             stamp("I0924 18:08:15.990117") - stamp("I0924 18:08:14.490117"),
             1_500
