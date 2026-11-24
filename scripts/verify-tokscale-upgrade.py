@@ -18,18 +18,28 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from compression import zstd  # Python 3.14+
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TODAY = datetime.date.today().isoformat()
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 
 def ledger(binary, data_home):
+    # Only token-monitor's own database is throwaway: tokscale also finds other apps' data (OpenCode)
+    # through XDG_DATA_HOME, so link everything else back in or those clients vanish from both runs.
+    real_data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    for name in os.listdir(real_data_home):
+        if name != "token-monitor":
+            os.symlink(os.path.join(real_data_home, name), os.path.join(data_home, name))
     args = [binary, "--consumption", "--json", "--skip-import", "--days", "0", "--audit-pricing"]
     env = dict(os.environ, XDG_DATA_HOME=data_home)
     quotes = json.loads(subprocess.run(args, env=env, check=True, capture_output=True).stdout)["quotes"]
     db = f"file:{data_home}/token-monitor/token-monitor.sqlite3?mode=ro"
     payload = sqlite3.connect(db, uri=True).execute(
         "select payload_json from usage_snapshots order by id desc limit 1").fetchone()[0]
+    if payload[:4] == ZSTD_MAGIC:  # storage.rs compresses snapshots
+        payload = zstd.decompress(payload)
     records = json.loads(payload)["records"]
     assert len(records) == len(quotes), "quotes no longer line up with snapshot records"
     return [(r, q) for r, q in zip(records, quotes) if r["date"] < TODAY]
