@@ -7,7 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::pricing::{PriceQuote, PricingEngine, PricingStatus};
 
@@ -1066,6 +1067,50 @@ fn read_gen_turns(path: &std::path::Path) -> Option<Vec<GenTurn>> {
     Some(turns)
 }
 
+/// A file's mtime and size.
+pub(crate) fn file_stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+type FileStamps = [Option<(std::time::SystemTime, u64)>; 2];
+type FileCache<T> = LazyLock<Mutex<HashMap<PathBuf, (FileStamps, T)>>>;
+
+/// `read(path)`, run again only once the file or its `-wal` (where SQLite writes land first) changes
+/// mtime or size. The TUI then re-reads just the AGY sessions that changed since its last ledger
+/// refresh instead of every session (~1 s a refresh).
+// ponytail: a deleted file keeps its entry; bounded by the AGY sessions this Mac has had.
+fn cached<T: Clone>(cache: &FileCache<T>, path: &Path, read: impl FnOnce(&Path) -> T) -> T {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let stamps = [file_stamp(path), file_stamp(Path::new(&wal))];
+    if let Some((seen, value)) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(path) {
+        if *seen == stamps {
+            return value.clone();
+        }
+    }
+    let value = read(path);
+    cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(path.to_owned(), (stamps, value.clone()));
+    value
+}
+
+fn gen_turns(path: &Path) -> Option<Arc<Vec<GenTurn>>> {
+    static CACHE: FileCache<Option<Arc<Vec<GenTurn>>>> = LazyLock::new(Default::default);
+    cached(&CACHE, path, |path| read_gen_turns(path).map(Arc::new))
+}
+
+/// tokscale's records for one AGY database file.
+fn agy_file_messages(path: &Path) -> Arc<Vec<tokscale_core::sessions::UnifiedMessage>> {
+    static CACHE: FileCache<Arc<Vec<tokscale_core::sessions::UnifiedMessage>>> =
+        LazyLock::new(Default::default);
+    cached(&CACHE, path, |path| {
+        Arc::new(tokscale_core::sessions::antigravity_cli::parse_antigravity_cli_file(path))
+    })
+}
+
 /// A session's generations in order: everything `agy-dehydrate` archived (the history up to its
 /// last run), then the hot rows the archive lacks, which are newer. AGY >= 1.2.15 overwrites the
 /// hot rows that cite steps past the kept ones when it resumes a dehydrated session, so only the
@@ -1142,7 +1187,12 @@ fn parent_reference_conversation(blob: &[u8]) -> Option<&str> {
 
 /// The conversations a `/fork` copied this one's history from. `parent_references` lists the
 /// trajectory segments a conversation is made of; a fork's first segments name its parent.
-fn agy_ancestors(db: &std::path::Path, session_id: &str) -> Vec<String> {
+fn agy_ancestors(db: &Path, session_id: &str) -> Vec<String> {
+    static CACHE: FileCache<Vec<String>> = LazyLock::new(Default::default);
+    cached(&CACHE, db, |db| read_agy_ancestors(db, session_id))
+}
+
+fn read_agy_ancestors(db: &Path, session_id: &str) -> Vec<String> {
     let Ok(conn) = rusqlite::Connection::open_with_flags(
         db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
@@ -1237,16 +1287,21 @@ fn rebuild_forked_antigravity_sessions(
     let mut held: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
     for id in &members {
         let path = db(id);
-        let messages = tokscale_core::sessions::antigravity_cli::parse_antigravity_cli_file(&path);
-        let Some(turns) = read_gen_turns(&path).filter(|t| t.len() == messages.len()) else {
+        let messages = agy_file_messages(&path);
+        let Some(turns) = gen_turns(&path).filter(|t| t.len() == messages.len()) else {
             return HashMap::new(); // can't line them up: leave tokscale's records as they are
         };
-        let archived = read_gen_turns(&archive_dir.join(format!("{id}.cold.db")));
-        let keys: Vec<Vec<u8>> = turns.into_iter().map(|(key, _)| key).collect();
+        let archived = gen_turns(&archive_dir.join(format!("{id}.cold.db")));
+        let keys: Vec<Vec<u8>> = turns.iter().map(|(key, _)| key.clone()).collect();
         let mut all_keys: HashSet<Vec<u8>> = keys.iter().cloned().collect();
-        all_keys.extend(archived.unwrap_or_default().into_iter().map(|(key, _)| key));
+        all_keys.extend(
+            archived
+                .unwrap_or_default()
+                .iter()
+                .map(|(key, _)| key.clone()),
+        );
         held.insert(id.clone(), all_keys);
-        let rows: Vec<_> = keys.into_iter().zip(messages).collect();
+        let rows: Vec<_> = keys.into_iter().zip(messages.iter().cloned()).collect();
         parsed.insert(id.clone(), rows);
     }
     let inherited = agy_inherited_keys(&lineage, &held);
@@ -1323,30 +1378,7 @@ fn enrich_antigravity_records(
                 return None;
             }
 
-            let conn = rusqlite::Connection::open_with_flags(
-                &db_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-            ).ok()?;
-
-            // Extract step timestamps
-            let mut step_timestamps: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-            if let Ok(mut stmt) = conn.prepare("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL") {
-                if let Ok(mut rows) = stmt.query([]) {
-                    while let Ok(Some(row)) = rows.next() {
-                        let idx: i64 = match row.get(0) {
-                            Ok(i) => i,
-                            Err(_) => continue,
-                        };
-                        let meta: Vec<u8> = match row.get(1) {
-                            Ok(m) => m,
-                            Err(_) => continue,
-                        };
-                        if let Some(ts) = extract_step_timestamp_ms(&meta) {
-                            step_timestamps.insert(idx, ts);
-                        }
-                    }
-                }
-            }
+            let step_timestamps = agy_step_times(&db_path)?;
 
             // `agy-dehydrate` renumbers the hot `steps` but leaves `gen_metadata` on the old indices,
             // so after a dehydration the hot steps date older turns wrongly or not at all. AGY's own
@@ -1362,12 +1394,12 @@ fn enrich_antigravity_records(
             } else {
                 &full_path
             };
-            let transcript = read_agy_transcript(transcript_path);
+            let transcript = agy_transcript(transcript_path);
             if transcript.is_none() && step_timestamps.is_empty() {
                 return None;
             }
 
-            let hot = read_gen_turns(&db_path)?;
+            let hot = gen_turns(&db_path)?;
             let skip = inherited.get(&session_id);
             let own: Vec<&GenTurn> = hot
                 .iter()
@@ -1412,7 +1444,7 @@ fn enrich_antigravity_records(
                 });
             };
 
-            let archived = read_gen_turns(&archive_path).unwrap_or_default();
+            let archived = gen_turns(&archive_path).unwrap_or_default();
             let history = gen_history(&archived, &hot);
             let steps: Vec<Vec<i64>> = history.iter().map(|(_, s)| s.clone()).collect();
             let dated: HashMap<&[u8], i64> = history
@@ -1451,16 +1483,15 @@ fn enrich_antigravity_records(
             let mut session_archived = Vec::new();
             if !archived.iter().all(|(key, _)| in_hot.contains(key.as_slice())) {
                 let client = records_ref[record_indices[0]].client.clone();
-                let parsed =
-                    tokscale_core::sessions::antigravity_cli::parse_antigravity_cli_file(&archive_path);
-                for ((key, _), m) in archived.iter().zip(parsed) {
+                let parsed = agy_file_messages(&archive_path);
+                for ((key, _), m) in archived.iter().zip(parsed.iter()) {
                     if in_hot.contains(key.as_slice()) || skip.is_some_and(|s| s.contains(key)) {
                         continue;
                     }
                     // ponytail: with no session start, a row the transcript can't date (1 of 3,910
                     // on 2026-10-28) keeps tokscale's reading of the archive, whose fallback is
                     // the file's mtime; date it by its dated neighbours if that ever matters.
-                    let mut record = agy_record(m, &client, &session_id);
+                    let mut record = agy_record(m.clone(), &client, &session_id);
                     if let Some(ts) = first_ts {
                         record.date = first_date.clone();
                         record.timestamp = ts;
@@ -1513,6 +1544,40 @@ fn read_agy_transcript(path: &std::path::Path) -> Option<Vec<(i64, i64)>> {
     (!lines.is_empty()).then_some(lines)
 }
 
+fn agy_transcript(path: &Path) -> Option<Arc<Vec<(i64, i64)>>> {
+    static CACHE: FileCache<Option<Arc<Vec<(i64, i64)>>>> = LazyLock::new(Default::default);
+    cached(&CACHE, path, |path| read_agy_transcript(path).map(Arc::new))
+}
+
+/// `steps.idx` → when that step was created, for the steps whose metadata says. None when the
+/// database can't be opened.
+fn agy_step_times(path: &Path) -> Option<Arc<HashMap<i64, i64>>> {
+    static CACHE: FileCache<Option<Arc<HashMap<i64, i64>>>> = LazyLock::new(Default::default);
+    cached(&CACHE, path, |path| {
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .ok()?;
+        let mut step_timestamps = HashMap::new();
+        let query = "SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL";
+        if let Ok(mut stmt) = conn.prepare(query) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    let (Ok(idx), Ok(meta)) = (row.get::<_, i64>(0), row.get::<_, Vec<u8>>(1))
+                    else {
+                        continue;
+                    };
+                    if let Some(ts) = extract_step_timestamp_ms(&meta) {
+                        step_timestamps.insert(idx, ts);
+                    }
+                }
+            }
+        }
+        Some(Arc::new(step_timestamps))
+    })
+}
+
 /// Dates each turn (its step indices, in `gen_metadata` order) from the transcript. Every
 /// dehydration restarts the step indices, so one index can appear once per era. Both logs are
 /// append-only, so walking back from the newest turn, each turn's latest line at or before the
@@ -1556,6 +1621,37 @@ fn date_turns_from_transcript(turns: &[Vec<i64>], lines: &[(i64, i64)]) -> Vec<O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cached_file_is_read_again_only_after_it_or_its_wal_changes() {
+        static CACHE: FileCache<u32> = LazyLock::new(Default::default);
+        let path = std::env::temp_dir().join(format!("tm-file-cache-{}.db", std::process::id()));
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let reads = std::cell::Cell::new(0);
+        let read = |_: &Path| {
+            reads.set(reads.get() + 1);
+            reads.get()
+        };
+        std::fs::write(&path, "a").unwrap();
+        assert_eq!(cached(&CACHE, &path, read), 1);
+        assert_eq!(
+            cached(&CACHE, &path, read),
+            1,
+            "unchanged: served from the cache"
+        );
+        std::fs::write(&path, "ab").unwrap();
+        assert_eq!(cached(&CACHE, &path, read), 2, "the file changed");
+        std::fs::write(&wal, "w").unwrap();
+        assert_eq!(
+            cached(&CACHE, &path, read),
+            3,
+            "a write that only reached its -wal"
+        );
+        assert_eq!(cached(&CACHE, &path, read), 3);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&wal);
+    }
 
     #[test]
     fn reported_total_does_not_double_count_reasoning() {
