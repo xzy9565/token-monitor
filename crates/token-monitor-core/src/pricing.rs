@@ -9,7 +9,7 @@
 use crate::usage::{UsageRecord, UsageTokens};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,6 +59,45 @@ impl PricingEngine {
             service: tokscale_core::pricing::PricingService::load_cached_any_age(),
             resolutions: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// `load_cached`, kept for as long as tokscale's price files stay the same. A new engine has to
+    /// resolve every model again, which took ~15% of a TUI ledger refresh.
+    pub fn shared() -> Arc<Self> {
+        type Stamps = Vec<(std::path::PathBuf, Option<(std::time::SystemTime, u64)>)>;
+        static SHARED: Mutex<Option<(Stamps, Arc<PricingEngine>)>> = Mutex::new(None);
+        let mut files: Vec<std::path::PathBuf> =
+            std::fs::read_dir(tokscale_core::pricing::cache::get_cache_dir())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("pricing-"))
+                })
+                .collect();
+        files.push(tokscale_core::pricing::custom::CustomPricing::default_path());
+        files.sort();
+        let stamps: Stamps = files
+            .into_iter()
+            .map(|path| {
+                let stamp = crate::usage::file_stamp(&path);
+                (path, stamp)
+            })
+            .collect();
+        let mut shared = SHARED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((seen, engine)) = shared.as_ref() {
+            if *seen == stamps {
+                return Arc::clone(engine);
+            }
+        }
+        let engine = Arc::new(Self::load_cached());
+        *shared = Some((stamps, Arc::clone(&engine)));
+        engine
     }
 
     pub fn from_datasets(

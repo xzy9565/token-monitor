@@ -377,7 +377,7 @@ impl CachedLedger {
         let d7_ms = now_ms - 7 * 86400 * 1000;
         let d30_ms = now_ms - 30 * 86400 * 1000;
 
-        let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
+        let pricing = token_monitor_core::pricing::PricingEngine::shared();
 
         let mut today_b = TemporalUsageBucket { label: "Today", tokens: 0, input: 0, output: 0, cache: 0, api_usd: 0.0, records: 0 };
         let mut h24_b = TemporalUsageBucket { label: "Last 24h", tokens: 0, input: 0, output: 0, cache: 0, api_usd: 0.0, records: 0 };
@@ -583,7 +583,7 @@ impl App {
         let mut win_usd = 0.0;
         let mut client_map: HashMap<String, (i64, f64, usize, HashMap<String, (i64, f64, usize)>)> = HashMap::new();
         let mut model_map: HashMap<String, (i64, f64, usize, HashMap<String, usize>)> = HashMap::new();
-        let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
+        let pricing = token_monitor_core::pricing::PricingEngine::shared();
 
         for (idx, rec) in report.snapshot.records.iter().enumerate() {
             if !record_in_window(rec, target_win, now_ms, &today_str) {
@@ -654,7 +654,7 @@ impl App {
         };
 
         let mut client_models: std::collections::HashMap<String, (i64, f64, usize)> = std::collections::HashMap::new();
-        let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
+        let pricing = token_monitor_core::pricing::PricingEngine::shared();
         let now_ms = chrono::Utc::now().timestamp_millis();
         let today_str = local_today_str();
 
@@ -696,7 +696,7 @@ impl App {
         };
 
         let mut model_clients: std::collections::HashMap<String, (i64, f64, usize)> = std::collections::HashMap::new();
-        let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
+        let pricing = token_monitor_core::pricing::PricingEngine::shared();
         let now_ms = chrono::Utc::now().timestamp_millis();
         let today_str = local_today_str();
 
@@ -1526,7 +1526,7 @@ fn mock_consumption_report() -> usage::ConsumptionReport {
         processing_time_ms: 12,
         tokscale_revision: "fixture".into(),
     };
-    let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
+    let pricing = token_monitor_core::pricing::PricingEngine::shared();
     usage::build_consumption_report(snapshot, &pricing, true)
 }
 
@@ -3148,7 +3148,7 @@ fn consumption_rows(
     let now_ms = chrono::Utc::now().timestamp_millis();
     let today_str = local_today_str();
     let mut grouped: HashMap<String, ConsumptionRow> = HashMap::new();
-    let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
+    let pricing = token_monitor_core::pricing::PricingEngine::shared();
 
     let q = query.trim().to_ascii_lowercase();
     for (index, record) in report.snapshot.records.iter().enumerate() {
@@ -3219,7 +3219,7 @@ fn compute_temporal_usage(report: &usage::ConsumptionReport) -> Vec<TemporalUsag
     let d7_ms = now_ms - 7 * 86400 * 1000;
     let d30_ms = now_ms - 30 * 86400 * 1000;
 
-    let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
+    let pricing = token_monitor_core::pricing::PricingEngine::shared();
     let mut today = TemporalUsageBucket { label: "Today", tokens: 0, input: 0, output: 0, cache: 0, api_usd: 0.0, records: 0 };
     let mut h24 = TemporalUsageBucket { label: "Last 24h", tokens: 0, input: 0, output: 0, cache: 0, api_usd: 0.0, records: 0 };
     let mut d7 = TemporalUsageBucket { label: "Last 7d", tokens: 0, input: 0, output: 0, cache: 0, api_usd: 0.0, records: 0 };
@@ -3295,7 +3295,7 @@ fn model_consumption_rows(
     let now_ms = chrono::Utc::now().timestamp_millis();
     let today_str = local_today_str();
     let mut rows: std::collections::HashMap<String, ModelConsumptionRow> = std::collections::HashMap::new();
-    let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
+    let pricing = token_monitor_core::pricing::PricingEngine::shared();
 
     let q = query.trim().to_ascii_lowercase();
     for (index, record) in report.snapshot.records.iter().enumerate() {
@@ -5130,7 +5130,7 @@ fn print_usage(
 ) -> io::Result<()> {
     let report = usage::build_consumption_report_with_legacy(
         consumption.clone(),
-        &token_monitor_core::pricing::PricingEngine::load_cached(),
+        &token_monitor_core::pricing::PricingEngine::shared(),
         audit_pricing,
         legacy,
     );
@@ -5398,7 +5398,7 @@ fn load_cached_app(
     if let Ok(Some(snapshot)) = storage.latest_usage_snapshot() {
         let report = usage::build_consumption_report_with_legacy(
             snapshot,
-            &token_monitor_core::pricing::PricingEngine::load_cached(),
+            &token_monitor_core::pricing::PricingEngine::shared(),
             true,
             // The cached UsageSnapshot does not encode its original date
             // range. Do not pair it with an all-history legacy total; the
@@ -6075,7 +6075,7 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                         let legacy = legacy_totals_for_range(since.as_deref(), None);
                         let report = Arc::new(usage::build_consumption_report_with_legacy(
                             snapshot,
-                            &token_monitor_core::pricing::PricingEngine::load_cached(),
+                            &token_monitor_core::pricing::PricingEngine::shared(),
                             true,
                             legacy.as_ref(),
                         ));
@@ -6394,7 +6394,7 @@ mod tests {
     fn consumption_view_contains_both_value_measures() {
         let mut app = App::new(true, false);
         app.view = View::Consumption;
-        let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
+        let pricing = token_monitor_core::pricing::PricingEngine::shared();
         let report = usage::build_consumption_report(usage::UsageSnapshot::default(), &pricing, true);
         app.set_consumption(report);
         let lines = body_lines(&app, 100, 26);
@@ -6410,7 +6410,7 @@ mod tests {
     fn commandcode_mimo_model_displays_priced_api_eq() {
         let mut app = App::new(true, false);
         app.view = View::Consumption;
-        let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
+        let pricing = token_monitor_core::pricing::PricingEngine::shared();
         if !pricing.has_pricing_data() {
             return;
         }
@@ -6453,7 +6453,7 @@ mod tests {
     fn cursor_navigation_and_horizontal_window_switching() {
         let mut app = App::new(true, false);
         app.view = View::Consumption;
-        let pricing = token_monitor_core::pricing::PricingEngine::load_cached();
+        let pricing = token_monitor_core::pricing::PricingEngine::shared();
         let report = usage::build_consumption_report(usage::UsageSnapshot::default(), &pricing, true);
         app.set_consumption(report);
 
