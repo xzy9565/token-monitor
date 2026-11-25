@@ -139,7 +139,7 @@ Run the compiled binary directly:
 | **Codex (ChatGPT)** | Subscription | Plus/Team 5h window, 7d weekly ceiling, banked reset credits & expiration countdowns |
 | **Antigravity CLI** | Multi-Pool | Gemini Flash/Pro + Claude/GPT pool split, zero-config daemon discovery, multi-account support |
 | **Grok (SuperGrok)** | Subscription | SuperGrok remaining quota percentages |
-| **GitHub Copilot** | Subscription | Premium entitlement and remaining usage |
+| **GitHub Copilot** | Subscription | AI-credit balance in dollars (premium requests on older plans) and monthly reset; signs in through your `gh` login |
 | **Modal** | Cloud Credit | Profile allowance ($30/mo), compute spend, cycle resets |
 | **OpenRouter** | Pay-as-you-go | Real-time balance and usage tracking |
 | **DeepSeek** | Pay-as-you-go | Prepaid API balance |

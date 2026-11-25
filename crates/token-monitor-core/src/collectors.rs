@@ -4214,12 +4214,17 @@ pub async fn collect_zai_team(options: &CollectorOptions) -> Vec<ProviderSnapsho
     )]
 }
 
-fn copilot_token() -> Option<String> {
-    env_secret(&[
+async fn copilot_token(timeout: Duration) -> Option<String> {
+    if let Some(token) = env_secret(&[
         "TOKEN_MONITOR_COPILOT_API_TOKEN",
         "COPILOT_API_TOKEN",
         "GITHUB_COPILOT_TOKEN",
-    ])
+    ]) {
+        return Some(token);
+    }
+    // A signed-in GitHub CLI's token can read Copilot usage, so nothing has to be pasted.
+    let token = run_text_command("gh", &["auth", "token"], timeout).await.ok()?;
+    clean_secret(Some(&token))
 }
 
 fn copilot_quota_window(
@@ -4253,13 +4258,19 @@ fn copilot_quota_window(
             .filter(|(total, _)| *total > 0.0)
             .map(|(total, remaining)| remaining / total * 100.0)
     })?;
+    // Token-based billing meters GitHub AI Credits (1 credit = $0.01), so the balance is money.
+    // A premium-request count is not, and the views print any amount as dollars.
+    let credits = raw.get("token_based_billing").and_then(Value::as_bool) == Some(true);
     Some(LimitWindow {
-        label: label.into(),
+        label: if credits { "Credits" } else { label }.into(),
         kind: WindowKind::Billing,
         metric: WindowMetric::Quota,
         remaining_percent: Some(percent.clamp(0.0, 100.0)),
-        remaining_amount: remaining,
-        currency: None,
+        remaining_amount: credits
+            .then(|| number(raw.get("quota_remaining")).or(remaining))
+            .flatten()
+            .map(|credits| credits / 100.0),
+        currency: None, // the views show a missing currency as "$"
         resets_at_ms: reset,
         reset_text: None,
         estimated: false,
@@ -4277,7 +4288,7 @@ pub async fn collect_copilot(options: &CollectorOptions) -> Vec<ProviderSnapshot
     if !options.includes("copilot") {
         return vec![];
     }
-    let token = match copilot_token() {
+    let token = match copilot_token(options.timeout()).await {
         Some(token) => token,
         None => {
             return vec![unavailable_snapshot(
@@ -4353,7 +4364,8 @@ pub async fn collect_copilot(options: &CollectorOptions) -> Vec<ProviderSnapshot
     };
     let reset = copilot_reset(
         payload
-            .get("quota_reset_date")
+            .get("quota_reset_date_utc") // `quota_reset_date` is a bare date, which RFC 3339 rejects
+            .or_else(|| payload.get("quota_reset_date"))
             .or_else(|| payload.get("quotaResetDate")),
     );
     let snapshots = payload
@@ -4392,7 +4404,7 @@ pub async fn collect_copilot(options: &CollectorOptions) -> Vec<ProviderSnapshot
                     kind: WindowKind::Billing,
                     metric: WindowMetric::Quota,
                     remaining_percent: Some((remaining / entitlement * 100.0).clamp(0.0, 100.0)),
-                    remaining_amount: Some(remaining),
+                    remaining_amount: None, // a count of requests, not dollars
                     currency: None,
                     resets_at_ms: reset,
                     reset_text: None,
@@ -5851,6 +5863,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(window.remaining_percent, Some(7.0));
+    }
+
+    #[test]
+    fn copilot_credits_show_dollars_but_request_counts_do_not() {
+        let credits = copilot_quota_window(
+            "Premium",
+            Some(&serde_json::json!({"entitlement":1500,"remaining":1142,"quota_remaining":1142.5,
+                "percent_remaining":76.1,"token_based_billing":true})),
+            None,
+        )
+        .unwrap();
+        assert_eq!(credits.label, "Credits");
+        assert_eq!(credits.remaining_amount, Some(11.425));
+        let requests = copilot_quota_window(
+            "Premium",
+            Some(&serde_json::json!({"entitlement":300,"remaining":225,"percent_remaining":75})),
+            None,
+        )
+        .unwrap();
+        assert_eq!(requests.label, "Premium");
+        assert_eq!(requests.remaining_amount, None);
     }
 
     #[test]
