@@ -227,6 +227,20 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
         .into_iter()
         .filter(|client| client != "cursor")
         .collect();
+    // Asked for "synthetic", tokscale scans and parses every client it knows, to keep their
+    // Synthetic-gateway rows, then drops the rows of clients nobody asked for: Cursor's, which
+    // this crate reads itself, and AGY's, whose databases its source cache never holds, so it
+    // re-reads all of them each call. Together that was a third of a refresh's CPU (2026-11-25).
+    // So tokscale gets the other clients, and `messages_outside_tokscale` does the rest as tokscale
+    // would, reading an AGY database again only once it changed. tokscale's recovery merges
+    // archived history per client it parses, so with recovery on, tokscale keeps everything.
+    let split = !tokscale_core::recovery::enabled();
+    let (outside, clients): (Vec<String>, Vec<String>) = clients.into_iter().partition(|client| {
+        split && (client == "synthetic" || AGY_FAMILY.iter().any(|agy| agy.as_str() == client))
+    });
+    let home_dir = options
+        .home_dir
+        .map(|path| path.to_string_lossy().into_owned());
 
     // The date window is applied after enrichment below: until then an AGY turn may still carry
     // its session's start date, and filtering here would drop a long-running session whole.
@@ -234,25 +248,37 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
     // call; `parse_local_clients` re-reads every session file each time. The lane is doc-hidden
     // upstream, so the weekly tokscale-update build is what flags a change to it.
     let started = std::time::Instant::now();
-    let messages = if clients.is_empty() {
+    let mut messages = if clients.is_empty() {
         Vec::new() // tokscale reads an empty list as "every client"
     } else {
         futures::executor::block_on(tokscale_core::parse_local_unified_messages_with_pricing(
             tokscale_core::LocalParseOptions {
-                home_dir: options
-                    .home_dir
-                    .map(|path| path.to_string_lossy().into_owned()),
+                home_dir: home_dir.clone(),
                 use_env_roots: true,
                 clients: Some(clients),
                 since: None,
                 until: None,
-                year: options.year,
+                year: options.year.clone(),
                 scanner_settings: tokscale_core::scanner::ScannerSettings::default(),
             },
             None,
         ))
         .map_err(|error| format!("tokscale local parse failed: {error}"))?
     };
+    if outside.iter().any(|client| client == "synthetic") {
+        // What tokscale's parse tail does to every row once "synthetic" is asked for.
+        for message in &mut messages {
+            message.normalize_synthetic_gateway();
+        }
+    }
+    if !outside.is_empty() {
+        let home = tokscale_core::get_home_dir_string(&home_dir)?;
+        let mut rest = messages_outside_tokscale(&home, &outside);
+        if let Some(year) = &options.year {
+            rest.retain(|m| m.date.starts_with(&format!("{year}-"))); // as tokscale filters its own
+        }
+        messages.extend(rest);
+    }
     let processing_time_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
 
     let mut records: Vec<UsageRecord> = messages
@@ -1116,13 +1142,117 @@ fn gen_turns(path: &Path) -> Option<Arc<Vec<GenTurn>>> {
     cached(&CACHE, path, |path| read_gen_turns(path).map(Arc::new))
 }
 
-/// tokscale's records for one AGY database file.
-fn agy_file_messages(path: &Path) -> Arc<Vec<tokscale_core::sessions::UnifiedMessage>> {
-    static CACHE: FileCache<Arc<Vec<tokscale_core::sessions::UnifiedMessage>>> =
-        LazyLock::new(Default::default);
+type Message = tokscale_core::sessions::UnifiedMessage;
+
+const AGY_FAMILY: [tokscale_core::ClientId; 3] = [
+    tokscale_core::ClientId::Antigravity,
+    tokscale_core::ClientId::AntigravityCli,
+    tokscale_core::ClientId::AntigravityExtension,
+];
+
+/// tokscale's records for one AGY database file, the CLI's or the IDE extension's.
+// ponytail: keyed by path alone; each client's databases live in a directory of their own.
+fn agy_file_messages(client: tokscale_core::ClientId, path: &Path) -> Arc<Vec<Message>> {
+    use tokscale_core::sessions::antigravity_cli as db;
+    static CACHE: FileCache<Arc<Vec<Message>>> = LazyLock::new(Default::default);
     cached(&CACHE, path, |path| {
-        Arc::new(tokscale_core::sessions::antigravity_cli::parse_antigravity_cli_file(path))
+        Arc::new(match client {
+            tokscale_core::ClientId::AntigravityExtension => {
+                db::parse_antigravity_extension_file(path)
+            }
+            _ => db::parse_antigravity_cli_file(path),
+        })
     })
+}
+
+/// tokscale's records for one file of the AGY IDE's synced usage cache, split as tokscale splits
+/// them: the rows with their own time, then the rows it dated by the file's mtime.
+fn agy_ide_file_messages(path: &Path) -> Arc<(Vec<Message>, Vec<Message>)> {
+    static CACHE: FileCache<Arc<(Vec<Message>, Vec<Message>)>> = LazyLock::new(Default::default);
+    cached(&CACHE, path, |path| {
+        Arc::new(tokscale_core::sessions::antigravity::parse_antigravity_file_partitioned(path))
+    })
+}
+
+/// What tokscale's local parse returns for `clients`, which are only AGY family members and
+/// "synthetic", in tokscale's order (AGY, then Octofriend), but with each AGY file parsed again
+/// only once it changed. Under `ScannerSettings::default()` tokscale's parse tail does nothing to
+/// these rows but the Synthetic-gateway rename, which "synthetic" turns on.
+fn messages_outside_tokscale(home_dir: &str, clients: &[String]) -> Vec<Message> {
+    let synthetic = clients.iter().any(|client| client == "synthetic");
+    let agy: Vec<String> = clients
+        .iter()
+        .filter(|client| *client != "synthetic")
+        .cloned()
+        .collect();
+    let mut messages = if agy.is_empty() {
+        Vec::new()
+    } else {
+        antigravity_family_messages(home_dir, &agy)
+    };
+    if synthetic {
+        // Octofriend, the "synthetic" client's own store, where tokscale's scanner looks for it.
+        let data = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(home_dir).join(".local/share"));
+        let octofriend = data.join("octofriend/sqlite.db");
+        if octofriend.exists() {
+            messages.extend(tokscale_core::sessions::synthetic::parse_octofriend_sqlite(
+                &octofriend,
+            ));
+        }
+        for message in &mut messages {
+            message.normalize_synthetic_gateway();
+        }
+    }
+    messages
+}
+
+/// The AGY family (IDE, CLI, IDE extension) as tokscale parses it, each source file parsed again
+/// only once it changed. tokscale re-reads every one on each call: 285 databases and 6.3 GB on
+/// 2026-11-23, while one or two change between refreshes. Mirrors
+/// `parse_antigravity_family_messages_with_recount_proofs`, minus the recount proofs, and unpriced,
+/// as this crate prices rows itself.
+fn antigravity_family_messages(home_dir: &str, clients: &[String]) -> Vec<Message> {
+    use rayon::prelude::*;
+    use tokscale_core::ClientId;
+    let scan = tokscale_core::scanner::scan_all_clients_with_scanner_settings(
+        home_dir,
+        clients,
+        true,
+        &tokscale_core::scanner::ScannerSettings::default(),
+    );
+    let ide: Vec<_> = scan
+        .get(ClientId::Antigravity)
+        .par_iter()
+        .map(|path| agy_ide_file_messages(path))
+        .collect();
+    let dbs: Vec<_> = [ClientId::AntigravityCli, ClientId::AntigravityExtension]
+        .into_iter()
+        .flat_map(|client| {
+            let files: Vec<_> = scan
+                .get(client)
+                .par_iter()
+                .map(|path| agy_file_messages(client, path))
+                .collect();
+            files
+        })
+        .collect();
+    // tokscale's order: the IDE's own rows, the databases, then the IDE rows it dated by mtime. The
+    // first copy of a response id wins.
+    let mut seen = HashSet::new();
+    ide.iter()
+        .flat_map(|file| &file.0)
+        .chain(dbs.iter().flat_map(|file| file.iter()))
+        .chain(ide.iter().flat_map(|file| &file.1))
+        .filter(|m| {
+            m.dedup_key
+                .as_deref()
+                .filter(|key| !key.trim().is_empty())
+                .is_none_or(|key| seen.insert(key.to_owned()))
+        })
+        .cloned()
+        .collect()
 }
 
 /// A session's generations in order: everything `agy-dehydrate` archived (the history up to its
@@ -1305,7 +1435,7 @@ fn rebuild_forked_antigravity_sessions(
     let mut held: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
     for id in &members {
         let path = db(id);
-        let messages = agy_file_messages(&path);
+        let messages = agy_file_messages(tokscale_core::ClientId::AntigravityCli, &path);
         let Some(turns) = gen_turns(&path).filter(|t| t.len() == messages.len()) else {
             return HashMap::new(); // can't line them up: leave tokscale's records as they are
         };
@@ -1501,7 +1631,8 @@ fn enrich_antigravity_records(
             let mut session_archived = Vec::new();
             if !archived.iter().all(|(key, _)| in_hot.contains(key.as_slice())) {
                 let client = records_ref[record_indices[0]].client.clone();
-                let parsed = agy_file_messages(&archive_path);
+                let parsed =
+                    agy_file_messages(tokscale_core::ClientId::AntigravityCli, &archive_path);
                 for ((key, _), m) in archived.iter().zip(parsed.iter()) {
                     if in_hot.contains(key.as_slice()) || skip.is_some_and(|s| s.contains(key)) {
                         continue;
@@ -2065,8 +2196,8 @@ mod tests {
         assert_eq!(time_updates, vec![(0, 2000), (1, 3000)]);
     }
 
-    #[test]
-    fn gen_turns_line_up_with_tokscales_records_for_the_same_file() {
+    /// An AGY `gen_metadata` row: { 1: chatModel { 4: usage { …, 11: response id }, 19: model } }.
+    fn agy_generation(usage: &[(u64, u64)], id: &str) -> Vec<u8> {
         fn varint(mut value: u64, out: &mut Vec<u8>) {
             while value >= 0x80 {
                 out.push(value as u8 | 0x80);
@@ -2079,41 +2210,120 @@ mod tests {
             varint(bytes.len() as u64, out);
             out.extend_from_slice(bytes);
         }
-        // gen_metadata { 1: chatModel { 4: usage { …, 11: response id }, 19: model } }
-        let generation = |usage: &[(u64, u64)], id: &str| {
-            let mut u = Vec::new();
-            for &(field, value) in usage {
-                varint(field << 3, &mut u);
-                varint(value, &mut u);
-            }
-            len_field(11, id.as_bytes(), &mut u);
-            let mut chat_model = Vec::new();
-            len_field(4, &u, &mut chat_model);
-            len_field(19, b"gemini-3-pro", &mut chat_model);
-            let mut blob = Vec::new();
-            len_field(1, &chat_model, &mut blob);
-            blob
+        let mut u = Vec::new();
+        for &(field, value) in usage {
+            varint(field << 3, &mut u);
+            varint(value, &mut u);
+        }
+        len_field(11, id.as_bytes(), &mut u);
+        let mut chat_model = Vec::new();
+        len_field(4, &u, &mut chat_model);
+        len_field(19, b"gemini-3-pro", &mut chat_model);
+        let mut blob = Vec::new();
+        len_field(1, &chat_model, &mut blob);
+        blob
+    }
+
+    /// An AGY conversation database holding just these `gen_metadata` rows.
+    fn agy_db(path: &Path, blobs: &[Vec<u8>]) {
+        let _ = std::fs::remove_file(path);
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TABLE gen_metadata (idx integer, data blob, size integer);")
+            .unwrap();
+        for (idx, blob) in blobs.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO gen_metadata (idx, data, size) VALUES (?1, ?2, 0)",
+                rusqlite::params![idx as i64, blob],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn messages_outside_tokscale_are_the_ones_tokscale_returns() {
+        let home = std::env::temp_dir().join(format!("tm-agy-family-{}", std::process::id()));
+        let cli = home.join(".gemini/antigravity-cli/conversations");
+        let extension = home.join(".gemini/antigravity/conversations");
+        let octofriend = home.join(".local/share/octofriend");
+        for dir in [&cli, &extension, &octofriend] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let turn = |id| agy_generation(&[(1, 1132), (2, 500), (3, 70)], id);
+        // A parent, its fork (which copied r1 and r2), and an IDE extension database sharing r3 with
+        // the fork: the first copy of a response id wins, in path order, the CLI's before the IDE's.
+        agy_db(&cli.join("a.db"), &[turn("r1"), turn("r2")]);
+        agy_db(&cli.join("b.db"), &[turn("r1"), turn("r2"), turn("r3")]);
+        agy_db(&extension.join("c.db"), &[turn("r3"), turn("r4")]);
+        rusqlite::Connection::open(octofriend.join("sqlite.db"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE messages (id TEXT, model TEXT, input_tokens INTEGER,
+                   output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER,
+                   reasoning_tokens INTEGER, cost REAL, timestamp REAL, session_id TEXT, provider TEXT);
+                 INSERT INTO messages VALUES ('o1', 'hf:deepseek-ai/DeepSeek-V3-0324', 100, 20, 0, 0,
+                   0, 0.0, 1790000000.0, 's1', 'synthetic');",
+            )
+            .unwrap();
+        let home_dir = home.to_string_lossy().into_owned();
+        let theirs = |clients: &[String]| {
+            futures::executor::block_on(
+                tokscale_core::parse_local_unified_messages_with_pricing_uncached(
+                    tokscale_core::LocalParseOptions {
+                        home_dir: Some(home_dir.clone()),
+                        use_env_roots: true,
+                        clients: Some(clients.to_vec()),
+                        since: None,
+                        until: None,
+                        year: None,
+                        scanner_settings: tokscale_core::scanner::ScannerSettings::default(),
+                    },
+                    None,
+                ),
+            )
+            .unwrap()
         };
+        let agy = ["antigravity-cli", "antigravity-extension"].map(String::from);
+        let expected = theirs(&agy);
+        let kept: Vec<String> = expected
+            .iter()
+            .map(|m| {
+                format!(
+                    "{}:{}",
+                    m.session_id,
+                    m.dedup_key.as_deref().unwrap_or_default()
+                )
+            })
+            .collect();
+        assert_eq!(kept, ["a:r1", "a:r2", "b:r3", "c:r4"]);
+        assert_eq!(messages_outside_tokscale(&home_dir, &agy), expected);
+        assert_eq!(
+            messages_outside_tokscale(&home_dir, &agy),
+            expected,
+            "again, from the per-file cache"
+        );
+        // "synthetic" adds Octofriend's rows, after AGY's, and the gateway rename.
+        let with_synthetic =
+            ["antigravity-cli", "antigravity-extension", "synthetic"].map(String::from);
+        let expected = theirs(&with_synthetic);
+        assert_eq!(expected.len(), 5);
+        assert_eq!(expected[4].client.as_str(), "synthetic");
+        assert_eq!(
+            messages_outside_tokscale(&home_dir, &with_synthetic),
+            expected
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn gen_turns_line_up_with_tokscales_records_for_the_same_file() {
         let blobs = [
-            generation(&[(1, 1132), (2, 500), (10, 40)], "r1"),
-            generation(&[(1, 1132)], "r2"), // a failed turn: only the model enum
-            generation(&[(3, 70), (9, 20)], "r3"), // output only as the #3 total
-            generation(&[(4, 900)], "r4"),  // cache write only
+            agy_generation(&[(1, 1132), (2, 500), (10, 40)], "r1"),
+            agy_generation(&[(1, 1132)], "r2"), // a failed turn: only the model enum
+            agy_generation(&[(3, 70), (9, 20)], "r3"), // output only as the #3 total
+            agy_generation(&[(4, 900)], "r4"),  // cache write only
         ];
         let path = std::env::temp_dir().join(format!("tm-agy-align-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch("CREATE TABLE gen_metadata (idx integer, data blob, size integer);")
-                .unwrap();
-            for (idx, blob) in blobs.iter().enumerate() {
-                conn.execute(
-                    "INSERT INTO gen_metadata (idx, data, size) VALUES (?1, ?2, 0)",
-                    rusqlite::params![idx as i64, blob],
-                )
-                .unwrap();
-            }
-        }
+        agy_db(&path, &blobs);
         let ours: Vec<Vec<u8>> = read_gen_turns(&path)
             .unwrap()
             .into_iter()
