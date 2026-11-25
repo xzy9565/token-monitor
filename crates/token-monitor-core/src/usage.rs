@@ -271,47 +271,18 @@ pub fn collect_local_usage(options: UsageOptions) -> Result<UsageSnapshot, Strin
             message.normalize_synthetic_gateway();
         }
     }
+    let mut rest = Vec::new();
     if !outside.is_empty() {
         let home = tokscale_core::get_home_dir_string(&home_dir)?;
-        let mut rest = messages_outside_tokscale(&home, &outside);
+        rest = records_outside_tokscale(&home, &outside);
         if let Some(year) = &options.year {
-            rest.retain(|m| m.date.starts_with(&format!("{year}-"))); // as tokscale filters its own
+            rest.retain(|r| r.date.starts_with(&format!("{year}-"))); // as tokscale filters its own
         }
-        messages.extend(rest);
     }
     let processing_time_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
 
-    let mut records: Vec<UsageRecord> = messages
-        .into_iter()
-        .map(|message| {
-            let is_commandcode = message.client == "commandcode";
-            let tokens = &message.tokens;
-            let input = if is_commandcode {
-                tokens.input.saturating_sub(tokens.cache_read).max(0)
-            } else {
-                tokens.input.max(0)
-            };
-            UsageRecord {
-                tokens: UsageTokens {
-                    input,
-                    output: tokens.output.max(0),
-                    cache_read: tokens.cache_read.max(0),
-                    cache_write: tokens.cache_write.max(0),
-                    reasoning: tokens.reasoning.max(0),
-                    cache_write_1h: tokens.cache_write_1h.clamp(0, tokens.cache_write.max(0)),
-                },
-                client: message.client.into(),
-                model_id: message.model_id.into(),
-                provider_id: message.provider_id.into(),
-                session_id: message.session_id.into(),
-                date: message.date.into(),
-                timestamp: message.timestamp,
-                message_count: message.message_count.max(0),
-                reported_cost_micros: None,
-                dedup_id: None,
-            }
-        })
-        .collect();
+    let mut records: Vec<UsageRecord> = messages.into_iter().map(usage_record).collect();
+    records.extend(rest);
 
     collect_commandcode_v3_records(&mut records, options.since.as_deref());
     collect_cursor_cache_records(&mut records, options.since.as_deref());
@@ -1144,51 +1115,126 @@ fn gen_turns(path: &Path) -> Option<Arc<Vec<GenTurn>>> {
 
 type Message = tokscale_core::sessions::UnifiedMessage;
 
+/// A message's token counts as a ledger row holds them.
+fn usage_tokens(tokens: &tokscale_core::TokenBreakdown) -> UsageTokens {
+    UsageTokens {
+        input: tokens.input.max(0),
+        output: tokens.output.max(0),
+        cache_read: tokens.cache_read.max(0),
+        cache_write: tokens.cache_write.max(0),
+        reasoning: tokens.reasoning.max(0),
+        cache_write_1h: tokens.cache_write_1h.clamp(0, tokens.cache_write.max(0)),
+    }
+}
+
+/// The ledger row for a message from tokscale's local parse.
+fn usage_record(message: Message) -> UsageRecord {
+    let mut tokens = usage_tokens(&message.tokens);
+    if message.client == "commandcode" {
+        tokens.input = message
+            .tokens
+            .input
+            .saturating_sub(message.tokens.cache_read)
+            .max(0);
+    }
+    UsageRecord {
+        tokens,
+        client: message.client.into(),
+        model_id: message.model_id.into(),
+        provider_id: message.provider_id.into(),
+        session_id: message.session_id.into(),
+        date: message.date.into(),
+        timestamp: message.timestamp,
+        message_count: message.message_count.max(0),
+        reported_cost_micros: None,
+        dedup_id: None,
+    }
+}
+
 const AGY_FAMILY: [tokscale_core::ClientId; 3] = [
     tokscale_core::ClientId::Antigravity,
     tokscale_core::ClientId::AntigravityCli,
     tokscale_core::ClientId::AntigravityExtension,
 ];
 
-/// tokscale's records for one AGY database file, the CLI's or the IDE extension's.
+/// One AGY generation as tokscale parsed it, kept for the per-file cache with only what a ledger
+/// row needs: 160 bytes against the 368 of tokscale's message, whose strings it shares (one
+/// allocation per distinct value in a file). Kept whole, the messages of this Mac's 157k AGY rows
+/// added 75 MB of live heap (2026-11-25).
+#[derive(Clone)]
+struct AgyRow {
+    client: tokscale_core::SharedStr,
+    model_id: tokscale_core::SharedStr,
+    provider_id: tokscale_core::SharedStr,
+    session_id: tokscale_core::SharedStr,
+    date: tokscale_core::SharedStr,
+    timestamp: i64,
+    tokens: UsageTokens,
+    message_count: i32,
+    dedup_key: Option<Box<str>>,
+}
+
+fn agy_rows(messages: Vec<Message>) -> Vec<AgyRow> {
+    let mut rows: Vec<AgyRow> = messages
+        .into_iter()
+        .map(|m| AgyRow {
+            client: m.client,
+            model_id: m.model_id,
+            provider_id: m.provider_id,
+            session_id: m.session_id,
+            date: m.date,
+            timestamp: m.timestamp,
+            tokens: usage_tokens(&m.tokens),
+            message_count: m.message_count.max(0),
+            dedup_key: m.dedup_key.map(String::into_boxed_str),
+        })
+        .collect();
+    // The collect reuses the messages' buffer, sized for the 368-byte messages.
+    rows.shrink_to_fit();
+    rows
+}
+
+/// tokscale's rows for one AGY database file, the CLI's or the IDE extension's.
 // ponytail: keyed by path alone; each client's databases live in a directory of their own.
-fn agy_file_messages(client: tokscale_core::ClientId, path: &Path) -> Arc<Vec<Message>> {
+fn agy_file_rows(client: tokscale_core::ClientId, path: &Path) -> Arc<Vec<AgyRow>> {
     use tokscale_core::sessions::antigravity_cli as db;
-    static CACHE: FileCache<Arc<Vec<Message>>> = LazyLock::new(Default::default);
+    static CACHE: FileCache<Arc<Vec<AgyRow>>> = LazyLock::new(Default::default);
     cached(&CACHE, path, |path| {
-        Arc::new(match client {
+        Arc::new(agy_rows(match client {
             tokscale_core::ClientId::AntigravityExtension => {
                 db::parse_antigravity_extension_file(path)
             }
             _ => db::parse_antigravity_cli_file(path),
-        })
+        }))
     })
 }
 
-/// tokscale's records for one file of the AGY IDE's synced usage cache, split as tokscale splits
+/// tokscale's rows for one file of the AGY IDE's synced usage cache, split as tokscale splits
 /// them: the rows with their own time, then the rows it dated by the file's mtime.
-fn agy_ide_file_messages(path: &Path) -> Arc<(Vec<Message>, Vec<Message>)> {
-    static CACHE: FileCache<Arc<(Vec<Message>, Vec<Message>)>> = LazyLock::new(Default::default);
+fn agy_ide_file_rows(path: &Path) -> Arc<(Vec<AgyRow>, Vec<AgyRow>)> {
+    static CACHE: FileCache<Arc<(Vec<AgyRow>, Vec<AgyRow>)>> = LazyLock::new(Default::default);
     cached(&CACHE, path, |path| {
-        Arc::new(tokscale_core::sessions::antigravity::parse_antigravity_file_partitioned(path))
+        let (own, by_mtime) =
+            tokscale_core::sessions::antigravity::parse_antigravity_file_partitioned(path);
+        Arc::new((agy_rows(own), agy_rows(by_mtime)))
     })
 }
 
-/// What tokscale's local parse returns for `clients`, which are only AGY family members and
-/// "synthetic", in tokscale's order (AGY, then Octofriend), but with each AGY file parsed again
-/// only once it changed. Under `ScannerSettings::default()` tokscale's parse tail does nothing to
-/// these rows but the Synthetic-gateway rename, which "synthetic" turns on.
-fn messages_outside_tokscale(home_dir: &str, clients: &[String]) -> Vec<Message> {
+/// The ledger rows of what tokscale's local parse returns for `clients`, which are only AGY family
+/// members and "synthetic", in tokscale's order (AGY, then Octofriend), but with each AGY file
+/// parsed again only once it changed. Under `ScannerSettings::default()` tokscale's parse tail
+/// does nothing to these rows but the Synthetic-gateway rename, which "synthetic" turns on.
+fn records_outside_tokscale(home_dir: &str, clients: &[String]) -> Vec<UsageRecord> {
     let synthetic = clients.iter().any(|client| client == "synthetic");
     let agy: Vec<String> = clients
         .iter()
         .filter(|client| *client != "synthetic")
         .cloned()
         .collect();
-    let mut messages = if agy.is_empty() {
+    let mut records = if agy.is_empty() {
         Vec::new()
     } else {
-        antigravity_family_messages(home_dir, &agy)
+        antigravity_family_records(home_dir, &agy)
     };
     if synthetic {
         // Octofriend, the "synthetic" client's own store, where tokscale's scanner looks for it.
@@ -1197,15 +1243,17 @@ fn messages_outside_tokscale(home_dir: &str, clients: &[String]) -> Vec<Message>
             .unwrap_or_else(|| Path::new(home_dir).join(".local/share"));
         let octofriend = data.join("octofriend/sqlite.db");
         if octofriend.exists() {
-            messages.extend(tokscale_core::sessions::synthetic::parse_octofriend_sqlite(
-                &octofriend,
-            ));
+            let messages = tokscale_core::sessions::synthetic::parse_octofriend_sqlite(&octofriend);
+            records.extend(messages.into_iter().map(usage_record));
         }
-        for message in &mut messages {
-            message.normalize_synthetic_gateway();
+        for record in &mut records {
+            tokscale_core::sessions::synthetic::normalize_synthetic_gateway_fields(
+                &mut record.model_id,
+                &mut record.provider_id,
+            );
         }
     }
-    messages
+    records
 }
 
 /// The AGY family (IDE, CLI, IDE extension) as tokscale parses it, each source file parsed again
@@ -1213,7 +1261,7 @@ fn messages_outside_tokscale(home_dir: &str, clients: &[String]) -> Vec<Message>
 /// 2026-11-23, while one or two change between refreshes. Mirrors
 /// `parse_antigravity_family_messages_with_recount_proofs`, minus the recount proofs, and unpriced,
 /// as this crate prices rows itself.
-fn antigravity_family_messages(home_dir: &str, clients: &[String]) -> Vec<Message> {
+fn antigravity_family_records(home_dir: &str, clients: &[String]) -> Vec<UsageRecord> {
     use rayon::prelude::*;
     use tokscale_core::ClientId;
     let scan = tokscale_core::scanner::scan_all_clients_with_scanner_settings(
@@ -1225,7 +1273,7 @@ fn antigravity_family_messages(home_dir: &str, clients: &[String]) -> Vec<Messag
     let ide: Vec<_> = scan
         .get(ClientId::Antigravity)
         .par_iter()
-        .map(|path| agy_ide_file_messages(path))
+        .map(|path| agy_ide_file_rows(path))
         .collect();
     let dbs: Vec<_> = [ClientId::AntigravityCli, ClientId::AntigravityExtension]
         .into_iter()
@@ -1233,7 +1281,7 @@ fn antigravity_family_messages(home_dir: &str, clients: &[String]) -> Vec<Messag
             let files: Vec<_> = scan
                 .get(client)
                 .par_iter()
-                .map(|path| agy_file_messages(client, path))
+                .map(|path| agy_file_rows(client, path))
                 .collect();
             files
         })
@@ -1245,13 +1293,13 @@ fn antigravity_family_messages(home_dir: &str, clients: &[String]) -> Vec<Messag
         .flat_map(|file| &file.0)
         .chain(dbs.iter().flat_map(|file| file.iter()))
         .chain(ide.iter().flat_map(|file| &file.1))
-        .filter(|m| {
-            m.dedup_key
+        .filter(|row| {
+            row.dedup_key
                 .as_deref()
                 .filter(|key| !key.trim().is_empty())
-                .is_none_or(|key| seen.insert(key.to_owned()))
+                .is_none_or(|key| seen.insert(key))
         })
-        .cloned()
+        .map(|row| agy_record(row, &row.client, &row.session_id, false))
         .collect()
 }
 
@@ -1292,33 +1340,25 @@ fn fallback_timestamp(timestamps: impl Iterator<Item = i64>) -> Option<i64> {
         .map(|(ts, _)| ts)
 }
 
-/// A record for one AGY generation as tokscale parsed it from a single database file.
-fn agy_record(
-    m: tokscale_core::sessions::UnifiedMessage,
-    client: &str,
-    session_id: &str,
-) -> UsageRecord {
+/// The ledger row for one AGY generation as tokscale parsed it from a single database file, as
+/// `client`'s in `session_id`. `keep_id` keeps its response id, which the fork and archive passes
+/// match rows by.
+fn agy_record(row: &AgyRow, client: &str, session_id: &str, keep_id: bool) -> UsageRecord {
     UsageRecord {
         client: client.to_owned(),
-        model_id: m.model_id.into(),
-        provider_id: m.provider_id.into(),
+        model_id: row.model_id.to_string(),
+        provider_id: row.provider_id.to_string(),
         session_id: session_id.to_owned(),
-        date: m.date.into(),
-        timestamp: m.timestamp,
-        tokens: UsageTokens {
-            input: m.tokens.input.max(0),
-            output: m.tokens.output.max(0),
-            cache_read: m.tokens.cache_read.max(0),
-            cache_write: m.tokens.cache_write.max(0),
-            reasoning: m.tokens.reasoning.max(0),
-            cache_write_1h: m
-                .tokens
-                .cache_write_1h
-                .clamp(0, m.tokens.cache_write.max(0)),
-        },
-        message_count: m.message_count.max(0),
+        date: row.date.to_string(),
+        timestamp: row.timestamp,
+        tokens: row.tokens.clone(),
+        message_count: row.message_count,
         reported_cost_micros: None,
-        dedup_id: m.dedup_key,
+        dedup_id: row
+            .dedup_key
+            .as_deref()
+            .filter(|_| keep_id)
+            .map(str::to_owned),
     }
 }
 
@@ -1435,7 +1475,7 @@ fn rebuild_forked_antigravity_sessions(
     let mut held: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
     for id in &members {
         let path = db(id);
-        let messages = agy_file_messages(tokscale_core::ClientId::AntigravityCli, &path);
+        let messages = agy_file_rows(tokscale_core::ClientId::AntigravityCli, &path);
         let Some(turns) = gen_turns(&path).filter(|t| t.len() == messages.len()) else {
             return HashMap::new(); // can't line them up: leave tokscale's records as they are
         };
@@ -1460,7 +1500,7 @@ fn rebuild_forked_antigravity_sessions(
         records.extend(
             rows.into_iter()
                 .filter(|(key, _)| skip.is_none_or(|s| !s.contains(key)))
-                .map(|(_, m)| agy_record(m, "antigravity-cli", &id)),
+                .map(|(_, row)| agy_record(&row, "antigravity-cli", &id, true)),
         );
     }
     inherited
@@ -1631,8 +1671,7 @@ fn enrich_antigravity_records(
             let mut session_archived = Vec::new();
             if !archived.iter().all(|(key, _)| in_hot.contains(key.as_slice())) {
                 let client = records_ref[record_indices[0]].client.clone();
-                let parsed =
-                    agy_file_messages(tokscale_core::ClientId::AntigravityCli, &archive_path);
+                let parsed = agy_file_rows(tokscale_core::ClientId::AntigravityCli, &archive_path);
                 for ((key, _), m) in archived.iter().zip(parsed.iter()) {
                     if in_hot.contains(key.as_slice()) || skip.is_some_and(|s| s.contains(key)) {
                         continue;
@@ -1640,7 +1679,7 @@ fn enrich_antigravity_records(
                     // ponytail: with no session start, a row the transcript can't date (1 of 3,910
                     // on 2026-10-28) keeps tokscale's reading of the archive, whose fallback is
                     // the file's mtime; date it by its dated neighbours if that ever matters.
-                    let mut record = agy_record(m.clone(), &client, &session_id);
+                    let mut record = agy_record(m, &client, &session_id, true);
                     if let Some(ts) = first_ts {
                         record.date = first_date.clone();
                         record.timestamp = ts;
@@ -2240,7 +2279,7 @@ mod tests {
     }
 
     #[test]
-    fn messages_outside_tokscale_are_the_ones_tokscale_returns() {
+    fn records_outside_tokscale_are_the_ones_tokscale_returns() {
         let home = std::env::temp_dir().join(format!("tm-agy-family-{}", std::process::id()));
         let cli = home.join(".gemini/antigravity-cli/conversations");
         let extension = home.join(".gemini/antigravity/conversations");
@@ -2282,9 +2321,12 @@ mod tests {
             )
             .unwrap()
         };
+        let rows = |messages: Vec<Message>| -> Vec<UsageRecord> {
+            messages.into_iter().map(usage_record).collect()
+        };
         let agy = ["antigravity-cli", "antigravity-extension"].map(String::from);
-        let expected = theirs(&agy);
-        let kept: Vec<String> = expected
+        let messages = theirs(&agy);
+        let kept: Vec<String> = messages
             .iter()
             .map(|m| {
                 format!(
@@ -2295,20 +2337,21 @@ mod tests {
             })
             .collect();
         assert_eq!(kept, ["a:r1", "a:r2", "b:r3", "c:r4"]);
-        assert_eq!(messages_outside_tokscale(&home_dir, &agy), expected);
+        let expected = rows(messages);
+        assert_eq!(records_outside_tokscale(&home_dir, &agy), expected);
         assert_eq!(
-            messages_outside_tokscale(&home_dir, &agy),
+            records_outside_tokscale(&home_dir, &agy),
             expected,
             "again, from the per-file cache"
         );
         // "synthetic" adds Octofriend's rows, after AGY's, and the gateway rename.
         let with_synthetic =
             ["antigravity-cli", "antigravity-extension", "synthetic"].map(String::from);
-        let expected = theirs(&with_synthetic);
+        let expected = rows(theirs(&with_synthetic));
         assert_eq!(expected.len(), 5);
-        assert_eq!(expected[4].client.as_str(), "synthetic");
+        assert_eq!(expected[4].client, "synthetic");
         assert_eq!(
-            messages_outside_tokscale(&home_dir, &with_synthetic),
+            records_outside_tokscale(&home_dir, &with_synthetic),
             expected
         );
         let _ = std::fs::remove_dir_all(&home);
