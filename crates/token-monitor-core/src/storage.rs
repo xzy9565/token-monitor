@@ -426,10 +426,18 @@ impl Storage {
         // Only the newest snapshot is ever read (the TUI's startup cache), so the older ones go.
         // Kept, they grew this table to 6.9 GB in a month: `processing_time_ms` alone makes every
         // payload unique, so the hash never skipped one.
+        // Delete first so the new payload reuses the old one's pages. Inserted first, it left the
+        // old ~12 MB on the freelist, and `auto_maintenance` VACUUMed the whole DB after every save.
         let transaction = self
             .connection
             .unchecked_transaction()
             .map_err(|error| format!("begin usage snapshot transaction: {error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM usage_snapshots WHERE payload_sha256 != ?1",
+                params![digest],
+            )
+            .map_err(|error| format!("drop older usage snapshots: {error}"))?;
         let inserted = transaction
             .execute(
                 "INSERT OR IGNORE INTO usage_snapshots(collected_at_ms, payload_json, payload_sha256)
@@ -437,12 +445,6 @@ impl Storage {
                 params![collected_at_ms, compressed, digest],
             )
             .map_err(|error| format!("store usage snapshot: {error}"))?;
-        transaction
-            .execute(
-                "DELETE FROM usage_snapshots WHERE payload_sha256 != ?1",
-                params![digest],
-            )
-            .map_err(|error| format!("drop older usage snapshots: {error}"))?;
         transaction
             .commit()
             .map_err(|error| format!("commit usage snapshot: {error}"))?;
@@ -786,6 +788,34 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1);
         assert_eq!(storage.latest_usage_snapshot().unwrap(), Some(newer));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn usage_snapshot_replacement_reuses_the_old_pages() {
+        // Inserted before the old row was deleted, every save left the old payload on the
+        // freelist, and `auto_maintenance` rewrote the whole DB to reclaim it.
+        let path = temp_db("usage_pages");
+        let storage = Storage::open_at(&path).unwrap();
+        // Hex survives zstd well enough to span overflow pages, like a real ledger does.
+        let noise: String = (0..3000)
+            .map(|i| sha256(i.to_string().as_bytes()))
+            .collect();
+        for processing_time_ms in [1, 2] {
+            let snapshot = UsageSnapshot {
+                records: vec![],
+                processing_time_ms,
+                tokscale_revision: noise.clone(),
+            };
+            assert!(storage.save_usage_snapshot(&snapshot, 1).unwrap());
+        }
+        let free: i64 = storage
+            .connection
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(free, 0);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
         let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
