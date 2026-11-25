@@ -5995,6 +5995,7 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
     let mut usage_in_flight = false;
     let mut next_refresh = Instant::now();
     let mut next_usage_refresh = Instant::now();
+    let mut last_snapshot_save: Option<Instant> = None;
     let mut dirty = true;
     let collector_options =
         args.providers
@@ -6066,6 +6067,13 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                 app.usage_busy = true;
                 let tx = usage_tx.clone();
                 let days = args.days;
+                // The snapshot only seeds the next launch's first paint, which the first refresh
+                // replaces anyway: one every 10 minutes is plenty, and each costs ~0.7 CPU-s.
+                let save_snapshot =
+                    last_snapshot_save.is_none_or(|at| at.elapsed() >= Duration::from_secs(600));
+                if save_snapshot {
+                    last_snapshot_save = Some(Instant::now());
+                }
                 tokio::task::spawn_blocking(move || {
                     let since = (days > 0).then(|| {
                         (chrono::Utc::now() - chrono::Duration::days(days as i64))
@@ -6090,7 +6098,11 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
                     });
                     // Hand the ledger to the UI before saving it: the snapshot only seeds the next
                     // launch's first paint, and encoding and writing it takes most of a second.
-                    let saved = result.as_ref().ok().map(|(report, _)| Arc::clone(report));
+                    let saved = result
+                        .as_ref()
+                        .ok()
+                        .filter(|_| save_snapshot)
+                        .map(|(report, _)| Arc::clone(report));
                     let _ = tx.send(result);
                     if let Some(report) = saved {
                         if let Ok(storage) = token_monitor_core::storage::Storage::open_default() {
