@@ -136,6 +136,18 @@ impl LimitWindow {
         })
     }
 
+    /// A used-up monthly allowance, in percent or in dollars (Command Code's $0.24 of $70).
+    /// Every request draws on it, so it blocks the provider whatever its 5h and weekly windows
+    /// have left; the Limits row marks it "monthly cap".
+    pub fn is_spent_monthly_cap(&self) -> bool {
+        (self.kind == WindowKind::Monthly || self.label.to_ascii_lowercase().contains("monthly"))
+            && (self.effectively_exhausted()
+                || self
+                    .remaining_percent
+                    .is_some_and(|p| p <= EFFECTIVE_EXHAUSTION_PERCENT || p.round() <= 0.0)
+                || (self.metric.is_credit() && self.remaining_amount.is_some_and(|a| a <= 0.05)))
+    }
+
     pub fn spendable(&self) -> bool {
         if self.effectively_exhausted() {
             return false;
@@ -228,6 +240,8 @@ impl ProviderSnapshot {
         }
         if self.windows.is_empty() {
             false
+        } else if self.windows.iter().any(LimitWindow::is_spent_monthly_cap) {
+            true
         } else if self.windows.iter().any(|w| !w.metric.is_credit()) {
             self.windows
                 .iter()

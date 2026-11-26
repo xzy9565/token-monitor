@@ -4824,11 +4824,7 @@ fn limits_matrix_lines(app: &App, width: u16, height: u16) -> Vec<Line<'static>>
             let monthly_w = provider.windows.iter().find(|w| {
                 w.kind == WindowKind::Monthly || w.label.to_ascii_lowercase().contains("monthly")
             });
-            let is_monthly_capped = monthly_w.is_some_and(|w| {
-                w.effectively_exhausted()
-                    || w.remaining_percent.is_some_and(|p| p <= EFFECTIVE_EXHAUSTION_PERCENT || p.round() <= 0.0)
-                    || (w.metric.is_credit() && w.remaining_amount.is_some_and(|a| a <= 0.05))
-            });
+            let is_monthly_capped = monthly_w.is_some_and(LimitWindow::is_spent_monthly_cap);
             let cycle_w = if is_monthly_capped {
                 monthly_w.or_else(|| {
                     provider.windows.iter().find(|w| {
@@ -7499,6 +7495,21 @@ mod tests {
             ],
         );
         assert!(find_burn_first_recommendation(&[&opencode], now).is_none());
+        // Command Code GOAT on 2026-11-26: 88% of the week left, but only $0.24 of the $70 in
+        // monthly credits that every request spends.
+        let commandcode = provider(
+            "commandcode",
+            vec![
+                window("5h", WindowKind::Session, 100.0, now + day / 5),
+                window("7d", WindowKind::Weekly, 88.0, now + 3 * day),
+                LimitWindow {
+                    metric: WindowMetric::Credits,
+                    remaining_amount: Some(0.24),
+                    ..window("Monthly", WindowKind::Monthly, 0.34, now + 11 * day)
+                },
+            ],
+        );
+        assert!(find_burn_first_recommendation(&[&commandcode], now).is_none());
         let codex = provider(
             "codex",
             vec![window("Weekly", WindowKind::Weekly, 50.0, now + 4 * day)],
