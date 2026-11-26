@@ -140,6 +140,7 @@ Run the compiled binary directly:
 | **Antigravity CLI** | Multi-Pool | Gemini Flash/Pro + Claude/GPT pool split, zero-config daemon discovery, multi-account support |
 | **Grok (SuperGrok)** | Subscription | SuperGrok remaining quota percentages |
 | **GitHub Copilot** | Subscription | AI-credit balance in dollars (premium requests on older plans) and monthly reset; signs in through your `gh` login |
+| **OpenDesign** | Subscription | Coding Plan 5h + weekly windows (Go/Plus/Pro/Max); reads the login `npx -y @powerformer/vela-cli login` saves |
 | **Modal** | Cloud Credit | Profile allowance ($30/mo), compute spend, cycle resets |
 | **OpenRouter** | Pay-as-you-go | Real-time balance and usage tracking |
 | **DeepSeek** | Pay-as-you-go | Prepaid API balance |

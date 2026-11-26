@@ -4,6 +4,7 @@ pub const ALL_PROVIDER_IDS: &[&str] = &[
     "claude",
     "codex",
     "opencode",
+    "opendesign",
     "cursor",
     "grokbot",
     "antigravity",
@@ -49,6 +50,7 @@ pub const NATIVE_PROVIDER_IDS: &[&str] = &[
     "modal",
     "vast",
     "opencode",
+    "opendesign",
 ];
 
 pub fn display_name(id: &str) -> &str {
@@ -70,6 +72,7 @@ pub fn display_name(id: &str) -> &str {
         "ollama" => "Ollama",
         "openrouter" => "OpenRouter",
         "opencode" => "OpenCode",
+        "opendesign" => "OpenDesign",
         "qoder" => "Qoder",
         "thirdparty" => "Third-party",
         "trae" => "Trae",

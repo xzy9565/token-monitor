@@ -5439,6 +5439,158 @@ pub async fn collect_opencode(options: &CollectorOptions) -> Vec<ProviderSnapsho
     snapshots
 }
 
+const OPENDESIGN_LOGIN_HINT: &str = "sign in with `npx -y @powerformer/vela-cli login`";
+
+/// The account login `vela login` (OpenDesign's CLI) saves: (control key, API URL, email).
+/// OpenDesign API keys can't read usage; its billing API turns them away by design.
+fn opendesign_login() -> Option<(String, String, String)> {
+    let path = dirs::home_dir()?.join(".amr").join("config.json");
+    let config: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let profile = config.pointer("/profiles/prod")?;
+    let key = profile.get("controlKey").and_then(Value::as_str)?.trim();
+    let api = profile
+        .get("apiUrl")
+        .and_then(Value::as_str)
+        .unwrap_or("https://amr-api.open-design.ai")
+        .trim_end_matches('/');
+    let email = profile
+        .pointer("/user/email")
+        .and_then(Value::as_str)
+        .unwrap_or("OpenDesign");
+    (!key.is_empty()).then(|| (key.to_owned(), api.to_owned(), email.to_owned()))
+}
+
+/// One bar per Coding Plan window (Go has 5 h and 7 d). Only the share is shown: credits are
+/// 10,000 to the dollar, while the plan's advertised limits are larger because they count
+/// cheaper models at a discount.
+fn opendesign_windows(funding: &Value) -> Vec<LimitWindow> {
+    let windows = funding
+        .pointer("/codingPlan/windows")
+        .and_then(Value::as_array);
+    windows
+        .into_iter()
+        .flatten()
+        .filter_map(|window| {
+            let limit = number(window.get("limitCredits")).filter(|limit| *limit > 0.0)?;
+            let remaining = number(window.get("remainingCredits"))?;
+            let seconds = window.get("durationSeconds").and_then(Value::as_i64)?;
+            let (label, kind) = if seconds <= 86_400 {
+                (format!("{}h", seconds / 3_600), WindowKind::Session)
+            } else if seconds <= 7 * 86_400 {
+                ("Weekly".to_owned(), WindowKind::Weekly)
+            } else {
+                ("Monthly".to_owned(), WindowKind::Monthly)
+            };
+            Some(LimitWindow {
+                label,
+                kind,
+                metric: WindowMetric::Quota,
+                remaining_percent: Some((remaining / limit * 100.0).clamp(0.0, 100.0)),
+                remaining_amount: None,
+                currency: None,
+                resets_at_ms: window
+                    .get("resetsAt")
+                    .and_then(Value::as_str)
+                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                    .map(|at| at.timestamp_millis()),
+                reset_text: None,
+                estimated: false,
+            })
+        })
+        .collect()
+}
+
+pub async fn collect_opendesign(options: &CollectorOptions) -> Vec<ProviderSnapshot> {
+    if !options.includes("opendesign") {
+        return vec![];
+    }
+    let Some((token, api, email)) = opendesign_login() else {
+        return vec![unavailable_snapshot(
+            "opendesign",
+            "".into(),
+            "OpenDesign".into(),
+            "api",
+            SourceHealth::Unavailable,
+            &format!("OpenDesign login not configured: {OPENDESIGN_LOGIN_HINT}"),
+            200,
+        )];
+    };
+    let Ok(client) = http_client(options.timeout()) else {
+        return vec![];
+    };
+    let key = account_key("opendesign", &token);
+    // Usage belongs to the account's current workspace (a personal one unless it joined a team).
+    let funding = async {
+        let current = request_bearer_json(
+            &client,
+            &format!("{api}/api/v1/workspaces/current"),
+            &token,
+            &[],
+        )
+        .await?;
+        let workspace = current
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .ok_or((SourceHealth::Unavailable, "no current workspace".to_owned()))?;
+        request_bearer_json(
+            &client,
+            &format!("{api}/api/v1/workspaces/{workspace}/billing/funding-check"),
+            &token,
+            &[],
+        )
+        .await
+    };
+    let funding = match funding.await {
+        Ok(funding) => funding,
+        Err((health, detail)) => {
+            let detail = if health == SourceHealth::Unauthorized {
+                format!("{detail}: {OPENDESIGN_LOGIN_HINT}")
+            } else {
+                detail
+            };
+            return vec![unavailable_snapshot(
+                "opendesign",
+                key,
+                email,
+                "api",
+                health,
+                &detail,
+                200,
+            )];
+        }
+    };
+    let windows = opendesign_windows(&funding);
+    if windows.is_empty() {
+        // A free account has no Coding Plan windows; this marker hides its row.
+        return vec![unavailable_snapshot(
+            "opendesign",
+            key,
+            email,
+            "api",
+            SourceHealth::Unavailable,
+            "no coding plan",
+            200,
+        )];
+    }
+    let mut plan = funding
+        .pointer("/codingPlan/tier")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if let Some(first) = plan.get_mut(..1) {
+        first.make_ascii_uppercase(); // "go" -> "Go"
+    }
+    vec![connected_snapshot(
+        "opendesign",
+        key,
+        email,
+        plan,
+        "api",
+        windows,
+        200,
+    )]
+}
+
 pub async fn collect_live_limits(options: &CollectorOptions) -> Vec<ProviderSnapshot> {
     let explicit_selection = options.providers.is_some();
     let (
@@ -5462,6 +5614,7 @@ pub async fn collect_live_limits(options: &CollectorOptions) -> Vec<ProviderSnap
         kiro,
         ollama,
         opencode,
+        opendesign,
     ) = tokio::join!(
         collect_openrouter(options),
         collect_deepseek(options),
@@ -5483,6 +5636,7 @@ pub async fn collect_live_limits(options: &CollectorOptions) -> Vec<ProviderSnap
         collect_kiro(options),
         collect_ollama(options),
         collect_opencode(options),
+        collect_opendesign(options),
     );
     let mut rows = [
         openrouter,
@@ -5505,6 +5659,7 @@ pub async fn collect_live_limits(options: &CollectorOptions) -> Vec<ProviderSnap
         kiro,
         ollama,
         opencode,
+        opendesign,
     ]
     .into_iter()
     .flatten()
@@ -5559,6 +5714,29 @@ pub async fn collect_live_limits(options: &CollectorOptions) -> Vec<ProviderSnap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opendesign_shows_each_coding_plan_window_and_nothing_for_a_free_account() {
+        // The shape of a live Go funding-check, 2026-11-25.
+        let funding = serde_json::json!({"codingPlan": {"tier": "go", "windows": [
+            {"durationSeconds": 18000, "resetMode": "anchored_recurring", "usedCredits": "56",
+             "limitCredits": "50000", "remainingCredits": "49944",
+             "resetsAt": "2026-11-26T06:40:42.000Z"},
+            {"durationSeconds": 604800, "resetMode": "anchored_recurring", "usedCredits": "56",
+             "limitCredits": "150000", "remainingCredits": "149944",
+             "resetsAt": "2026-12-03T01:40:42.000Z"}
+        ]}});
+        let windows = opendesign_windows(&funding);
+        let shape: Vec<_> = windows.iter().map(|w| (w.label.as_str(), w.kind)).collect();
+        assert_eq!(
+            shape,
+            [("5h", WindowKind::Session), ("Weekly", WindowKind::Weekly)]
+        );
+        assert!((windows[0].remaining_percent.unwrap() - 99.888).abs() < 1e-9);
+        assert_eq!(windows[1].resets_at_ms, Some(1_796_262_042_000));
+        let free = serde_json::json!({"codingPlan": {"tier": null, "windows": []}});
+        assert!(opendesign_windows(&free).is_empty());
+    }
 
     #[test]
     fn openrouter_credit_math_preserves_decimal_remainder() {

@@ -3965,6 +3965,7 @@ fn provider_brand_color(provider_id: &str) -> Color {
         "openrouter" => Color::Rgb(140, 100, 255),              // OpenRouter Royal Violet #7624F4
         "vast" | "vastai" => Color::Rgb(255, 140, 50),         // Vast Sunset Orange #FF8C32
         "opencode" => Color::Rgb(118, 153, 254),               // OpenCode v2 Periwinkle Blue #7699FE
+        "opendesign" => Color::Rgb(99, 254, 19),               // OpenDesign Lime #63FE13 (its site's accent)
         "deepseek" => Color::Rgb(77, 107, 254),                 // DeepSeek Royal Blue #4D6BFE
         "copilot" | "github" => Color::Rgb(184, 112, 255),      // Copilot Purple: GitHub Purple 3 #B870FF (Purple 4 #8534F3 is too dark on a dark terminal)
         "kimi" => Color::Rgb(255, 110, 180),                    // Kimi Pink #FF6EB4
