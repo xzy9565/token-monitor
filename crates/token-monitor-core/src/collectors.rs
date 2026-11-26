@@ -30,11 +30,28 @@ pub struct CollectorOptions {
     pub timeout: Option<Duration>,
 }
 
+/// Providers switched off in the Config tab, e.g. a cancelled plan you may take up again. A
+/// comma-separated list kept in credentials.json beside the pasted keys.
+pub const DISABLED_PROVIDERS: &str = "TOKEN_MONITOR_DISABLED_PROVIDERS";
+
+pub fn disabled_providers() -> HashSet<String> {
+    crate::credentials::get(DISABLED_PROVIDERS)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 impl CollectorOptions {
     pub fn includes(&self, provider: &str) -> bool {
+        // ponytail: re-reads the small credentials file once per collector per refresh; carry
+        // the set in the options if that ever shows up in a profile.
         self.providers
             .as_ref()
             .is_none_or(|selected| selected.contains("all") || selected.contains(provider))
+            && !disabled_providers().contains(provider)
     }
 
     pub fn timeout(&self) -> Duration {

@@ -122,6 +122,7 @@ Run the compiled binary directly:
 | `/` | Open inline interactive fuzzy search / filter |
 | `m` | Toggle rank metric (Total Tokens vs. API-Equivalent USD) |
 | `p` | Open native credential manager to configure keys or session tokens |
+| `x` | In **[3] Config**, switch the selected provider off or back on (e.g. a cancelled plan you may renew) |
 | `a` | Filter by providers requiring attention |
 | `c` | Filter by credit grants and wallets |
 | `r` | Force an immediate background refresh of all collectors |

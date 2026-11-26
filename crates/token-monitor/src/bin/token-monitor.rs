@@ -345,6 +345,8 @@ struct SettingsState {
     editing: bool,
     input: String,
     message: String,
+    /// Switched off with `x`; mirrors `collectors::disabled_providers()`.
+    disabled: HashSet<String>,
 }
 
 impl SettingsState {
@@ -358,6 +360,7 @@ impl SettingsState {
             editing: false,
             input: String::new(),
             message: String::new(),
+            disabled: token_monitor_core::collectors::disabled_providers(),
         }
     }
 }
@@ -1198,6 +1201,9 @@ impl App {
     }
 
     fn settings_status(&self, provider_id: &str) -> String {
+        if self.settings.disabled.contains(provider_id) {
+            return "switched off · x".into();
+        }
         if let Some(provider) = self
             .providers
             .iter()
@@ -1268,6 +1274,44 @@ impl App {
         }
     }
 
+    /// Switches the selected provider off (no collecting, no row) or back on. The Ledger is
+    /// unaffected: an app keeps its history after its subscription ends.
+    fn toggle_settings_provider(&mut self) {
+        let Some(id) = self
+            .settings
+            .provider_ids
+            .get(self.settings.selected)
+            .cloned()
+        else {
+            return;
+        };
+        let mut disabled = self.settings.disabled.clone();
+        let off = disabled.insert(id.clone());
+        if !off {
+            disabled.remove(&id);
+        }
+        let mut ids: Vec<&str> = disabled.iter().map(String::as_str).collect();
+        ids.sort_unstable();
+        // An empty list removes the entry.
+        let saved = credentials::set(
+            token_monitor_core::collectors::DISABLED_PROVIDERS,
+            &ids.join(","),
+        );
+        if let Err(error) = saved {
+            self.settings.message = format!("save failed: {error}");
+            return;
+        }
+        self.settings.disabled = disabled;
+        let name = token_monitor_core::provider_registry::display_name(&id);
+        if off {
+            self.providers.retain(|provider| provider.provider_id != id);
+            self.settings.message = format!("{name} switched off; press x to switch it back on.");
+        } else {
+            self.settings.message = format!("{name} switched back on; refreshing…");
+            self.refresh_requested = true;
+        }
+    }
+
     fn handle_settings_key(&mut self, key: KeyEvent) {
         if self.settings.editing {
             match key.code {
@@ -1319,6 +1363,7 @@ impl App {
             }
             KeyCode::Enter => self.begin_settings_edit(),
             KeyCode::Char('d') => self.delete_settings_credential(),
+            KeyCode::Char('x') => self.toggle_settings_provider(),
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.refreshes = self.refreshes.saturating_add(1);
                 self.last_refresh = Instant::now();
@@ -5367,6 +5412,7 @@ fn load_cached_app(
             let mut seen = HashSet::new();
             let now_ms = chrono::Utc::now().timestamp_millis();
             let max_cache_age_ms = 7 * 86_400_000;
+            let disabled = token_monitor_core::collectors::disabled_providers();
             providers.retain(|provider| {
                 let fresh_enough =
                     now_ms.saturating_sub(provider.collected_at_ms) <= max_cache_age_ms;
@@ -5385,7 +5431,12 @@ fn load_cached_app(
                 } else {
                     seen.insert(provider.provider_id.clone())
                 };
-                fresh_enough && requested && configured && not_registry_dup && is_first
+                fresh_enough
+                    && requested
+                    && configured
+                    && not_registry_dup
+                    && is_first
+                    && !disabled.contains(&provider.provider_id)
             });
             // The cache is useful for instant first paint, but it is not a live
             // answer until the background collector completes.
@@ -5898,7 +5949,7 @@ fn draw(frame: &mut Frame, app: &App, forced_width: Option<u16>, refresh_seconds
         if app.view == View::Consumption {
             format!("[1] Limits  [2] Ledger*  [3] Config │ [h/l] Win:{}  [r] Ref  [Enter] Detail  [q] Quit", app.ledger_window.label())
         } else if app.view == View::Settings {
-            "[1] Limits  [2] Ledger  [3] Config* │ [Enter] Edit  [r] Ref  [Esc] Back  [q] Quit".to_owned()
+            "[1] Limits  [2] Ledger  [3] Config* │ [Enter] Edit  [x] On/Off  [r] Ref  [Esc] Back  [q] Quit".to_owned()
         } else {
             "[1] Limits*  [2] Ledger  [3] Config │ [/] Filter  [Enter] Detail  [r] Ref  [q] Quit".to_owned()
         }
@@ -5906,7 +5957,7 @@ fn draw(frame: &mut Frame, app: &App, forced_width: Option<u16>, refresh_seconds
         if app.view == View::Consumption {
             format!("[1] Limits  [2] Ledger*  [3] Config │ [h/l / ←/→] Window: {}  [/] Filter  [m] Metric  [Enter] Detail  [r] Refresh  [q] Quit", app.ledger_window.label())
         } else if app.view == View::Settings {
-            "[1] Limits  [2] Ledger  [3] Config* │ [Enter] Edit  [d] Delete  [r] Refresh  [Esc] Back  [q] Quit".to_owned()
+            "[1] Limits  [2] Ledger  [3] Config* │ [Enter] Edit  [d] Delete  [x] On/Off  [r] Refresh  [Esc] Back  [q] Quit".to_owned()
         } else {
             "[1] Limits*  [2] Ledger  [3] Config │ [/] Filter  [j/k] Select  [Enter] Detail  [a] Attn  [c] Credits  [r] Refresh  [q] Quit".to_owned()
         }
@@ -6016,6 +6067,9 @@ async fn run_interactive(args: &Args, mut app: App) -> io::Result<()> {
             if let Ok(providers) = refresh_rx.try_recv() {
                 app.providers =
                     token_monitor_core::merge_provider_snapshots(&app.providers, providers);
+                // A refresh that began before `x` switched a provider off still returns its row.
+                app.providers
+                    .retain(|provider| !app.settings.disabled.contains(&provider.provider_id));
                 sort_burn_first(&mut app.providers, chrono::Utc::now().timestamp_millis());
                 app.live = true;
                 refresh_in_flight = false;
