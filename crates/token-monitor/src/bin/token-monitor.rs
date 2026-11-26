@@ -4165,6 +4165,11 @@ fn find_burn_first_recommendation(providers: &[&ProviderSnapshot], now_ms: i64) 
         // AGY burns on its Gemini pool alone, as in `sort_burn_first`.
         let view = burn_view(p);
         let p = view.as_ref();
+        // A spent weekly or monthly cap blocks every window, whatever else is left (the rule
+        // `sort_burn_first` ranks by).
+        if p.is_exhausted() {
+            continue;
+        }
         // If currently on cooldown (effectively exhausted session remaining), cannot burn right now!
         let pid = p.provider_id.to_ascii_lowercase();
         if pid == "antigravity" {
@@ -7454,6 +7459,52 @@ mod tests {
         };
         // Gemini is spent; a soon-resetting Claude/GPT pool must not make this account burn-first.
         assert!(find_burn_first_recommendation(&[&agy], now).is_none());
+    }
+
+    #[test]
+    fn burn_first_header_skips_a_provider_whose_monthly_cap_is_spent() {
+        // OpenCode Go on 2026-11-25: weekly 81% left, but the monthly cap was used up.
+        let now = 1_000;
+        let day = 86_400_000;
+        let window = |label: &str, kind, percent, reset| LimitWindow {
+            currency: None,
+            estimated: false,
+            kind,
+            label: label.into(),
+            metric: WindowMetric::Quota,
+            remaining_amount: None,
+            remaining_percent: Some(percent),
+            reset_text: None,
+            resets_at_ms: Some(reset),
+        };
+        let provider = |id: &str, windows| ProviderSnapshot {
+            account_key: format!("{id}:a"),
+            account_label: "a@example.com".into(),
+            availability: Availability::Available,
+            collected_at_ms: now,
+            diagnostics: vec![],
+            hue: 141,
+            plan: "Go".into(),
+            provider_id: id.into(),
+            source: "api".into(),
+            source_health: SourceHealth::Connected,
+            windows,
+        };
+        let opencode = provider(
+            "opencode",
+            vec![
+                window("Rolling", WindowKind::Session, 100.0, now + day / 5),
+                window("Weekly", WindowKind::Weekly, 81.0, now + 3 * day),
+                window("Monthly", WindowKind::Monthly, 0.0, now + 4 * day),
+            ],
+        );
+        assert!(find_burn_first_recommendation(&[&opencode], now).is_none());
+        let codex = provider(
+            "codex",
+            vec![window("Weekly", WindowKind::Weekly, 50.0, now + 4 * day)],
+        );
+        let pick = find_burn_first_recommendation(&[&opencode, &codex], now).unwrap();
+        assert_eq!(pick.remaining_pct, 50.0);
     }
 
     #[test]
